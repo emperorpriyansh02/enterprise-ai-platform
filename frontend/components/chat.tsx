@@ -6,10 +6,14 @@ import {
   ApiError,
   type FinishReason,
   getModels,
+  listPrompts,
   type Message,
   type ModelInfo,
+  type PromptSummary,
+  type PromptUsed,
   streamChat,
   type Usage,
+  type VariableValues,
 } from "@/lib/api";
 
 interface Turn {
@@ -25,6 +29,7 @@ interface Turn {
     usage?: Usage;
     latencyMs?: number;
     finishReason?: FinishReason;
+    prompt?: PromptUsed;
   };
 }
 
@@ -46,6 +51,10 @@ export default function Chat() {
   const [turns, setTurns] = useState<Turn[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  const [prompts, setPrompts] = useState<PromptSummary[]>([]);
+  const [promptsAvailable, setPromptsAvailable] = useState(true);
+  const [promptName, setPromptName] = useState("");
+  const [promptVars, setPromptVars] = useState<VariableValues>({});
   const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -54,7 +63,10 @@ export default function Chat() {
     getModels(controller.signal)
       .then((list) => {
         setModels(list.data);
-        setModel(list.default ?? list.data[0]?.id ?? "");
+        // This also re-runs when you come back to Chat from another page: keep your choice if it still exists.
+        setModel((current) =>
+          list.data.some((m) => m.id === current) ? current : (list.default ?? list.data[0]?.id ?? ""),
+        );
       })
       .catch((err: unknown) => {
         if ((err as Error).name === "AbortError") return;
@@ -66,6 +78,24 @@ export default function Chat() {
   }, []);
 
   useEffect(() => {
+    const controller = new AbortController();
+    listPrompts({ signal: controller.signal })
+      .then((list) => {
+        setPrompts(list.data);
+        setPromptsAvailable(true);
+        setPromptName((current) => (list.data.some((p) => p.name === current) ? current : ""));
+      })
+      .catch((err: unknown) => {
+        if ((err as Error).name === "AbortError") return;
+        setPromptsAvailable(false); // no database configured: chat works without managed prompts
+      });
+    return () => controller.abort();
+  }, []);
+
+  const selectedPrompt = prompts.find((p) => p.name === promptName);
+  const missingVars = (selectedPrompt?.active_variables ?? []).filter((v) => !promptVars[v]?.trim());
+
+  useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [turns]);
 
@@ -75,7 +105,7 @@ export default function Chat() {
 
   const send = useCallback(async () => {
     const text = input.trim();
-    if (!text || busy || !model) return;
+    if (!text || busy || !model || missingVars.length > 0) return;
 
     const history: Message[] = turns
       .filter((t) => !t.error && t.content)
@@ -95,13 +125,23 @@ export default function Chat() {
     abortRef.current = controller;
     try {
       await streamChat(
-        { model, messages: history, system: system.trim() || undefined },
+        {
+          model,
+          messages: history,
+          system: system.trim() || undefined,
+          prompt: selectedPrompt
+            ? {
+                name: selectedPrompt.name,
+                variables: Object.fromEntries(selectedPrompt.active_variables.map((v) => [v, promptVars[v]])),
+              }
+            : undefined,
+        },
         (event) => {
           switch (event.type) {
             case "start":
               updateTurn(assistantKey, (t) => ({
                 ...t,
-                meta: { provider: event.provider, model: event.model },
+                meta: { provider: event.provider, model: event.model, prompt: event.prompt },
               }));
               break;
             case "delta":
@@ -117,6 +157,7 @@ export default function Chat() {
                   usage: event.usage,
                   latencyMs: event.latency_ms,
                   finishReason: event.finish_reason,
+                  prompt: event.prompt,
                 },
               }));
               break;
@@ -140,7 +181,7 @@ export default function Chat() {
       abortRef.current = null;
       setBusy(false);
     }
-  }, [busy, input, model, system, turns, updateTurn]);
+  }, [busy, input, missingVars.length, model, promptVars, selectedPrompt, system, turns, updateTurn]);
 
   const stop = () => abortRef.current?.abort();
   const newChat = () => {
@@ -151,13 +192,28 @@ export default function Chat() {
   const providers = Array.from(new Set(models.map((m) => m.provider)));
 
   return (
-    <div className="mx-auto flex h-dvh w-full max-w-4xl flex-col px-4">
+    <div className="mx-auto flex min-h-0 w-full max-w-4xl flex-1 flex-col px-4">
       {/* Header */}
       <header className="flex flex-wrap items-center gap-3 border-b border-line py-3">
-        <div className="mr-auto">
-          <h1 className="text-base font-semibold tracking-tight">Enterprise AI Platform</h1>
-          <p className="text-xs text-muted">Layer 1 · multi-provider chat</p>
-        </div>
+        <h1 className="mr-auto text-base font-semibold tracking-tight">Chat</h1>
+        <label className="flex items-center gap-2 text-sm">
+          <span className="text-muted">Prompt</span>
+          <select
+            aria-label="Prompt"
+            value={promptName}
+            onChange={(e) => setPromptName(e.target.value)}
+            disabled={busy || !promptsAvailable}
+            title={promptsAvailable ? undefined : "Prompt store not configured (DATABASE_URL)"}
+            className="max-w-[12rem] rounded-md border border-line bg-surface px-2 py-1.5 text-sm"
+          >
+            <option value="">{promptsAvailable ? "None" : "Unavailable"}</option>
+            {prompts.map((p) => (
+              <option key={p.name} value={p.name}>
+                {p.name} (v{p.active_version})
+              </option>
+            ))}
+          </select>
+        </label>
         <label className="flex items-center gap-2 text-sm">
           <span className="text-muted">Model</span>
           <select
@@ -186,7 +242,7 @@ export default function Chat() {
           aria-expanded={showSettings}
           className="rounded-md border border-line px-2.5 py-1.5 text-sm hover:bg-surface"
         >
-          System prompt
+          {selectedPrompt ? "Extra instructions" : "System prompt"}
         </button>
         <button
           type="button"
@@ -197,10 +253,29 @@ export default function Chat() {
         </button>
       </header>
 
+      {selectedPrompt && selectedPrompt.active_variables.length > 0 && (
+        <fieldset className="flex flex-wrap items-center gap-3 border-b border-line py-3">
+          <legend className="sr-only">Prompt variables</legend>
+          {selectedPrompt.active_variables.map((name) => (
+            <label key={name} className="flex items-center gap-2 text-sm">
+              <span className="font-mono text-xs text-muted">{name}</span>
+              <input
+                value={promptVars[name] ?? ""}
+                onChange={(e) => setPromptVars((prev) => ({ ...prev, [name]: e.target.value }))}
+                aria-label={`Prompt variable ${name}`}
+                className="w-44 rounded-md border border-line bg-surface px-2 py-1 text-sm"
+              />
+            </label>
+          ))}
+        </fieldset>
+      )}
+
       {showSettings && (
         <div className="border-b border-line py-3">
           <label htmlFor="system" className="mb-1 block text-xs font-medium text-muted">
-            System prompt (sent with every message)
+            {selectedPrompt
+              ? `Extra instructions (added after the "${selectedPrompt.name}" prompt)`
+              : "System prompt (sent with every message)"}
           </label>
           <textarea
             id="system"
@@ -267,6 +342,7 @@ export default function Chat() {
                   {turn.role === "assistant" && !turn.streaming && turn.meta?.model && (
                     <p className="mt-1.5 font-mono text-[11px] text-muted">
                       {turn.meta.provider}/{turn.meta.model}
+                      {turn.meta.prompt && ` · prompt ${turn.meta.prompt.name} v${turn.meta.prompt.version}`}
                       {turn.meta.usage &&
                         ` · ${turn.meta.usage.input_tokens} in / ${turn.meta.usage.output_tokens} out`}
                       {turn.meta.latencyMs !== undefined && ` · ${(turn.meta.latencyMs / 1000).toFixed(2)}s`}
@@ -314,7 +390,7 @@ export default function Chat() {
           ) : (
             <button
               type="submit"
-              disabled={!input.trim() || !model}
+              disabled={!input.trim() || !model || missingVars.length > 0}
               className="rounded-lg bg-accent px-3 py-1.5 text-sm font-medium text-accent-fg disabled:opacity-40"
             >
               Send
@@ -322,7 +398,9 @@ export default function Chat() {
           )}
         </div>
         <p className="mt-1.5 text-center text-[11px] text-muted">
-          Enter to send · Shift+Enter for a new line
+          {missingVars.length > 0
+            ? `Fill in the prompt variables first: ${missingVars.join(", ")}`
+            : "Enter to send · Shift+Enter for a new line"}
         </p>
       </form>
     </div>

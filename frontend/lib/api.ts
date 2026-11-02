@@ -1,4 +1,4 @@
-// Typed client for the backend API (Layer 1: models + chat streaming).
+// Typed client for the backend API: models + chat streaming (Layer 1), prompts (Layer 2).
 
 export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -13,6 +13,7 @@ export interface Message {
 export interface ChatRequest {
   model?: string;
   messages: Message[];
+  prompt?: PromptRef;
   system?: string;
   temperature?: number;
   max_tokens?: number;
@@ -30,7 +31,7 @@ export interface ApiErrorBody {
 }
 
 export type StreamEvent =
-  | { type: "start"; id: string; provider: string; model: string }
+  | { type: "start"; id: string; provider: string; model: string; prompt?: PromptUsed }
   | { type: "delta"; id: string; delta: string }
   | {
       type: "done";
@@ -40,6 +41,7 @@ export type StreamEvent =
       finish_reason: FinishReason;
       usage?: Usage;
       latency_ms: number;
+      prompt?: PromptUsed;
     }
   | { type: "error"; id: string; error: ApiErrorBody };
 
@@ -52,6 +54,53 @@ export interface ModelInfo {
 export interface ModelList {
   default: string | null;
   data: ModelInfo[];
+}
+
+// --- Prompts (Layer 2) ---
+
+export type VariableValues = Record<string, string>;
+
+export interface PromptRef {
+  name: string;
+  version?: number;
+  variables?: VariableValues;
+}
+
+export interface PromptUsed {
+  name: string;
+  version: number;
+}
+
+export interface PromptVersion {
+  version: number;
+  template: string;
+  variables: string[];
+  note: string;
+  created_by: string | null;
+  created_at: string;
+  is_active: boolean;
+}
+
+export interface PromptSummary {
+  name: string;
+  description: string;
+  active_version: number | null;
+  latest_version: number;
+  active_variables: string[];
+  archived: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PromptDetail extends PromptSummary {
+  versions: PromptVersion[]; // newest first
+}
+
+export interface RenderResult {
+  name: string;
+  version: number;
+  text: string;
+  variables: string[];
 }
 
 export class ApiError extends Error {
@@ -81,10 +130,91 @@ async function toApiError(response: Response): Promise<ApiError> {
   return new ApiError(`Request failed with status ${response.status}`, response.status);
 }
 
-export async function getModels(signal?: AbortSignal): Promise<ModelList> {
-  const response = await fetch(`${API_URL}/v1/models`, { signal });
+/** Send a JSON request and parse the JSON reply. Throws ApiError on HTTP errors. */
+async function apiRequest<T>(
+  path: string,
+  options: { method?: string; body?: unknown; adminKey?: string; signal?: AbortSignal } = {},
+): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (options.body !== undefined) headers["Content-Type"] = "application/json";
+  if (options.adminKey) headers["X-Admin-Key"] = options.adminKey;
+  const response = await fetch(`${API_URL}${path}`, {
+    method: options.method ?? "GET",
+    headers,
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    signal: options.signal,
+  });
   if (!response.ok) throw await toApiError(response);
-  return response.json();
+  return response.json() as Promise<T>;
+}
+
+export function getModels(signal?: AbortSignal): Promise<ModelList> {
+  return apiRequest<ModelList>("/v1/models", { signal });
+}
+
+export function listPrompts(
+  options: { includeArchived?: boolean; signal?: AbortSignal } = {},
+): Promise<{ data: PromptSummary[] }> {
+  const query = options.includeArchived ? "?include_archived=true" : "";
+  return apiRequest(`/v1/prompts${query}`, { signal: options.signal });
+}
+
+export function getPrompt(name: string): Promise<PromptDetail> {
+  return apiRequest(`/v1/prompts/${encodeURIComponent(name)}`);
+}
+
+export function createPrompt(
+  body: { name: string; description: string; template: string; note: string },
+  adminKey?: string,
+): Promise<PromptDetail> {
+  return apiRequest("/v1/prompts", { method: "POST", body, adminKey });
+}
+
+export function updatePromptDescription(
+  name: string,
+  description: string,
+  adminKey?: string,
+): Promise<PromptDetail> {
+  return apiRequest(`/v1/prompts/${encodeURIComponent(name)}`, {
+    method: "PATCH",
+    body: { description },
+    adminKey,
+  });
+}
+
+export function addPromptVersion(
+  name: string,
+  body: { template: string; note: string; activate: boolean },
+  adminKey?: string,
+): Promise<PromptVersion> {
+  return apiRequest(`/v1/prompts/${encodeURIComponent(name)}/versions`, {
+    method: "POST",
+    body,
+    adminKey,
+  });
+}
+
+export function activatePromptVersion(
+  name: string,
+  version: number,
+  adminKey?: string,
+): Promise<PromptDetail> {
+  return apiRequest(`/v1/prompts/${encodeURIComponent(name)}/activate`, {
+    method: "POST",
+    body: { version },
+    adminKey,
+  });
+}
+
+export function archivePrompt(name: string, adminKey?: string): Promise<PromptDetail> {
+  return apiRequest(`/v1/prompts/${encodeURIComponent(name)}`, { method: "DELETE", adminKey });
+}
+
+export function renderPrompt(
+  name: string,
+  body: { version?: number; variables: VariableValues },
+): Promise<RenderResult> {
+  return apiRequest(`/v1/prompts/${encodeURIComponent(name)}/render`, { method: "POST", body });
 }
 
 /**

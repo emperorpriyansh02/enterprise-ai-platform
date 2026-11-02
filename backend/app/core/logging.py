@@ -18,6 +18,7 @@ _EXTRA_FIELDS = (
     "output_tokens",
     "finish_reason",
     "error_code",
+    "prompt",
 )
 
 

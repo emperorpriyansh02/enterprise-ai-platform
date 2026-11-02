@@ -28,7 +28,12 @@ TS_DIRS = [REPO / "frontend" / "app", REPO / "frontend" / "components", REPO / "
 # TypeScript: named functions, arrow functions / hooks assigned to a const, and classes.
 TS_PATTERNS = [
     re.compile(r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+(\w+)", re.M),
-    re.compile(r"^\s*(?:export\s+)?const\s+(\w+)\s*=\s*(?:useCallback\()?\s*(?:async\s*)?\(.*=>", re.M),
+    # `const x = (a, b) => ...`, `const x = useCallback(async () => ...)`, `const x = async <T,>(...): R =>`
+    re.compile(
+        r"^\s*(?:export\s+)?const\s+(\w+)\s*=\s*(?:useCallback\()?\s*(?:async\s*)?(?:<[^>]*>\s*)?"
+        r"\([^()]*(?:\([^()]*\)[^()]*)*\)\s*(?::\s*[^=]+?)?\s*=>",
+        re.M,
+    ),
     re.compile(r"^\s*(?:export\s+)?class\s+(\w+)", re.M),
 ]
 

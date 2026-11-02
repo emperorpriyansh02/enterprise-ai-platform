@@ -4,6 +4,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.prompts.schemas import PromptRef, PromptUsed
+
 Role = Literal["user", "assistant"]
 FinishReason = Literal["stop", "length", "refusal", "content_filter", "other"]
 
@@ -20,7 +22,13 @@ class ChatRequest(BaseModel):
         examples=["anthropic/claude-opus-5-5"],
     )
     messages: list[Message] = Field(min_length=1)
-    system: str | None = Field(default=None, description="System prompt.")
+    prompt: PromptRef | None = Field(
+        default=None,
+        description="Managed prompt to use as the system prompt (Layer 2). `system` is appended after it.",
+    )
+    system: str | None = Field(
+        default=None, description="System prompt, or extra instructions with `prompt`."
+    )
     temperature: float | None = Field(
         default=None,
         ge=0,
@@ -54,6 +62,7 @@ class ChatResponse(BaseModel):
     finish_reason: FinishReason
     usage: Usage
     latency_ms: int
+    prompt: PromptUsed | None = Field(default=None, description="Managed prompt version used, if any.")
 
 
 class StreamEvent(BaseModel):
@@ -70,6 +79,7 @@ class StreamEvent(BaseModel):
     finish_reason: FinishReason | None = None
     usage: Usage | None = None
     latency_ms: int | None = None
+    prompt: PromptUsed | None = None
     error: dict | None = None
 
 

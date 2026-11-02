@@ -1,7 +1,8 @@
 """Chat orchestration: the one place every chat request passes through.
 
+Steps today:  resolve model -> build system prompt (Layer 2) -> LLM call -> log
 Later layers plug in here, in this order:
-    prompts -> auth/RBAC -> input guardrails -> cache -> router -> RAG / MCP tools
+    auth/RBAC -> input guardrails -> cache -> router -> RAG / MCP tools
     -> LLM call -> output guardrails -> observability / evals logging
 """
 
@@ -10,23 +11,27 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 
-from app.core.errors import AppError, ProviderError
+from app.core.errors import AppError, PromptStoreUnavailableError, ProviderError
 from app.llm.base import LLMRequest
 from app.llm.registry import ProviderRegistry
+from app.prompts.schemas import PromptUsed
+from app.prompts.service import PromptService
 from app.schemas.chat import ChatRequest, ChatResponse, StreamEvent
 
 logger = logging.getLogger(__name__)
 
 
 class ChatService:
-    def __init__(self, registry: ProviderRegistry) -> None:
+    def __init__(self, registry: ProviderRegistry, prompts: PromptService | None = None) -> None:
         self._registry = registry
+        self._prompts = prompts  # None when no database is configured
 
     async def complete(self, request: ChatRequest) -> ChatResponse:
         provider, model = self._registry.resolve(request.model)
+        system, prompt_used = await self._build_system(request)
         request_id = _new_id()
         started = time.perf_counter()
-        result = await provider.complete(_to_llm_request(request, model))
+        result = await provider.complete(_to_llm_request(request, model, system))
         latency_ms = _ms_since(started)
         logger.info(
             "chat completed",
@@ -34,6 +39,7 @@ class ChatService:
                 "request_id": request_id,
                 "provider": provider.name,
                 "model": result.model,
+                "prompt": _prompt_label(prompt_used),
                 "latency_ms": latency_ms,
                 "input_tokens": result.usage.input_tokens,
                 "output_tokens": result.usage.output_tokens,
@@ -48,24 +54,32 @@ class ChatService:
             finish_reason=result.finish_reason,
             usage=result.usage,
             latency_ms=latency_ms,
+            prompt=prompt_used,
         )
 
     async def stream(self, request: ChatRequest) -> AsyncIterator[StreamEvent]:
         """Yield `start`, `delta`..., then `done` (or `error` if the provider fails mid-stream).
 
-        Errors before the first token (bad model, auth, rate limit) are raised instead, so the
-        route can still return a proper HTTP status: the provider is called before `start`.
+        Errors before the first token (bad model or prompt, auth, rate limit) are raised instead,
+        so the route can still return a proper HTTP status: the provider is called before `start`.
         """
         provider, model = self._registry.resolve(request.model)
+        system, prompt_used = await self._build_system(request)
         request_id = _new_id()
         started = time.perf_counter()
-        chunks = provider.stream(_to_llm_request(request, model))
+        chunks = provider.stream(_to_llm_request(request, model, system))
 
         try:
             first = await anext(chunks)  # raises ProviderError before any bytes are sent
         except StopAsyncIteration:
             raise ProviderError("Provider returned an empty stream", provider=provider.name) from None
-        yield StreamEvent(type="start", id=request_id, provider=provider.name, model=first.model or model)
+        yield StreamEvent(
+            type="start",
+            id=request_id,
+            provider=provider.name,
+            model=first.model or model,
+            prompt=prompt_used,
+        )
 
         try:
             chunk = first
@@ -78,6 +92,7 @@ class ChatService:
                             "request_id": request_id,
                             "provider": provider.name,
                             "model": chunk.model or model,
+                            "prompt": _prompt_label(prompt_used),
                             "latency_ms": latency_ms,
                             "input_tokens": chunk.usage.input_tokens if chunk.usage else 0,
                             "output_tokens": chunk.usage.output_tokens if chunk.usage else 0,
@@ -92,6 +107,7 @@ class ChatService:
                         finish_reason=chunk.finish_reason or "other",
                         usage=chunk.usage,
                         latency_ms=latency_ms,
+                        prompt=prompt_used,
                     )
                     return
                 if chunk.delta:
@@ -107,16 +123,35 @@ class ChatService:
         )
         yield StreamEvent(type="error", id=request_id, error=error.to_dict())
 
+    async def _build_system(self, request: ChatRequest) -> tuple[str | None, PromptUsed | None]:
+        """Final system prompt: the managed prompt (if any), then the request's own `system` text."""
+        if self._prompts is None:
+            if request.prompt is not None:
+                raise PromptStoreUnavailableError(
+                    "This request names a prompt, but no prompt store is configured (DATABASE_URL)."
+                )
+            return request.system, None
+        rendered = await self._prompts.resolve_for_chat(request.prompt, has_system=bool(request.system))
+        if rendered is None:
+            return request.system, None
+        system = f"{rendered.text}\n\n{request.system}" if request.system else rendered.text
+        return system, PromptUsed(name=rendered.name, version=rendered.version)
 
-def _to_llm_request(request: ChatRequest, model: str) -> LLMRequest:
+
+def _to_llm_request(request: ChatRequest, model: str, system: str | None) -> LLMRequest:
     return LLMRequest(
         model=model,
         messages=request.messages,
-        system=request.system,
+        system=system,
         temperature=request.temperature,
         max_tokens=request.max_tokens,
         provider_options=request.provider_options,
     )
+
+
+def _prompt_label(prompt: PromptUsed | None) -> str | None:
+    """`support-agent@v3` for logs, or None."""
+    return f"{prompt.name}@v{prompt.version}" if prompt else None
 
 
 def _new_id() -> str:

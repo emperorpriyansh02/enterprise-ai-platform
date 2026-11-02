@@ -4,19 +4,23 @@ version = "0.1.0"
 description = "Enterprise AI Platform API: multi-provider LLM gateway"
 requires-python = ">=3.13"
 dependencies = [
+    "alembic>=1.20.1",
     "anthropic>=2.3.0",
+    "asyncpg>=0.32.0",
     "fastapi>=0.162.0",
     "google-genai>=2.34.0",
     "httpx>=0.28.1",
     "httpx2>=2.16.0",
     "openai>=3.42.1",
     "pydantic-settings>=2.16.2",
+    "sqlalchemy[asyncio]>=2.1.6",
     "sse-starlette>=3.6.0",
     "uvicorn[standard]>=0.54.0",
 ]
 
 [dependency-groups]
 dev = [
+    "aiosqlite>=0.22.1",
     "pytest>=9.2.0",
     "pytest-asyncio>=1.4.1.post1",
     "ruff>=0.17.3",

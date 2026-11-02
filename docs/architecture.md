@@ -1,6 +1,6 @@
 # Architecture
 
-## Request flow (Layer 1, today)
+## Request flow (Layers 1–2, today)
 
 ```
 Browser (Next.js chat UI)
@@ -11,6 +11,8 @@ FastAPI  app/api/v1/routes.py
    ▼
 ChatService  app/services/chat_service.py      ◄── every later layer plugs in here
    │  registry.resolve("provider/model")       ◄── allowlist: only configured models
+   │  _build_system()  ──►  PromptService  ──►  Postgres (prompts, prompt_versions)
+   │                        render {{ variables }}, record {name, version}
    ▼
 LLMProvider adapters  app/llm/providers/
    ├─ anthropic_provider.py   official anthropic SDK
@@ -58,5 +60,15 @@ response
   Anthropic's server-side fallback: if the model's safety classifier declines, the API retries on
   Anthropic's recommended fallback model in the same call. The response's `model` field shows
   which model actually answered. Turn off with `ANTHROPIC_REFUSAL_FALLBACK=false`.
+- **Prompts are append-only versions (Layer 2).** Editing a prompt creates a new version; one
+  version is active; rollback = activate an older one. Every reply records `prompt: {name, version}`,
+  so evals (Layer 9) and audits can tie any answer to the exact text used. Requests can pin a version.
+- **Prompt rules vs SQL.** `PromptService` holds the rules; `PromptRepository` holds the queries;
+  routes stay thin. Tables are created by Alembic migrations (`backend/migrations`), never at startup.
+- **Safe templates.** `{{ variable }}` substitution only: no loops, expressions or code, so a template
+  can't execute anything. Missing values fail loudly (400) instead of sending a half-filled prompt.
+- **Database is optional.** Without `DATABASE_URL`, chat works as in Layer 1 and prompt endpoints
+  return 503. The read transaction for a prompt ends before the LLM call, so streaming doesn't hold
+  a database connection.
 - **Testability.** Every adapter accepts an injected HTTP client; tests replay realistic provider
   responses through a mock transport, so the suite needs no keys and no network.

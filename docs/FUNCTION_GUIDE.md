@@ -32,7 +32,8 @@ learn the code and to debug it.
 10. [Shutdown](#10-shutdown)
 11. [Frontend](#11-frontend)
 12. [Tests](#12-tests)
-13. [Debugging cheat sheet](#13-debugging-cheat-sheet)
+13. [Prompts (Layer 2)](#13-prompts-layer-2)
+14. [Debugging cheat sheet](#14-debugging-cheat-sheet)
 
 ---
 
@@ -47,15 +48,34 @@ What callers send and receive over HTTP.
 | Shape | What it holds | Example |
 |---|---|---|
 | `Message` | One chat message: `role` (`"user"` or `"assistant"`) and `content` (non-empty text). | `{"role": "user", "content": "Hi"}` |
-| `ChatRequest` | What the caller sends: `model` (optional `"provider/model"`), `messages` (at least one, first must be from the user), `system` (optional system prompt), `temperature` (0–2, optional), `max_tokens` (1–128,000, optional), `provider_options` (extra vendor settings, passed through). | `{"model": "openai/gpt-5", "messages": [...]}` |
+| `ChatRequest` | What the caller sends: `model` (optional `"provider/model"`), `messages` (at least one, first must be from the user), `prompt` (optional managed prompt: `{name, version?, variables}`, Layer 2), `system` (optional system prompt, or extra instructions added after `prompt`), `temperature` (0–2, optional), `max_tokens` (1–128,000, optional), `provider_options` (extra vendor settings, passed through). | `{"model": "openai/gpt-5", "prompt": {"name": "support-agent", "variables": {"company_name": "Acme"}}, "messages": [...]}` |
 | `Usage` | Token counts: `input_tokens`, `output_tokens`. | `{"input_tokens": 12, "output_tokens": 40}` |
-| `ChatResponse` | The full reply: `id`, `provider`, `model` (the one that actually answered), `content`, `finish_reason`, `usage`, `latency_ms`. | see section 5 |
-| `StreamEvent` | One streaming event: `type` (`start`/`delta`/`done`/`error`), `id`, and depending on type: `provider`, `model`, `delta` (text piece), `finish_reason`, `usage`, `latency_ms`, `error`. | `{"type": "delta", "id": "chat_…", "delta": "Hel"}` |
+| `ChatResponse` | The full reply: `id`, `provider`, `model` (the one that actually answered), `content`, `finish_reason`, `usage`, `latency_ms`, `prompt` (`{name, version}` of the managed prompt used, or absent). | see section 5 |
+| `StreamEvent` | One streaming event: `type` (`start`/`delta`/`done`/`error`), `id`, and depending on type: `provider`, `model`, `delta` (text piece), `finish_reason`, `usage`, `latency_ms`, `prompt` (on `start`/`done`), `error`. | `{"type": "delta", "id": "chat_…", "delta": "Hel"}` |
 | `ModelInfo` | One model you may call: `id` (`"provider/model"`), `provider`, `model`. | `{"id": "mock/echo", "provider": "mock", "model": "echo"}` |
 | `ModelList` | `default` (model id or null) + `data` (list of `ModelInfo`). | see section 4 |
 
 `finish_reason` is always one of: `stop` (finished normally), `length` (hit the token limit),
 `refusal` (model declined), `content_filter` (blocked by a safety filter), `other`.
+
+### Prompt shapes (`backend/app/prompts/schemas.py`, Layer 2)
+
+| Shape | What it holds |
+|---|---|
+| `PromptRef` | The `prompt` field on a chat request: `name`, optional `version` (omit = active), `variables` (name → value). |
+| `PromptUsed` | Which prompt a reply used: `name`, `version`. |
+| `PromptCreate` | New prompt: `name` (lowercase words with hyphens, 2–64 chars), `description`, `template`, `note`. |
+| `PromptUpdate` | `description`. |
+| `PromptVersionCreate` | New version: `template`, `note`, `activate` (true = switch to it now). |
+| `ActivateRequest` | `version` to make active. |
+| `RenderRequest` / `RenderResponse` | Preview input (`version?`, `variables`) and output (`name`, `version`, `text`, `variables`). |
+| `PromptVersionOut` | One version: `version`, `template`, `variables` (detected names), `note`, `created_by`, `created_at`, `is_active`. |
+| `PromptSummary` | One prompt in a list: `name`, `description`, `active_version`, `latest_version`, `active_variables`, `archived`, `created_at`, `updated_at`. |
+| `PromptDetail` | A summary plus `versions` (newest first). |
+| `PromptList` | `data`: a list of `PromptSummary`. |
+
+Database tables (`backend/app/prompts/models.py`): `prompts` (one row per prompt; `active_version` is a
+version *number*) and `prompt_versions` (one row per version, never edited; unique per prompt + number).
 
 ### Internal shapes (`backend/app/llm/base.py`)
 
@@ -88,6 +108,7 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 - **Takes in:**
   - `settings` (optional `Settings`): config to use. If not given, reads it with `get_settings()`. Tests pass their own.
   - `registry` (optional `ProviderRegistry`): a ready-made set of providers. If not given, one is built from settings at startup. Tests pass fake ones.
+  - `database` (optional `Database`): a ready-made database connection (tests). If not given, one is created at startup when `DATABASE_URL` is set.
 - **What it does:**
   1. Picks the settings (given ones, or from the environment).
   2. Turns on JSON logging at the configured level.
@@ -96,19 +117,20 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
   5. Saves the settings on `app.state.settings`.
   6. Adds CORS, so browsers on the origins in `CORS_ORIGINS` (e.g. `http://localhost:3000`) may call the API. It also lets the browser read the `X-Request-ID` header.
   7. Adds the `request_context` middleware (request id + request log).
-  8. Registers the error handler, then adds the `/health` route and the `/v1` routes.
+  8. Registers the error handler, then adds the `/health` route, the `/v1` chat routes and the `/v1/prompts` routes.
 - **Gives back:** the configured `FastAPI` app object. Providers are **not** created yet; that happens when the server starts.
 - **Can fail with:** a pydantic `ValidationError` from `get_settings()` if an env value has the wrong type (e.g. `REQUEST_TIMEOUT_S=abc`). The server won't start; the error names the bad field.
 - **Debug tips:** settings are read when `app.main` is imported. If a change to `.env` has no effect, restart the server. `.env` is read from the folder you start uvicorn in (`backend/`).
 
 #### `lifespan()` · `backend/app/main.py`
 
-- **Where:** defined inside `create_app`. **Called by:** FastAPI, once at server start and once at shutdown. **Calls:** `ProviderRegistry.from_settings`, `ProviderRegistry.aclose`.
-- **Takes in:** `app`, the FastAPI app (given by FastAPI). Also uses `settings` and `registry` from `create_app`.
+- **Where:** defined inside `create_app`. **Called by:** FastAPI, once at server start and once at shutdown. **Calls:** `ProviderRegistry.from_settings`, `Database.__init__`, `ProviderRegistry.aclose`, `Database.aclose`.
+- **Takes in:** `app`, the FastAPI app (given by FastAPI). Also uses `settings`, `registry` and `database` from `create_app`.
 - **What it does:**
   1. **Startup:** uses the given registry, or builds one from settings with `ProviderRegistry.from_settings()`, and stores it on `app.state.registry`.
-  2. Pauses (`yield`) while the server handles requests.
-  3. **Shutdown:** calls `app.state.registry.aclose()` to close all network clients.
+  2. Uses the given database, or creates `Database(DATABASE_URL)` if that's set, or `None`. Stores it on `app.state.database` and logs `prompt store: enabled` / `disabled (no DATABASE_URL)`. No connection is opened yet, so a database that's down doesn't stop startup.
+  3. Pauses (`yield`) while the server handles requests.
+  4. **Shutdown:** calls `app.state.registry.aclose()` to close all network clients, then closes the database pool, but only if `lifespan` created it (a test's database is left for the test to close).
 - **Gives back:** nothing. It's a startup/shutdown hook.
 - **Can fail with:** if building a provider fails (for example, an SDK rejects a setting), the server fails to start and the error is printed.
 - **Debug tips:** if any request fails with `AttributeError: 'State' object has no attribute 'registry'`, startup didn't run. In tests, use `with TestClient(app)` (the `with` triggers startup).
@@ -137,12 +159,12 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 
 #### `Settings._empty_to_none()` · `backend/app/core/config.py`
 
-- **Where:** a validator on `Settings`. **Called by:** pydantic, for `ANTHROPIC_EFFORT`, `OPENAI_BASE_URL`, `OLLAMA_BASE_URL`.
+- **Where:** a validator on `Settings`. **Called by:** pydantic, for `ANTHROPIC_EFFORT`, `OPENAI_BASE_URL`, `OLLAMA_BASE_URL`, `DATABASE_URL`, `DEFAULT_PROMPT_NAME`, `ADMIN_API_KEY`.
 - **Takes in:** `value`, the raw value (e.g. `""` from a line like `OLLAMA_BASE_URL=` in `.env`).
 - **What it does:** a blank or whitespace-only string becomes `None` ("not set"). Anything else passes through.
 - **Gives back:** `""` → `None`; `"http://localhost:11434"` → unchanged.
 - **Can fail with:** nothing.
-- **Debug tips:** this rule is why copying `.env.example` (which has blank values) doesn't switch Ollama on with an empty URL.
+- **Debug tips:** this rule is why copying `.env.example` (which has blank values) doesn't switch Ollama or the database on with an empty URL.
 
 #### `ProviderRegistry.from_settings()` · `backend/app/llm/registry.py`
 
@@ -231,7 +253,7 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 
 - **Where:** Mock adapter constructor. **Called by:** `ProviderRegistry.from_settings`; tests.
 - **Takes in:** `stream_delay_s`, the pause between streamed words (from `MOCK_STREAM_DELAY_S`; 0 in tests).
-- **What it does:** registers the single model `echo` and stores the delay.
+- **What it does:** registers two models, `echo` and `echo-system`, and stores the delay.
 - **Gives back:** the adapter.
 - **Can fail with:** nothing.
 - **Debug tips:** set `ENABLE_MOCK_PROVIDER=false` in production so nobody gets echo replies.
@@ -291,12 +313,12 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 
 #### `health()` · `backend/app/api/v1/routes.py`
 
-- **Where:** route `GET /health`. **Called by:** FastAPI. **Calls:** `ProviderRegistry.provider_names`.
-- **Takes in:** `registry`, from `get_registry`.
-- **What it does:** reports that the server is up and which providers are enabled.
-- **Gives back:** `{"status": "ok", "providers": ["anthropic", "mock"]}`.
-- **Can fail with:** nothing in normal operation.
-- **Debug tips:** used by Docker's health check. It does **not** contact any vendor, so "ok" doesn't prove your API keys work.
+- **Where:** route `GET /health`. **Called by:** FastAPI. **Calls:** `ProviderRegistry.provider_names`, `Database.ping`.
+- **Takes in:** `request` (to reach `app.state.database`) and `registry`, from `get_registry`.
+- **What it does:** reports that the server is up, which providers are enabled, and the database status: `disabled` (no `DATABASE_URL`), `ok` (it answered `SELECT 1`), or `unavailable` (it didn't).
+- **Gives back:** `{"status": "ok", "providers": ["anthropic", "mock"], "database": "ok"}`.
+- **Can fail with:** nothing in normal operation; a database problem shows as `"unavailable"`, not an error.
+- **Debug tips:** used by Docker's health check. It does **not** contact any LLM vendor, so "ok" doesn't prove your API keys work.
 
 #### `ProviderRegistry.provider_names()` · `backend/app/llm/registry.py`
 
@@ -356,21 +378,21 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 
 #### `get_chat_service()` · `backend/app/api/deps.py`
 
-- **Where:** `backend/app/api/deps.py`. **Called by:** FastAPI, for the `chat` and `chat_stream` routes (via the `Service` dependency). **Calls:** `get_registry`, `ChatService.__init__`.
-- **Takes in:** `request`, the current HTTP request.
-- **What it does:** creates a new `ChatService` that uses the shared registry.
+- **Where:** `backend/app/api/deps.py`. **Called by:** FastAPI, for the `chat` and `chat_stream` routes (via the `Service` dependency). **Calls:** `get_registry`, `ChatService.__init__`; FastAPI first runs `get_prompt_service` for it.
+- **Takes in:** `request`, the current HTTP request, and `prompts`, the `PromptService` (or `None` without a database) from `get_prompt_service`.
+- **What it does:** creates a new `ChatService` with the shared registry and this request's prompt service.
 - **Gives back:** a `ChatService` object (cheap; one per request).
 - **Can fail with:** same as `get_registry`.
-- **Debug tips:** later layers (prompts, auth) will add their services here, so this is where request-scoped wiring lives.
+- **Debug tips:** this is where request-scoped wiring lives; later layers (auth) will add their services here too.
 
 #### `ChatService.__init__()` · `backend/app/services/chat_service.py`
 
 - **Where:** `ChatService` constructor. **Called by:** `get_chat_service`.
-- **Takes in:** `registry`, the `ProviderRegistry`.
-- **What it does:** keeps a reference to the registry for `complete` and `stream`.
+- **Takes in:** `registry`, the `ProviderRegistry`, and `prompts`, a `PromptService` or `None` (no database).
+- **What it does:** keeps both for `complete`, `stream` and `_build_system`.
 - **Gives back:** the service object.
 - **Can fail with:** nothing.
-- **Debug tips:** nothing to debug here; it only holds the registry.
+- **Debug tips:** `prompts` is `None` exactly when `DATABASE_URL` isn't set.
 
 #### `chat()` · `backend/app/api/v1/routes.py`
 
@@ -385,23 +407,24 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 
 #### `ChatService.complete()` · `backend/app/services/chat_service.py`
 
-- **Where:** `ChatService`. **Called by:** the `chat` route. **Calls:** `ProviderRegistry.resolve`, `_new_id`, `_to_llm_request`, the chosen adapter's `complete`, `_ms_since`.
+- **Where:** `ChatService`. **Called by:** the `chat` route. **Calls:** `ProviderRegistry.resolve`, `ChatService._build_system`, `_new_id`, `_to_llm_request`, the chosen adapter's `complete`, `_ms_since`, `_prompt_label`.
 - **Takes in:** `request`, the validated `ChatRequest` from the caller.
 - **What it does:**
   1. **Picks the provider:** `registry.resolve(request.model)` turns `"openai/gpt-5"` into (OpenAI adapter, `"gpt-5"`). A missing model means the default.
-  2. **Makes an id** like `chat_3f2a…` with `_new_id()`.
-  3. **Starts a timer.**
-  4. **Converts** the public request into an internal `LLMRequest` (`_to_llm_request`) and calls `provider.complete(...)`. This is where the vendor is contacted.
-  5. **Measures** how long it took (`_ms_since`).
-  6. **Logs** `chat completed` with request id, provider, model, latency, tokens and finish reason.
-  7. **Builds** the `ChatResponse`. `model` comes from the vendor's answer, so after a Claude refusal fallback it shows the fallback model.
+  2. **Builds the system prompt** with `_build_system()`: managed prompt (rendered) + the request's own `system` text. Also gives back which prompt version was used.
+  3. **Makes an id** like `chat_3f2a…` with `_new_id()`.
+  4. **Starts a timer.**
+  5. **Converts** the public request into an internal `LLMRequest` (`_to_llm_request`) and calls `provider.complete(...)`. This is where the vendor is contacted.
+  6. **Measures** how long it took (`_ms_since`).
+  7. **Logs** `chat completed` with request id, provider, model, prompt (e.g. `support-agent@v3`), latency, tokens and finish reason.
+  8. **Builds** the `ChatResponse`. `model` comes from the vendor's answer, so after a Claude refusal fallback it shows the fallback model. `prompt` is `{name, version}` when a managed prompt was used.
 - **Gives back:**
   ```json
   {"id": "chat_3f2a…", "provider": "openai", "model": "gpt-5-2026-01-01",
    "content": "Hello!", "finish_reason": "stop",
    "usage": {"input_tokens": 9, "output_tokens": 3}, "latency_ms": 812}
   ```
-- **Can fail with:** `ModelNotFoundError` (404) from `resolve`; any `Provider*Error` from the adapter (see section 8). Nothing is logged as `chat completed` when it fails.
+- **Can fail with:** `ModelNotFoundError` (404) from `resolve`; prompt errors from `_build_system` (404/409/400/503, section 13); any `Provider*Error` from the adapter (see section 8). Nothing is logged as `chat completed` when it fails.
 - **Debug tips:**
   - `finish_reason: "length"` → raise `max_tokens`.
   - `"refusal"` / `"content_filter"` → the vendor declined; `content` may be empty.
@@ -436,10 +459,11 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 - **Takes in:**
   - `request`: the public `ChatRequest`.
   - `model`: the bare model name from `resolve` (e.g. `"gpt-5"`).
-- **What it does:** copies the fields into an internal `LLMRequest`, replacing `"openai/gpt-5"` with just `"gpt-5"`, the name the vendor understands.
+  - `system`: the final system prompt from `_build_system` (managed prompt + extra instructions), or `None`.
+- **What it does:** copies the fields into an internal `LLMRequest`, replacing `"openai/gpt-5"` with just `"gpt-5"` (the name the vendor understands) and the request's `system` with the final one.
 - **Gives back:** `LLMRequest(model="gpt-5", messages=[...], system=..., temperature=..., max_tokens=..., provider_options={...})`.
 - **Can fail with:** nothing.
-- **Debug tips:** Layer 2 (prompts) will change `system` at this point. If the system prompt the model sees is wrong, look here.
+- **Debug tips:** to see the exact system prompt a model receives, send the same request with `"model": "mock/echo-system"`.
 
 #### `_ms_since()` · `backend/app/services/chat_service.py`
 
@@ -475,18 +499,18 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 
 #### `ChatService.stream()` · `backend/app/services/chat_service.py`
 
-- **Where:** `ChatService`. **Called by:** `chat_stream`. **Calls:** `ProviderRegistry.resolve`, `_new_id`, `_to_llm_request`, the adapter's `stream`, `_ms_since`, `AppError.to_dict`.
+- **Where:** `ChatService`. **Called by:** `chat_stream`. **Calls:** `ProviderRegistry.resolve`, `ChatService._build_system`, `_new_id`, `_to_llm_request`, the adapter's `stream`, `_ms_since`, `_prompt_label`, `AppError.to_dict`.
 - **Takes in:** `request`, the validated `ChatRequest`.
 - **What it does:**
-  1. Picks the provider (`resolve`), makes an id, starts a timer, converts the request.
+  1. Picks the provider (`resolve`), builds the system prompt (`_build_system`), makes an id, starts a timer, converts the request.
   2. Starts the adapter's stream and **waits for its first chunk**. Errors here are *raised* (not turned into events), so the route can still return an HTTP error. An adapter that yields nothing at all raises `ProviderError("Provider returned an empty stream")`.
-  3. Yields `start` (id, provider, model).
+  3. Yields `start` (id, provider, model, and `prompt` if a managed prompt was used).
   4. Loops over the adapter's chunks:
      - a text chunk → yields `delta` with the text;
-     - the final chunk (`done=True`) → measures latency, logs `chat stream completed`, yields `done` with finish reason, usage and latency, then stops.
+     - the final chunk (`done=True`) → measures latency, logs `chat stream completed`, yields `done` with finish reason, usage, latency and `prompt`, then stops.
   5. If the adapter raises an `AppError` mid-stream, or ends without a final chunk → logs `chat stream failed` (with `error_code`), yields one `error` event with `{code, message, provider}`, and stops.
 - **Gives back:** a sequence of `StreamEvent`s: `start`, `delta`…, then exactly one `done` **or** `error`. All share the same `id`.
-- **Can fail with:** before `start`: `ModelNotFoundError` or any `Provider*Error` (raised). After `start`: never raises; problems become the `error` event.
+- **Can fail with:** before `start`: `ModelNotFoundError`, prompt errors, or any `Provider*Error` (raised). After `start`: never raises; problems become the `error` event.
 - **Debug tips:**
   - A stream that stops without `done` or `error` usually means the client disconnected.
   - Check the `chat stream failed` log for the `error_code`.
@@ -886,10 +910,12 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
 
 - **Where:** Mock adapter (static method). **Called by:** `MockProvider.complete`, `MockProvider.stream`.
 - **Takes in:** `request`, an `LLMRequest`.
-- **What it does:** finds the **last** user message and puts `"Echo: "` in front of it.
-- **Gives back:** e.g. `"Echo: hello world"`.
+- **What it does:**
+  - model `echo`: finds the **last** user message and puts `"Echo: "` in front of it;
+  - model `echo-system`: returns the system prompt it received, or `"(no system prompt)"`.
+- **Gives back:** e.g. `"Echo: hello world"`, or the full system prompt.
 - **Can fail with:** nothing (validation guarantees there's at least one user message).
-- **Debug tips:** the system prompt is ignored by this model.
+- **Debug tips:** use `mock/echo-system` to see exactly what system prompt (managed prompt + extra instructions) reaches a model.
 
 #### `MockProvider._usage()` · `backend/app/llm/providers/mock_provider.py`
 
@@ -977,7 +1003,7 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
 - **Takes in:** `record`, a log record (message, level, logger name, and any `extra={...}` fields).
 - **What it does:**
   1. Builds a dictionary with `ts` (UTC time), `level`, `logger`, `msg`.
-  2. Copies the known extra fields if present: `request_id`, `method`, `path`, `status`, `latency_ms`, `provider`, `model`, `input_tokens`, `output_tokens`, `finish_reason`, `error_code`.
+  2. Copies the known extra fields if present: `request_id`, `method`, `path`, `status`, `latency_ms`, `provider`, `model`, `input_tokens`, `output_tokens`, `finish_reason`, `error_code`, `prompt`.
   3. Adds the traceback (`exc`) if an exception was logged.
   4. Converts it all to one JSON line (values it can't convert become strings).
 - **Gives back:** e.g. `{"ts": "2026-11-02T05:56:02.207+00:00", "level": "INFO", "logger": "app.services.chat_service", "msg": "chat stream completed", "request_id": "chat_…", "provider": "mock", ...}`.
@@ -997,7 +1023,7 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
 - **Can fail with:** never raises.
 - **Debug tips:** warnings about unclosed connections at shutdown point to an adapter whose `aclose` didn't run.
 
-(Each adapter's own `aclose` is described in section 7.)
+(Each adapter's own `aclose` is described in section 7. `lifespan` then closes the database pool with `Database.aclose`, section 13.)
 
 ---
 
@@ -1009,7 +1035,7 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
 
 - **Where:** Next.js root layout. **Called by:** Next.js, for every page.
 - **Takes in:** `children`, the page content (here, `Home`).
-- **What it does:** renders `<html>` and `<body>`, loads the Geist fonts as CSS variables, sets the page title "Enterprise AI Platform".
+- **What it does:** renders `<html>` and `<body>`, loads the Geist fonts as CSS variables, sets the page title "Enterprise AI Platform", and puts the `NavBar` above every page. The body fills the screen height; each page fills the space under the bar.
 - **Gives back:** the page shell (JSX).
 - **Can fail with:** a build error if the fonts can't be downloaded at build time (no internet).
 - **Debug tips:** global colours live in `frontend/app/globals.css` (light and dark).
@@ -1033,16 +1059,19 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
   - `showSettings`;
   - `turns`: the messages on screen;
   - `input`: the text box;
-  - `busy`: a reply is in progress.
+  - `busy`: a reply is in progress;
+  - `prompts`, `promptsAvailable`, `promptName`, `promptVars`: the Prompt dropdown's options, whether the prompt store is reachable, the chosen prompt, and the values typed for its variables.
 - **What it does:**
   1. **Load-models effect** (runs once, after the first render):
      1. Calls `getModels()`.
      2. Success → fills the dropdown and selects the server's default, or the first model.
      3. Failure → shows the server's error message, or "Can't reach the backend. Is it running on port 8000?" for network/CORS failures.
      4. If the page closes mid-request, the request is cancelled and the cancel error is ignored.
-  2. **Auto-scroll effect** (runs whenever `turns` changes): scrolls the newest message into view.
-  3. Renders the header (model dropdown, "System prompt", "New chat"), the optional system prompt box, an error banner, the message list (user bubbles on the right, assistant replies on the left), and the composer.
-  4. Under each finished reply: `provider/model · N in / N out · 1.23s`, plus a note for `length`, `refusal`, `content_filter` or "Stopped."
+  2. **Load-prompts effect** (runs once): calls `listPrompts()`. Success → fills the Prompt dropdown. Failure (e.g. no database) → the dropdown shows "Unavailable"; chat works without it.
+  3. Works out `selectedPrompt` and `missingVars` (variables of the chosen prompt that are still empty) on every render.
+  4. **Auto-scroll effect** (runs whenever `turns` changes): scrolls the newest message into view.
+  5. Renders the header (Prompt dropdown, Model dropdown, "System prompt"/"Extra instructions", "New chat"), a row of variable inputs when the chosen prompt has variables, the optional instructions box, an error banner, the message list (user bubbles on the right, assistant replies on the left), and the composer. When variables are missing, Send is disabled and the hint under the box names them.
+  6. Under each finished reply: `provider/model · prompt name vN · N in / N out · 1.23s`, plus a note for `length`, `refusal`, `content_filter` or "Stopped."
 - **Gives back:** the chat screen (JSX).
 - **Can fail with:** nothing thrown; errors are shown on screen.
 - **Debug tips:**
@@ -1051,9 +1080,9 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
 
 #### `getModels()` · `frontend/lib/api.ts`
 
-- **Where:** API client. **Called by:** the load-models effect in `Chat`. **Calls:** `toApiError` on failure.
+- **Where:** API client. **Called by:** the load-models effect in `Chat`. **Calls:** `apiRequest`.
 - **Takes in:** `signal` (optional), used to cancel the request.
-- **What it does:** sends `GET {API_URL}/v1/models`. `API_URL` comes from `NEXT_PUBLIC_API_URL` (default `http://localhost:8000`), fixed at build time.
+- **What it does:** sends `GET {API_URL}/v1/models` through `apiRequest`. `API_URL` comes from `NEXT_PUBLIC_API_URL` (default `http://localhost:8000`), fixed at build time.
 - **Gives back:** the `ModelList` JSON: `{default, data: [...]}`.
 - **Can fail with:**
   - an `ApiError` for HTTP errors;
@@ -1063,7 +1092,7 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
 
 #### `toApiError()` · `frontend/lib/api.ts`
 
-- **Where:** API client (internal). **Called by:** `getModels`, `streamChat`.
+- **Where:** API client (internal). **Called by:** `apiRequest`, `streamChat`.
 - **Takes in:** `response`, a failed `fetch` response.
 - **What it does:** tries to read the JSON error body:
   1. Our format `{"error": {"message", "code"}}` → `ApiError(message, status, code)`.
@@ -1087,17 +1116,17 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
 #### `send()` · `frontend/components/chat.tsx`
 
 - **Where:** inside `Chat`. **Called by:** Enter key in the message box, or the Send button. **Calls:** `nextKey`, `streamChat`, `updateTurn`.
-- **Takes in:** nothing directly; reads `input`, `busy`, `model`, `system` and `turns` from the component's state.
+- **Takes in:** nothing directly; reads `input`, `busy`, `model`, `system`, `turns`, `selectedPrompt`, `promptVars` and `missingVars` from the component's state.
 - **What it does:**
-  1. Trims the input. Stops early if it's empty, a reply is already running, or no model is selected.
+  1. Trims the input. Stops early if it's empty, a reply is already running, no model is selected, or the chosen prompt has empty variables.
   2. **Builds the history:** all earlier turns that have text and no error, as `{role, content}`, plus the new user message. The backend is stateless, so the whole conversation is sent each time.
   3. Adds two turns to the screen: the user's message and an empty assistant turn marked "streaming" (shows "Thinking…").
   4. Clears the input and marks the chat busy (the Send button becomes Stop).
   5. Creates an `AbortController` so Stop can cancel.
-  6. Calls `streamChat` with `{model, messages, system}`. `system` is sent only if the box isn't blank. For each event:
-     - `start` → saves provider and model on the assistant turn;
+  6. Calls `streamChat` with `{model, messages, system, prompt}`. `system` is sent only if the box isn't blank. `prompt` is `{name, variables}` (only the chosen prompt's variables) when a prompt is selected. For each event:
+     - `start` → saves provider, model and prompt on the assistant turn;
      - `delta` → appends the text, so the reply grows on screen;
-     - `done` → saves usage, latency, finish reason, and marks it finished;
+     - `done` → saves usage, latency, finish reason, prompt, and marks it finished;
      - `error` → shows the error message under the reply.
   7. If `streamChat` throws:
      - Stop was pressed (abort) → marks the turn "Stopped.";
@@ -1194,7 +1223,7 @@ If one fails, the assertion message shows the expected vs actual value.
 #### `make_settings()` · `backend/tests/conftest.py`
 
 - **Takes in:** any settings to override, e.g. `make_settings(openai_api_key="x")`.
-- **What it does:** builds `Settings` that **ignore your real `.env` and keys**: all API keys off, Ollama off, mock on with no delay, default model `mock/echo`. Then applies the overrides.
+- **What it does:** builds `Settings` that **ignore your real `.env` and keys**: all API keys off, Ollama off, no database, no default prompt, no admin key, mock on with no delay, default model `mock/echo`. Then applies the overrides.
 - **Gives back:** a `Settings` object.
 - **Debug tips:** if tests behave differently on your machine, check that each test uses this helper rather than `get_settings()`.
 
@@ -1385,11 +1414,11 @@ If one fails, the assertion message shows the expected vs actual value.
 
 #### `test_health()` · `backend/tests/test_api.py`
 
-- **Proves:** `/health` returns `ok` with `["mock"]` and an `X-Request-ID` header.
+- **Proves:** `/health` returns `ok` with `["mock"]`, `database: "disabled"` and an `X-Request-ID` header.
 
 #### `test_models()` · `backend/tests/test_api.py`
 
-- **Proves:** `/v1/models` returns the mock model as default and in the list.
+- **Proves:** `/v1/models` returns `mock/echo` as default, and both mock models in the list.
 
 #### `test_chat()` · `backend/tests/test_api.py`
 
@@ -1452,7 +1481,7 @@ If one fails, the assertion message shows the expected vs actual value.
 #### `_all_functions()` · `backend/tests/test_docs_coverage.py`
 
 - **What it does:** runs `_python_functions` over `backend/app`, `backend/tests`, `backend/migrations`, and a regex scan over the frontend's `.ts`/`.tsx` files.
-  The regex finds named functions, arrow functions assigned to a `const`, and classes.
+  The regex finds named functions, arrow functions assigned to a `const` (including `useCallback(...)` and generic `async <T,>(...)` ones), and classes. Plain values like `const x = (a ?? b).filter(...)` are not counted.
 - **Gives back:** a list of `(file, function name)` pairs.
 
 #### `_mentioned()` · `backend/tests/test_docs_coverage.py`
@@ -1471,7 +1500,986 @@ If one fails, the assertion message shows the expected vs actual value.
 
 ---
 
-## 13. Debugging cheat sheet
+## 13. Prompts (Layer 2)
+
+Managed, versioned system prompts stored in Postgres. The order things run in is in
+[WORKFLOW_CODE_MAP.md § 13](WORKFLOW_CODE_MAP.md#13-prompts-layer-2).
+
+How the pieces split up:
+
+- **Routes** (`backend/app/api/v1/prompts.py`) only receive the request and hand it on.
+- **Service** (`backend/app/prompts/service.py`) holds every rule: versioning, activation, archiving, rendering.
+- **Repository** (`backend/app/prompts/repository.py`) holds every SQL query.
+- **Template** (`backend/app/prompts/template.py`) fills in `{{ variables }}`.
+
+### 13.1 Database connection
+
+#### `Database.__init__()` · `backend/app/db/session.py`
+
+- **Where:** `Database` class. **Called by:** `lifespan` (when `DATABASE_URL` is set), `main` in the seed script, the `database` test fixture.
+- **Takes in:**
+  - `url`: a SQLAlchemy async URL, e.g. `postgresql+asyncpg://eap:eap@localhost:5432/eap` (from `DATABASE_URL`), or `sqlite+aiosqlite:///:memory:` in tests;
+  - `echo`: print every SQL statement (debugging).
+- **What it does:**
+  1. Creates an async **engine**, the connection pool.
+     - Real databases: `pool_pre_ping` is on, so a dropped connection is replaced instead of failing a request.
+     - In-memory SQLite (tests): one shared connection is used, so all sessions see the same data.
+  2. Creates a **session factory**. `expire_on_commit=False` keeps loaded objects readable after a commit.
+- **Gives back:** the `Database` object. **No connection is opened yet**, so a database that's down doesn't stop the app from starting.
+- **Can fail with:** an error for a malformed URL or a missing driver (e.g. `postgresql://` without `+asyncpg`).
+- **Debug tips:** the URL must use an async driver: `postgresql+asyncpg://...`.
+
+#### `Database.session()` · `backend/app/db/session.py`
+
+- **Where:** `Database`. **Called by:** `get_db_session` (one per request), `main` (seed), the `prompt_service` fixture.
+- **Takes in:** nothing.
+- **What it does:** makes a new `AsyncSession`. It borrows a connection from the pool only when the first query runs.
+- **Gives back:** an `AsyncSession`, used as `async with db.session() as session:` (closed automatically at the end).
+- **Can fail with:** nothing here; connection errors appear on the first query.
+- **Debug tips:** one session = one unit of work. Don't share a session between requests.
+
+#### `Database.ping()` · `backend/app/db/session.py`
+
+- **Where:** `Database`. **Called by:** `health`.
+- **Takes in:** nothing.
+- **What it does:** opens a connection and runs `SELECT 1`. If anything fails, logs `database ping failed` with the reason.
+- **Gives back:** `True` (database answered) or `False`.
+- **Can fail with:** never raises.
+- **Debug tips:** `/health` showing `"database": "unavailable"` → read the `database ping failed` log line for the exact cause (wrong password, host down...).
+
+#### `Database.create_all()` · `backend/app/db/session.py`
+
+- **Where:** `Database`. **Called by:** the `database` test fixture. **Tests only.**
+- **Takes in:** nothing.
+- **What it does:** imports the prompt models (so their tables are known), then creates every table directly from the models.
+- **Gives back:** nothing.
+- **Can fail with:** database errors (e.g. no permission to create tables).
+- **Debug tips:** real databases must use Alembic migrations (`alembic upgrade head`), never this, so the migration history stays correct.
+
+#### `Database.drop_all()` · `backend/app/db/session.py`
+
+- **Where:** `Database`. **Called by:** the `database` test fixture (before and after each test). **Tests only.**
+- **Takes in:** nothing. **What it does:** drops every table the models define. **Gives back:** nothing.
+- **Can fail with:** database errors.
+- **Debug tips:** point `TEST_DATABASE_URL` at a **separate test database**: this deletes everything.
+
+#### `Database.aclose()` · `backend/app/db/session.py`
+
+- **Where:** `Database`. **Called by:** `lifespan` at shutdown (only if it opened the database), `main` (seed), the `database` fixture.
+- **Takes in:** nothing. **What it does:** closes every pooled connection. **Gives back:** nothing.
+- **Can fail with:** nothing in normal use.
+- **Debug tips:** warnings about unclosed connections usually mean this wasn't called.
+
+#### `utcnow()` · `backend/app/prompts/models.py`
+
+- **Where:** module-level helper in the models file. **Called by:** SQLAlchemy, to fill `created_at`/`updated_at` on new and changed rows.
+- **Takes in:** nothing.
+- **What it does:** gets the current time in UTC (time-zone aware).
+- **Gives back:** e.g. `datetime(2026, 11, 2, 6, 57, tzinfo=UTC)`.
+- **Can fail with:** nothing.
+- **Debug tips:** all stored times are UTC; the frontend converts them to the viewer's local time.
+
+### 13.2 Migrations and seeding
+
+#### `database_url()` · `backend/migrations/env.py`
+
+- **Where:** Alembic's runner. **Called by:** `run_migrations_offline`, `run_async_migrations`.
+- **Takes in:** nothing; reads `DATABASE_URL` through the app's `Settings` (environment or `backend/.env`).
+- **What it does:** returns the URL, or stops with "DATABASE_URL is not set".
+- **Gives back:** e.g. `"postgresql+asyncpg://eap:eap@localhost:5432/eap"`.
+- **Can fail with:** `RuntimeError` when the URL is missing.
+- **Debug tips:** run Alembic from the `backend/` folder so `backend/.env` is found.
+
+#### `run_migrations_offline()` · `backend/migrations/env.py`
+
+- **Where:** Alembic's runner. **Called by:** Alembic, when run with `--sql` (e.g. `uv run alembic upgrade head --sql`).
+- **Takes in:** nothing.
+- **What it does:** prints the SQL each migration *would* run, without connecting.
+- **Gives back:** nothing (SQL goes to the terminal).
+- **Can fail with:** the `database_url` error.
+- **Debug tips:** use this to review or hand the SQL to a DBA before running it in production.
+
+#### `do_run_migrations()` · `backend/migrations/env.py`
+
+- **Where:** Alembic's runner. **Called by:** `run_async_migrations` (through `run_sync`).
+- **Takes in:** `connection`, an open database connection.
+- **What it does:** tells Alembic which models to compare against (`Base.metadata`), then runs the pending migrations inside one transaction.
+- **Gives back:** nothing.
+- **Can fail with:** any SQL error in a migration. Postgres rolls back the whole transaction, so nothing is half-applied.
+- **Debug tips:** `uv run alembic current` shows which migration the database is on.
+
+#### `run_async_migrations()` · `backend/migrations/env.py`
+
+- **Where:** Alembic's runner. **Called by:** `run_migrations_online`.
+- **Takes in:** nothing.
+- **What it does:**
+  1. Creates a temporary engine (no pooling).
+  2. Connects.
+  3. Runs `do_run_migrations` on that connection.
+  4. Closes the engine.
+- **Gives back:** nothing.
+- **Can fail with:** connection errors (wrong URL or password, database down).
+- **Debug tips:** the same URL problems as `/health` → `unavailable`.
+
+#### `run_migrations_online()` · `backend/migrations/env.py`
+
+- **Where:** Alembic's runner. **Called by:** Alembic, for normal commands (`upgrade`, `downgrade`, `check`...).
+- **Takes in:** nothing. **What it does:** starts the async event loop and runs `run_async_migrations`. **Gives back:** nothing.
+- **Can fail with:** as `run_async_migrations`.
+- **Debug tips:** `uv run alembic check` fails if the models and migrations differ, so you know a new migration is needed.
+
+#### `upgrade()` · `backend/migrations/versions/0001_create_prompts.py`
+
+- **Where:** migration `0001`. **Called by:** `alembic upgrade head`.
+- **Takes in:** nothing.
+- **What it does:** creates:
+  - table `prompts`, with a unique index on `name`;
+  - table `prompt_versions`, with a foreign key to `prompts` (deleting a prompt deletes its versions), a unique rule on (prompt, version number), and an index on `prompt_id`.
+- **Gives back:** nothing.
+- **Can fail with:** "relation already exists" if the tables were made another way (e.g. `create_all`).
+- **Debug tips:** a later change to the tables goes in a **new** migration file. Never edit this one once it has run anywhere.
+
+#### `downgrade()` · `backend/migrations/versions/0001_create_prompts.py`
+
+- **Where:** migration `0001`. **Called by:** `alembic downgrade base` (or `-1`).
+- **Takes in:** nothing. **What it does:** drops both tables and their indexes. **All prompt data is lost.** **Gives back:** nothing.
+- **Can fail with:** database errors.
+- **Debug tips:** only for local development or a planned rollback.
+
+#### `seed()` · `backend/app/prompts/seed.py`
+
+- **Where:** seed script. **Called by:** `main`; `test_seed_is_idempotent`.
+- **Takes in:** `service`, a `PromptService`.
+- **What it does:** for each example prompt (`general-assistant`, and `support-agent` with `{{ company_name }}` and `{{ support_email }}`):
+  1. Checks whether it exists.
+  2. If it doesn't, creates it, with `created_by="seed"`.
+- **Gives back:** the names it created, e.g. `["general-assistant", "support-agent"]`, or `[]` when both already exist.
+- **Can fail with:** database errors.
+- **Debug tips:** safe to run any number of times; it never changes an existing prompt.
+
+#### `main()` · `backend/app/prompts/seed.py`
+
+- **Where:** seed script. **Called by:** `uv run python -m app.prompts.seed`.
+- **Takes in:** nothing; reads `DATABASE_URL`.
+- **What it does:** opens the database, runs `seed` in one session, closes the database, and prints what it created.
+- **Gives back:** nothing (prints `Created: ...` or `Nothing to do...`).
+- **Can fail with:**
+  - `SystemExit("DATABASE_URL is not set.")`;
+  - "relation does not exist" if the migrations weren't run first.
+- **Debug tips:** order matters: `alembic upgrade head` first, then the seed.
+
+### 13.3 Request dependencies
+
+#### `get_settings_from_app()` · `backend/app/api/deps.py`
+
+- **Where:** `backend/app/api/deps.py`. **Called by:** `get_prompt_service`, `require_admin`.
+- **Takes in:** `request`. **What it does:** returns the `Settings` saved on the app by `create_app`. **Gives back:** a `Settings` object.
+- **Can fail with:** nothing.
+- **Debug tips:** tests that pass their own settings to `create_app` are read through here, not from `.env`.
+
+#### `get_db_session()` · `backend/app/api/deps.py`
+
+- **Where:** `backend/app/api/deps.py`. **Called by:** FastAPI, for `get_prompt_service` (and so for every chat and prompt request).
+- **Takes in:** `request` (to find `app.state.database`).
+- **What it does:**
+  1. No database configured → gives `None`.
+  2. Otherwise opens a session for this request.
+  3. Closes it after the response (any work that wasn't committed is discarded).
+- **Gives back:** an `AsyncSession` or `None`.
+- **Can fail with:** nothing at this point; connection errors show up on the first query.
+- **Debug tips:** writes are committed explicitly by `PromptService._commit`, before the response is sent. So a 2xx reply means the change is saved.
+
+#### `get_prompt_service()` · `backend/app/api/deps.py`
+
+- **Where:** `backend/app/api/deps.py`. **Called by:** FastAPI, for `get_chat_service` and `require_prompt_service`. **Calls:** `get_settings_from_app`.
+- **Takes in:** `request`, and `session` (from `get_db_session`).
+- **What it does:** wraps the session in a `PromptService`, set up with `DEFAULT_PROMPT_NAME`.
+- **Gives back:** a `PromptService`, or `None` without a database.
+- **Can fail with:** nothing.
+- **Debug tips:** FastAPI reuses the same session for every dependency in one request.
+
+#### `require_prompt_service()` · `backend/app/api/deps.py`
+
+- **Where:** `backend/app/api/deps.py`. **Called by:** FastAPI, for every `/v1/prompts` route.
+- **Takes in:** `service` (from `get_prompt_service`).
+- **What it does:** lets the request through when there is a prompt service; otherwise stops it.
+- **Gives back:** the `PromptService`.
+- **Can fail with:** `PromptStoreUnavailableError` → **503** `prompt_store_unavailable` when `DATABASE_URL` isn't set.
+- **Debug tips:** chat routes use `get_prompt_service` instead, so chat keeps working without a database.
+
+#### `require_admin()` · `backend/app/api/deps.py`
+
+- **Where:** `backend/app/api/deps.py`. **Called by:** FastAPI, for the write routes: create, patch, archive, new version, activate. **Calls:** `get_settings_from_app`.
+- **Takes in:** `request`, and `x_admin_key` (the `X-Admin-Key` header, if sent).
+- **What it does:**
+  1. `ADMIN_API_KEY` not set → allows everything (development).
+  2. Otherwise the header must match exactly. The comparison takes the same time whether or not the key matches, so an attacker can't guess it character by character.
+- **Gives back:** nothing (lets the request through).
+- **Can fail with:** `AdminAuthError` → **401** `admin_auth_required`.
+- **Debug tips:**
+  - Reads (list, get, render) never need the key.
+  - This is a stand-in until real users and roles arrive in Layer 5.
+
+### 13.4 Prompt routes
+
+Each route only passes the request to `PromptService`; the rules and errors are described there (13.5).
+
+#### `list_prompts()` · `backend/app/api/v1/prompts.py`
+
+- **Route:** `GET /v1/prompts?include_archived=false`. **Calls:** `PromptService.list_prompts`.
+- **Takes in:** `include_archived` (query flag), `service`.
+- **Gives back:** `{"data": [PromptSummary, ...]}`, sorted by name.
+- **Debug tips:** archived prompts are hidden unless `include_archived=true`.
+
+#### `create_prompt()` · `backend/app/api/v1/prompts.py`
+
+- **Route:** `POST /v1/prompts` (admin). **Calls:** `PromptService.create_prompt`.
+- **Takes in:** `body` (`PromptCreate`: name, description, template, note), `service`.
+- **Gives back:** **201** with the new `PromptDetail` (version 1, active).
+- **Can fail with:** 422 bad name format, 409 `prompt_conflict` name taken, 401 without admin key.
+
+#### `get_prompt()` · `backend/app/api/v1/prompts.py`
+
+- **Route:** `GET /v1/prompts/{name}`. **Calls:** `PromptService.get_prompt`.
+- **Takes in:** `name`, `service`. **Gives back:** `PromptDetail` with every version (newest first).
+- **Can fail with:** 404 `prompt_not_found`.
+
+#### `update_prompt()` · `backend/app/api/v1/prompts.py`
+
+- **Route:** `PATCH /v1/prompts/{name}` (admin). **Calls:** `PromptService.update_prompt`.
+- **Takes in:** `name`, `body` (`{"description": "..."}`), `service`. **Gives back:** the updated `PromptDetail`.
+- **Can fail with:** 404, 401.
+
+#### `archive_prompt()` · `backend/app/api/v1/prompts.py`
+
+- **Route:** `DELETE /v1/prompts/{name}` (admin). **Calls:** `PromptService.archive`.
+- **Takes in:** `name`, `service`. **Gives back:** the `PromptDetail` with `archived: true`. Nothing is deleted from the database.
+- **Can fail with:** 404, 401.
+
+#### `get_prompt_version()` · `backend/app/api/v1/prompts.py`
+
+- **Route:** `GET /v1/prompts/{name}/versions/{version}`. **Calls:** `PromptService.get_version`.
+- **Takes in:** `name`, `version` (number), `service`. **Gives back:** one `PromptVersionOut`.
+- **Can fail with:** 404 `prompt_not_found` or `prompt_version_not_found`.
+
+#### `create_prompt_version()` · `backend/app/api/v1/prompts.py`
+
+- **Route:** `POST /v1/prompts/{name}/versions` (admin). **Calls:** `PromptService.add_version`.
+- **Takes in:** `name`, `body` (`template`, `note`, `activate`), `service`. **Gives back:** **201** with the new `PromptVersionOut`.
+- **Can fail with:** 404, 409 `prompt_archived`, 409 `prompt_conflict` (two saves at once), 401.
+
+#### `activate_prompt_version()` · `backend/app/api/v1/prompts.py`
+
+- **Route:** `POST /v1/prompts/{name}/activate` (admin), body `{"version": 2}`. **Calls:** `PromptService.activate`.
+- **Takes in:** `name`, `body`, `service`. **Gives back:** the `PromptDetail` with the new active version.
+- **Can fail with:** 404 (prompt or version), 409 `prompt_archived`, 401.
+- **Debug tips:** this is how you roll back: activate an older version number.
+
+#### `render_prompt()` · `backend/app/api/v1/prompts.py`
+
+- **Route:** `POST /v1/prompts/{name}/render`, body `{"version": 1, "variables": {...}}` (version optional). **Calls:** `PromptService.render`.
+- **Takes in:** `name`, `body`, `service`.
+- **Gives back:** `{"name", "version", "text", "variables"}`, the exact text a model would receive. No LLM is called.
+- **Can fail with:** 404, 409 `prompt_archived`, 400 `prompt_variable_missing`.
+
+### 13.5 Prompt service (the rules)
+
+#### `PromptService.__init__()` · `backend/app/prompts/service.py`
+
+- **Called by:** `get_prompt_service`, `main` (seed), test fixtures.
+- **Takes in:** `session` (an `AsyncSession`), `default_prompt_name` (from `DEFAULT_PROMPT_NAME`, or `None`).
+- **What it does:** keeps the session, builds a `PromptRepository` on it, and remembers the default prompt name.
+- **Gives back:** the service.
+
+#### `PromptService.list_prompts()` · `backend/app/prompts/service.py`
+
+- **Called by:** `list_prompts` route. **Calls:** `PromptRepository.list_prompts`, `latest_versions`, `active_versions`, `_summary`.
+- **Takes in:** `include_archived` (true/false).
+- **What it does:**
+  1. Loads the prompts.
+  2. In two more queries (not one per prompt), loads each prompt's highest version number and its active version.
+  3. Builds one summary per prompt.
+- **Gives back:** `PromptList`, e.g. `{"data": [{"name": "alpha", "active_version": 1, "latest_version": 2, "active_variables": ["x"], ...}]}`.
+- **Can fail with:** database errors.
+- **Debug tips:** `active_variables` is what the chat page uses to show variable inputs.
+
+#### `PromptService.get_prompt()` · `backend/app/prompts/service.py`
+
+- **Called by:** `get_prompt` route, `seed`. **Calls:** `_require_prompt`, `_detail`.
+- **Takes in:** `name`. **What it does:** finds the prompt and builds its full detail. **Gives back:** `PromptDetail`.
+- **Can fail with:** `PromptNotFoundError` (404). Archived prompts are still returned (marked `archived`).
+
+#### `PromptService.get_version()` · `backend/app/prompts/service.py`
+
+- **Called by:** `get_prompt_version` route. **Calls:** `_require_prompt`, `_require_version`, `_version_out`.
+- **Takes in:** `name`, `version`. **Gives back:** `PromptVersionOut` (with `is_active`).
+- **Can fail with:** `PromptNotFoundError`, `PromptVersionNotFoundError` (404).
+
+#### `PromptService.create_prompt()` · `backend/app/prompts/service.py`
+
+- **Called by:** `create_prompt` route, `seed`. **Calls:** `PromptRepository.get_prompt`, `_new_version`, `PromptRepository.add`, `_commit`, `_detail`.
+- **Takes in:** `body` (`PromptCreate`), `created_by` (who made it; `"seed"` from the seed script, empty until Layer 5 adds users).
+- **What it does:**
+  1. If the name is taken → conflict.
+  2. Makes the prompt row with `active_version = 1`. Its id is set right away, so the version can point to it.
+  3. Makes version 1 from the template (variables detected automatically).
+  4. Saves both in one commit.
+  5. Reads back the detail.
+- **Gives back:** `PromptDetail` with one active version.
+- **Can fail with:** `PromptConflictError` (409), whether the name was found taken, or two creates raced (the database's unique rule catches it in `_commit`).
+- **Debug tips:** the name rule (lowercase words with hyphens) is checked earlier by the request schema, giving 422.
+
+#### `PromptService.update_prompt()` · `backend/app/prompts/service.py`
+
+- **Called by:** `update_prompt` route. **Calls:** `_require_prompt`, `_commit`, `_detail`.
+- **Takes in:** `name`, `body` (`PromptUpdate` with `description`).
+- **What it does:** changes the description, commits, returns the detail. `updated_at` updates automatically.
+- **Gives back:** `PromptDetail`.
+- **Can fail with:** `PromptNotFoundError`.
+- **Debug tips:** the description is the only field that changes in place; templates always become new versions.
+
+#### `PromptService.add_version()` · `backend/app/prompts/service.py`
+
+- **Called by:** `create_prompt_version` route. **Calls:** `_require_prompt(writable=True)`, `PromptRepository.latest_versions`, `_new_version`, `PromptRepository.add`, `_commit`, `_version_out`.
+- **Takes in:** `name`, `body` (`template`, `note`, `activate`), `created_by`.
+- **What it does:**
+  1. Finds the prompt; archived → refuses.
+  2. Next number = highest existing + 1.
+  3. Saves the new version (variables detected).
+  4. Only if `activate` is true does it become active. Otherwise the old version keeps serving chat.
+  5. Touches `updated_at`, commits.
+- **Gives back:** `PromptVersionOut`, e.g. `{"version": 3, "is_active": true, "variables": ["team"], ...}`.
+- **Can fail with:** `PromptNotFoundError` (404), `PromptArchivedError` (409), `PromptConflictError` (409) if two saves pick the same number at once.
+- **Debug tips:** saving without activating is how you stage a change; activate it once it's reviewed.
+
+#### `PromptService.activate()` · `backend/app/prompts/service.py`
+
+- **Called by:** `activate_prompt_version` route. **Calls:** `_require_prompt(writable=True)`, `_require_version`, `_commit`, `_detail`.
+- **Takes in:** `name`, `version` (number).
+- **What it does:** checks that the version exists, sets it as active, commits. Chat requests without a pinned version use it from the next request.
+- **Gives back:** `PromptDetail`.
+- **Can fail with:** `PromptNotFoundError`, `PromptVersionNotFoundError` (404), `PromptArchivedError` (409).
+- **Debug tips:** **rollback** = activate an older number. Nothing is deleted, so you can roll forward again.
+
+#### `PromptService.archive()` · `backend/app/prompts/service.py`
+
+- **Called by:** `archive_prompt` route. **Calls:** `_require_prompt`, `_commit`, `_detail`.
+- **Takes in:** `name`.
+- **What it does:** stamps `archived_at` with the current time (once; archiving again changes nothing), commits.
+- **Gives back:** `PromptDetail` with `archived: true`.
+- **Can fail with:** `PromptNotFoundError`.
+- **Debug tips:**
+  - Archived prompts disappear from lists, can't be used in chat (409) and can't get new versions.
+  - All versions stay in the database for audit.
+  - There's no un-archive endpoint yet.
+
+#### `PromptService.render()` · `backend/app/prompts/service.py`
+
+- **Called by:** `render_prompt` route. **Calls:** `_render`.
+- **Takes in:** `name`, `body` (`version` optional, `variables`).
+- **What it does:** renders exactly as chat would, but returns the text instead of calling a model.
+- **Gives back:** `RenderResponse`, e.g. `{"name": "support", "version": 1, "text": "You help Acme customers.", "variables": ["company"]}`.
+- **Can fail with:** the same errors as `_render`.
+
+#### `PromptService.resolve_for_chat()` · `backend/app/prompts/service.py`
+
+- **Called by:** `ChatService._build_system`. **Calls:** `_render`.
+- **Takes in:**
+  - `ref`: the request's `prompt` field (`PromptRef`), or `None`;
+  - `has_system`: whether the request has its own `system` text.
+- **What it does:**
+  1. `ref` given → renders that prompt (pinned or active version) with its variables.
+  2. No `ref`, no `system`, and `DEFAULT_PROMPT_NAME` set → renders the default prompt, with no variables.
+  3. Otherwise → returns nothing ("no managed prompt").
+  4. Always ends the read transaction afterwards, so no database connection is held while the model is answering (which can take a while when streaming).
+- **Gives back:** `RenderedPrompt(name, version, text, variables)` or `None`.
+- **Can fail with:**
+  - `PromptNotFoundError`, `PromptVersionNotFoundError` (404);
+  - `PromptArchivedError` (409);
+  - `PromptVariableError` (400).
+- **Debug tips:** a default prompt **with variables** fails every request that doesn't send a prompt, because it's rendered with no values. Keep the default prompt free of variables.
+
+#### `PromptService._render()` · `backend/app/prompts/service.py`
+
+- **Called by:** `render`, `resolve_for_chat`. **Calls:** `_require_prompt`, `_require_version`, `template.render`.
+- **Takes in:** `name`, `version` (number or `None` for active), `variables` (name → value).
+- **What it does:**
+  1. Finds the prompt; archived → refuses.
+  2. Picks the version: the pinned one, or the active one.
+  3. Loads it.
+  4. Fills in the template.
+- **Gives back:** `RenderedPrompt`.
+- **Can fail with:**
+  - `PromptNotFoundError`;
+  - `PromptArchivedError`;
+  - `PromptVersionNotFoundError` (also when a prompt somehow has no active version);
+  - `PromptVariableError`.
+- **Debug tips:** pinned versions don't need to be active. This is how you A/B test or compare versions in evals.
+
+#### `PromptService._require_prompt()` · `backend/app/prompts/service.py`
+
+- **Called by:** almost every service method. **Calls:** `PromptRepository.get_prompt`.
+- **Takes in:** `name`, and `writable` (true when the caller is about to change the prompt).
+- **What it does:** loads the prompt; missing → error; `writable` and archived → error.
+- **Gives back:** the `Prompt` row.
+- **Can fail with:** `PromptNotFoundError` (404), `PromptArchivedError` (409).
+
+#### `PromptService._require_version()` · `backend/app/prompts/service.py`
+
+- **Called by:** `get_version`, `activate`, `_render`. **Calls:** `PromptRepository.get_version`.
+- **Takes in:** `prompt` (a `Prompt` row), `version` (number).
+- **What it does:** loads that version of that prompt, or raises.
+- **Gives back:** the `PromptVersion` row.
+- **Can fail with:** `PromptVersionNotFoundError` (404), naming the prompt and number.
+
+#### `PromptService._detail()` · `backend/app/prompts/service.py`
+
+- **Called by:** `get_prompt`, `create_prompt`, `update_prompt`, `activate`, `archive`. **Calls:** `PromptRepository.list_versions`, `_summary`, `_version_out`.
+- **Takes in:** `prompt` (a `Prompt` row).
+- **What it does:** loads all its versions (newest first), finds the active one, and builds the summary plus the version list.
+- **Gives back:** `PromptDetail`.
+- **Can fail with:** database errors.
+
+#### `PromptService._commit()` · `backend/app/prompts/service.py`
+
+- **Called by:** every write method.
+- **Takes in:** nothing.
+- **What it does:** commits the session. If the database rejects it because of a unique rule (duplicate name, or the same version number saved twice at once), it undoes the attempt and raises a clear conflict instead.
+- **Gives back:** nothing.
+- **Can fail with:** `PromptConflictError` (409) "Another change to this prompt happened at the same time. Please retry."
+- **Debug tips:** other database errors pass through unchanged and show as a 500 with a traceback in the server log.
+
+#### `_new_version()` · `backend/app/prompts/service.py`
+
+- **Called by:** `create_prompt`, `add_version`. **Calls:** `extract_variables`.
+- **Takes in:** `prompt`, `number`, `template`, `note`, `created_by`.
+- **What it does:** builds an unsaved `PromptVersion` row. Its `variables` list is detected from the template.
+- **Gives back:** the `PromptVersion` (saved later by `_commit`).
+
+#### `_summary()` · `backend/app/prompts/service.py`
+
+- **Called by:** `list_prompts`, `_detail`.
+- **Takes in:** `prompt` (row), `latest` (highest version number), `active` (the active version row or `None`).
+- **What it does:** copies the fields the API shows into a `PromptSummary`. `active_variables` comes from the active version; `archived` is true when `archived_at` is set.
+- **Gives back:** `PromptSummary`.
+
+#### `_version_out()` · `backend/app/prompts/service.py`
+
+- **Called by:** `get_version`, `add_version`, `_detail`.
+- **Takes in:** `version` (row), `prompt` (row).
+- **What it does:** copies the version's fields into `PromptVersionOut` and sets `is_active` (this number equals the prompt's `active_version`).
+- **Gives back:** `PromptVersionOut`.
+
+### 13.6 Prompt repository (the SQL)
+
+#### `PromptRepository.__init__()` · `backend/app/prompts/repository.py`
+
+- **Called by:** `PromptService.__init__`. **Takes in:** `session`. **What it does:** keeps the session for its queries.
+
+#### `PromptRepository.list_prompts()` · `backend/app/prompts/repository.py`
+
+- **Called by:** `PromptService.list_prompts`.
+- **Takes in:** `include_archived`.
+- **What it does:** `SELECT` all prompts ordered by name; without `include_archived`, only rows where `archived_at` is empty.
+- **Gives back:** a list of `Prompt` rows.
+
+#### `PromptRepository.get_prompt()` · `backend/app/prompts/repository.py`
+
+- **Called by:** `PromptService.create_prompt`, `_require_prompt`.
+- **Takes in:** `name`. **What it does:** finds the prompt with that exact name (indexed, fast). **Gives back:** a `Prompt` row or `None`.
+
+#### `PromptRepository.get_version()` · `backend/app/prompts/repository.py`
+
+- **Called by:** `PromptService._require_version`.
+- **Takes in:** `prompt_id`, `version`. **What it does:** finds that one version. **Gives back:** a `PromptVersion` row or `None`.
+
+#### `PromptRepository.list_versions()` · `backend/app/prompts/repository.py`
+
+- **Called by:** `PromptService._detail`.
+- **Takes in:** `prompt_id`. **What it does:** all versions of one prompt, highest number first. **Gives back:** a list of `PromptVersion` rows.
+
+#### `PromptRepository.latest_versions()` · `backend/app/prompts/repository.py`
+
+- **Called by:** `PromptService.list_prompts`, `PromptService.add_version`.
+- **Takes in:** `prompt_ids` (a list).
+- **What it does:** one grouped query: the highest version number per prompt. An empty list skips the query.
+- **Gives back:** a dictionary `{prompt_id: highest_number}`.
+
+#### `PromptRepository.active_versions()` · `backend/app/prompts/repository.py`
+
+- **Called by:** `PromptService.list_prompts`.
+- **Takes in:** `prompt_ids`.
+- **What it does:** one query joining each prompt to the version whose number equals its `active_version`.
+- **Gives back:** a dictionary `{prompt_id: PromptVersion}`.
+
+#### `PromptRepository.add()` · `backend/app/prompts/repository.py`
+
+- **Called by:** `PromptService.create_prompt`, `PromptService.add_version`.
+- **Takes in:** `row`, a new `Prompt` or `PromptVersion`.
+- **What it does:** stages the row in the session. It is written to the database when the service commits, so unique-rule errors surface in `_commit`, where they become 409s.
+- **Gives back:** nothing.
+
+### 13.7 Templates
+
+#### `extract_variables()` · `backend/app/prompts/template.py`
+
+- **Called by:** `render`, `_new_version` (so every saved version records its variables).
+- **Takes in:** `template`, the prompt text.
+- **What it does:**
+  1. Finds every `{{ name }}`. Spaces inside the braces are optional. A name is letters, digits and underscores, and can't start with a digit.
+  2. Keeps each name once, in order of first appearance.
+- **Gives back:** `"Hi {{ name }}, welcome to {{company}}. Bye {{name}}."` → `["name", "company"]`.
+- **Can fail with:** nothing.
+- **Debug tips:** `{{ 1abc }}`, `{{ a-b }}` and single braces `{ x }` are **not** variables; they stay as literal text. The frontend has an identical rule (`extractVariables` in `frontend/lib/template.ts`).
+
+#### `render()` · `backend/app/prompts/template.py`
+
+- **Called by:** `PromptService._render`. **Calls:** `extract_variables`.
+- **Takes in:** `template`, and `variables` (name → text/number/true-false).
+- **What it does:**
+  1. Lists every variable the template needs that has no value. Any missing → one error naming **all** of them.
+  2. Replaces each `{{ name }}` with its value as text. Extra values are ignored; everything else in the template is left exactly as written. There are no loops, conditions or code, so a template can't run anything.
+- **Gives back:** `render("Hi {{ name }} ({{ age }})", {"name": "Ada", "age": 36})` → `"Hi Ada (36)"`.
+- **Can fail with:** `PromptVariableError` → 400 `prompt_variable_missing`, e.g. "Missing values for prompt variables: company, region".
+- **Debug tips:** values are inserted as-is. A value that contains `{{ x }}` is not rendered again.
+
+### 13.8 Chat integration
+
+#### `ChatService._build_system()` · `backend/app/services/chat_service.py`
+
+- **Called by:** `ChatService.complete`, `ChatService.stream` (before the provider is called). **Calls:** `PromptService.resolve_for_chat`.
+- **Takes in:** `request`, the `ChatRequest`.
+- **What it does:**
+  1. No prompt service (no database):
+     - the request names a prompt → error;
+     - otherwise → the request's `system` as is.
+  2. Asks `resolve_for_chat` which managed prompt applies.
+  3. None applies → the request's `system` as is.
+  4. One applies → final system prompt = rendered prompt text, then a blank line, then the request's `system` (if any).
+- **Gives back:** `(final_system_text, PromptUsed or None)`, e.g. `("You help Acme customers.\n\nReply in French.", PromptUsed(name="support", version=1))`.
+- **Can fail with:**
+  - `PromptStoreUnavailableError` (503);
+  - the prompt errors from `resolve_for_chat` (404/409/400).
+  These happen before the provider is called, so a stream fails with a normal HTTP error.
+- **Debug tips:** see the final text with `"model": "mock/echo-system"`.
+
+#### `_prompt_label()` · `backend/app/services/chat_service.py`
+
+- **Called by:** `ChatService.complete`, `ChatService.stream` (for logs).
+- **Takes in:** `prompt`, a `PromptUsed` or `None`.
+- **Gives back:** `"support-agent@v3"` or `None`.
+- **Debug tips:** search logs for `"prompt": "support-agent@v3"` to find every reply that used that version.
+
+### 13.9 Frontend: Prompts page and helpers
+
+#### `Prompts()` · `frontend/app/prompts/page.tsx`
+
+- **Where:** the `/prompts` route. **Called by:** Next.js. **Calls:** `PromptsPage`.
+- **What it does:** sets the tab title "Prompts · Enterprise AI Platform" and renders the Prompts page.
+
+#### `NavBar()` · `frontend/components/nav.tsx`
+
+- **Where:** top bar (client component). **Called by:** `RootLayout`, on every page.
+- **Takes in:** nothing; reads the current path with `usePathname()`.
+- **What it does:** shows the app name and the **Chat** and **Prompts** links. The current page's link is highlighted and marked `aria-current="page"`.
+- **Debug tips:** Next.js keeps a page you left mounted (hidden). That's why Chat keeps your draft and selections when you come back.
+
+#### `PromptsPage()` · `frontend/components/prompts/prompts-page.tsx`
+
+- **Called by:** `Prompts`. **Calls:** `useAdminKey`, `listPrompts`, `errorMessage`, `NewPromptForm`, `PromptDetailPanel`.
+- **Takes in:** nothing. State:
+  - `prompts`, `loading`, `loadError`;
+  - `showArchived`;
+  - `selected` (prompt name);
+  - `creating`;
+  - `refreshKey` (bumped to reload).
+- **What it does:**
+  1. **Load-list effect** (on first view, when "Show archived" changes, and after `reload`): `listPrompts()`. Results arriving after the page changed again are ignored.
+  2. Renders:
+     - the header: title, `AdminKeyInput`, **New prompt**;
+     - any error banner;
+     - the list on the left: name, `vN of M` or "archived", description;
+     - on the right: the new-prompt form, the selected prompt's detail, or a hint.
+- **Can fail with:** nothing thrown; errors are shown in the banner (via `errorMessage`).
+- **Debug tips:** "The prompt store isn't configured" means the backend has no `DATABASE_URL`.
+
+#### `reload()` · `frontend/components/prompts/prompts-page.tsx`
+
+- **Called by:** `PromptDetailPanel` (after each change, as `onChanged`), `NewPromptForm` (after creating).
+- **What it does:** bumps `refreshKey`, which re-runs the load-list effect, so the list shows the latest versions and archive states.
+
+#### `NewPromptForm()` · `frontend/components/prompts/prompts-page.tsx`
+
+- **Called by:** `PromptsPage` when "New prompt" is clicked. **Calls:** `submit`, `extractVariables`, `VariableChips`.
+- **Takes in:** `adminKey`, `onCreated(name)`, `onCancel()`.
+- **What it does:** a form with name, description, template and version note. The browser checks the name format (lowercase words with hyphens). While you type the template, the detected variables are shown live.
+- **Debug tips:** the server checks the name again (422 if it's invalid).
+
+#### `submit()` · `frontend/components/prompts/prompts-page.tsx`
+
+- **Called by:** the New prompt form's submit. **Calls:** `createPrompt`, `errorMessage`.
+- **Takes in:** `e`, the form event.
+- **What it does:** stops the page from reloading, sends `createPrompt` with the admin key, then calls `onCreated(name)`, which opens the new prompt and refreshes the list. On failure, shows the error under the form (e.g. "A prompt named ... already exists.").
+
+#### `PromptDetailPanel()` · `frontend/components/prompts/prompt-detail.tsx`
+
+- **Called by:** `PromptsPage` for the selected prompt (rebuilt fresh when another prompt is selected). **Calls:** `getPrompt`, `run`, `saveVersion`, `VersionList`, `VariableChips`, `RenderPreview`, `VersionEditor`.
+- **Takes in:** `name`, `adminKey`, `onChanged` (the page's `reload`).
+- **What it does:**
+  1. **Load-detail effect** (first view and after each successful change): `getPrompt(name)`. On first load it views the active version.
+  2. Header: name, **Archive** (asks for confirmation), description with **Edit**, "Active vN · Latest vM", and the JSON snippet to use this prompt in chat.
+  3. `VersionList`, then the viewed version's template, variables and `RenderPreview`, then `VersionEditor` (hidden for archived prompts).
+- **Can fail with:** nothing thrown; errors appear under the header.
+
+#### `run()` · `frontend/components/prompts/prompt-detail.tsx`
+
+- **Called by:** the Archive, Save description and Make active / Roll back actions, and `saveVersion`.
+- **Takes in:** `action`, a function that makes one API call.
+- **What it does:**
+  1. Marks the panel busy (buttons disabled) and clears the old error.
+  2. Runs the action.
+  3. **Success:** reloads the panel, tells the page to reload the list, and returns the action's result.
+  4. **Failure:** shows the error and returns `undefined`.
+- **Gives back:** the result, or `undefined` on failure.
+- **Debug tips:** every change goes through here, so the panel and the list can't disagree after a change.
+
+#### `saveVersion()` · `frontend/components/prompts/prompt-detail.tsx`
+
+- **Called by:** `VersionEditor`'s **Save as new version**. **Calls:** `run`, `addPromptVersion`.
+- **Takes in:** `template`, `note`, `activate`.
+- **What it does:** saves the version, then switches the view to the new version number.
+- **Gives back:** `true` if saved, `false` if it failed.
+
+#### `VersionList()` · `frontend/components/prompts/prompt-detail.tsx`
+
+- **Called by:** `PromptDetailPanel`.
+- **Takes in:**
+  - `versions`, `activeVersion`;
+  - `viewing` (highlighted row);
+  - `canChange` (false while busy or archived);
+  - `onView(n)`, `onActivate(n)`.
+- **What it does:** one row per version: number, note, local time, and either an **Active** badge or a button. The button reads **Roll back to vN** for older versions and **Make active** for newer ones. Each row also has a **View** button.
+
+#### `RenderPreview()` · `frontend/components/prompts/prompt-detail.tsx`
+
+- **Called by:** `PromptDetailPanel`, for the viewed version (reset when the version changes). **Calls:** `preview`.
+- **Takes in:** `name`, `version` (the `PromptVersion`).
+- **What it does:** one input per variable, a **Render vN** button, and the rendered text or an error.
+
+#### `preview()` · `frontend/components/prompts/prompt-detail.tsx`
+
+- **Called by:** the **Render vN** button. **Calls:** `renderPrompt`, `errorMessage`.
+- **What it does:** sends the typed values for that exact version, then shows the returned text. On error (e.g. missing variables), it shows the message and hides any old text.
+
+#### `VersionEditor()` · `frontend/components/prompts/prompt-detail.tsx`
+
+- **Called by:** `PromptDetailPanel` (reset whenever the viewed version changes). **Calls:** `extractVariables`, `VariableChips`, `onSave` (`saveVersion`).
+- **Takes in:** `startFrom` (the viewed version), `busy`, `onSave(template, note, activate)`.
+- **What it does:**
+  1. Shows a template box pre-filled with the viewed version, the detected variables (live), a note field, and "Make it active right away" (on by default).
+  2. Save is disabled until the template differs from the starting version.
+- **Debug tips:** to stage a change without affecting chat, untick "Make it active right away".
+
+#### `VariableChips()` · `frontend/components/prompts/prompt-detail.tsx`
+
+- **Called by:** `NewPromptForm`, `PromptDetailPanel`, `VersionEditor`.
+- **Takes in:** `names`, a list of variable names.
+- **What it does:** shows them as small code labels, or "No variables."
+
+#### `errorMessage()` · `frontend/components/prompts/messages.ts`
+
+- **Called by:** every Prompts-page component that shows an error.
+- **Takes in:** `err`, anything thrown by an API call.
+- **What it does:** turns it into one clear sentence:
+  - `prompt_store_unavailable` → "set DATABASE_URL in backend/.env";
+  - `admin_auth_required` → "enter the admin key at the top of the page";
+  - any other server error → its message;
+  - a network failure → "Can't reach the backend...".
+- **Gives back:** the message text.
+
+#### `useAdminKey()` · `frontend/components/prompts/admin-key.tsx`
+
+- **Called by:** `PromptsPage`. **Calls:** React's `useSyncExternalStore` with `subscribe` and `readKey`; returns `setKey`.
+- **Takes in:** nothing.
+- **What it does:** keeps the admin key in **sessionStorage**: it survives reloads but is forgotten when the tab closes. During server rendering the key is empty, which avoids a mismatch between server and browser.
+- **Gives back:** `[key, setKey]`.
+- **Debug tips:** the key is never sent for reads, only for changes (as `X-Admin-Key`).
+
+#### `subscribe()` · `frontend/components/prompts/admin-key.tsx`
+
+- **Called by:** React (through `useAdminKey`).
+- **Takes in:** `onChange`, a function React wants called when the key changes.
+- **What it does:** listens for storage changes and for this app's own "admin key changed" event.
+- **Gives back:** a function that stops listening.
+
+#### `readKey()` · `frontend/components/prompts/admin-key.tsx`
+
+- **Called by:** React (through `useAdminKey`), on every render.
+- **What it does:** reads the key from sessionStorage, or from an in-memory copy if storage is blocked (e.g. strict privacy settings).
+- **Gives back:** the key, or `""`.
+
+#### `setKey()` · `frontend/components/prompts/admin-key.tsx`
+
+- **Called by:** `AdminKeyInput` (through `useAdminKey`).
+- **Takes in:** `value`, the new key (empty = forget it).
+- **What it does:** saves it in memory and in sessionStorage (or removes it), then fires the change event so the page re-renders with it.
+
+#### `AdminKeyInput()` · `frontend/components/prompts/admin-key.tsx`
+
+- **Called by:** `PromptsPage`.
+- **Takes in:** `value`, `onChange`.
+- **What it does:** a password field labelled "Admin key", hinting it's only needed when the backend sets `ADMIN_API_KEY`.
+
+#### `extractVariables()` · `frontend/lib/template.ts`
+
+- **Called by:** `NewPromptForm`, `VersionEditor`.
+- **Takes in:** `template`.
+- **What it does:** the same rule as the backend's `extract_variables`: `{{ name }}` placeholders, each name once, in order.
+- **Gives back:** e.g. `["company", "product"]`.
+- **Debug tips:** if the live chips and the saved version's variables ever differ, the two rules have drifted. Keep them identical.
+
+#### `apiRequest()` · `frontend/lib/api.ts`
+
+- **Called by:** `getModels` and every prompt API function below. **Calls:** `toApiError` on failure.
+- **Takes in:**
+  - `path` (e.g. `/v1/prompts`);
+  - `options`: `method`, `body` (sent as JSON), `adminKey` (sent as `X-Admin-Key`), `signal`.
+- **What it does:**
+  1. Builds the request: JSON content type only when there's a body; admin header only when a key is given.
+  2. Sends it.
+  3. Not OK → throws `ApiError`.
+  4. Otherwise parses the JSON reply.
+- **Gives back:** the parsed reply.
+- **Can fail with:** `ApiError`, network errors, `AbortError`.
+
+#### `listPrompts()` · `frontend/lib/api.ts`
+
+- **Called by:** `PromptsPage`, `Chat`.
+- **Takes in:** `includeArchived`, `signal`.
+- **What it does:** `GET /v1/prompts` (with `?include_archived=true` when asked).
+- **Gives back:** `{data: PromptSummary[]}`.
+
+#### `getPrompt()` · `frontend/lib/api.ts`
+
+- **Called by:** `PromptDetailPanel`. **Takes in:** `name`. **What it does:** `GET /v1/prompts/{name}` (the name is URL-encoded). **Gives back:** `PromptDetail`.
+
+#### `createPrompt()` · `frontend/lib/api.ts`
+
+- **Called by:** `submit`.
+- **Takes in:** `{name, description, template, note}` and `adminKey`.
+- **What it does:** `POST /v1/prompts`. **Gives back:** the new `PromptDetail`.
+
+#### `updatePromptDescription()` · `frontend/lib/api.ts`
+
+- **Called by:** the description **Save** in `PromptDetailPanel`.
+- **Takes in:** `name`, `description`, `adminKey`.
+- **What it does:** `PATCH /v1/prompts/{name}`. **Gives back:** `PromptDetail`.
+
+#### `addPromptVersion()` · `frontend/lib/api.ts`
+
+- **Called by:** `saveVersion`.
+- **Takes in:** `name`, `{template, note, activate}`, `adminKey`.
+- **What it does:** `POST /v1/prompts/{name}/versions`. **Gives back:** the new `PromptVersion`.
+
+#### `activatePromptVersion()` · `frontend/lib/api.ts`
+
+- **Called by:** `VersionList`'s Make active / Roll back (through `run`).
+- **Takes in:** `name`, `version`, `adminKey`.
+- **What it does:** `POST /v1/prompts/{name}/activate`. **Gives back:** `PromptDetail`.
+
+#### `archivePrompt()` · `frontend/lib/api.ts`
+
+- **Called by:** the **Archive** button (through `run`).
+- **Takes in:** `name`, `adminKey`.
+- **What it does:** `DELETE /v1/prompts/{name}`. **Gives back:** `PromptDetail` (archived).
+
+#### `renderPrompt()` · `frontend/lib/api.ts`
+
+- **Called by:** `preview`.
+- **Takes in:** `name`, `{version?, variables}`.
+- **What it does:** `POST /v1/prompts/{name}/render`. **Gives back:** `{name, version, text, variables}`.
+
+### 13.10 Prompt tests
+
+Run them on SQLite (default) or real Postgres:
+`TEST_DATABASE_URL=postgresql+asyncpg://eap:eap@localhost:5432/eap_test uv run pytest`.
+
+#### `database()` · `backend/tests/conftest.py`
+
+- **What it does:** a pytest fixture. Creates a `Database` on `TEST_DATABASE_URL` (default: in-memory SQLite), drops and recreates the tables, hands it to the test, then drops the tables and closes it.
+- **Debug tips:** never point it at a database you care about.
+
+#### `prompt_service()` · `backend/tests/conftest.py`
+
+- **What it does:** a pytest fixture. A `PromptService` on a fresh session of the test database.
+
+#### `api_factory()` · `backend/tests/conftest.py`
+
+- **What it does:** a pytest fixture that gives the test a `factory` for building full apps on the test database.
+- **Used as:** `async with api_factory(admin_api_key="x") as api:` → `api` is an HTTP client.
+
+#### `factory()` · `backend/tests/conftest.py`
+
+- **Takes in:** settings overrides (e.g. `default_prompt_name="support"`).
+- **What it does:** an inner helper of `api_factory`: builds the app with `make_settings(...)` and the test database, wrapped in an `AppClient`.
+
+#### `AppClient.__init__()` · `backend/tests/conftest.py`
+
+- **Takes in:** `app`. **What it does:** keeps the app until the test enters the `async with` block.
+
+#### `AppClient.__aenter__()` · `backend/tests/conftest.py`
+
+- **What it does:** runs the app's startup (`lifespan`), then gives an `httpx.AsyncClient` that calls the app directly in memory.
+- **Gives back:** the client.
+- **Debug tips:** it runs in the test's own event loop, which async database drivers need.
+
+#### `AppClient.__aexit__()` · `backend/tests/conftest.py`
+
+- **What it does:** closes the client and runs the app's shutdown.
+
+#### `test_extract_variables_in_order_without_duplicates()` · `backend/tests/test_prompt_template.py`
+
+- **Proves:** names come back in first-seen order, once each, with or without spaces inside the braces.
+
+#### `test_extract_ignores_things_that_are_not_variables()` · `backend/tests/test_prompt_template.py`
+
+- **Proves:** `{{ 1abc }}`, `{{ a-b }}`, `{ x }` and `{{}}` aren't variables; `{{ ok_1 }}` is.
+
+#### `test_render_fills_values_and_ignores_extras()` · `backend/tests/test_prompt_template.py`
+
+- **Proves:** values (including numbers) are filled in and unused values are ignored.
+
+#### `test_render_leaves_non_variable_braces_alone()` · `backend/tests/test_prompt_template.py`
+
+- **Proves:** JSON-like braces in a template are left untouched.
+
+#### `test_render_missing_variable_names_all_missing()` · `backend/tests/test_prompt_template.py`
+
+- **Proves:** the error names every missing variable, not just the first.
+
+#### `test_create_makes_version_1_active()` · `backend/tests/test_prompt_service.py`
+
+- **Proves:** a new prompt has version 1, active, with detected variables and `created_by` saved.
+
+#### `test_duplicate_name_conflicts()` · `backend/tests/test_prompt_service.py`
+
+- **Proves:** creating the same name twice raises `PromptConflictError`.
+
+#### `test_new_versions_count_up_and_activate_only_when_asked()` · `backend/tests/test_prompt_service.py`
+
+- **Proves:**
+  - Versions number 2, 3.
+  - Only `activate=True` switches the active version.
+  - The detail lists versions newest first.
+
+#### `test_activate_older_version_is_a_rollback()` · `backend/tests/test_prompt_service.py`
+
+- **Proves:** activating v1 after v2 makes chat render v1's text again.
+
+#### `test_activate_missing_version()` · `backend/tests/test_prompt_service.py`
+
+- **Proves:** activating a version that doesn't exist raises `PromptVersionNotFoundError`.
+
+#### `test_unknown_prompt()` · `backend/tests/test_prompt_service.py`
+
+- **Proves:** an unknown name raises `PromptNotFoundError`.
+
+#### `test_update_description()` · `backend/tests/test_prompt_service.py`
+
+- **Proves:** the description can be changed.
+
+#### `test_archive_hides_and_blocks_use_and_changes()` · `backend/tests/test_prompt_service.py`
+
+- **Proves:** an archived prompt:
+  - is hidden from the default list, but shown with `include_archived`;
+  - can't get new versions;
+  - can't be used in chat.
+
+#### `test_render_specific_version_and_missing_variable()` · `backend/tests/test_prompt_service.py`
+
+- **Proves:**
+  - Rendering a pinned old version works.
+  - Rendering with no version uses the active one.
+  - Missing values raise `PromptVariableError`.
+
+#### `test_default_prompt_applies_only_without_system()` · `backend/tests/test_prompt_service.py`
+
+- **Proves:** `DEFAULT_PROMPT_NAME` applies when a request has no `system`, and is skipped when it has one.
+
+#### `test_no_prompt_and_no_default_returns_none()` · `backend/tests/test_prompt_service.py`
+
+- **Proves:** with no prompt and no default, chat gets no managed prompt.
+
+#### `test_list_summaries()` · `backend/tests/test_prompt_service.py`
+
+- **Proves:** list summaries show the right active version, latest version and active variables per prompt, sorted by name.
+
+#### `test_seed_is_idempotent()` · `backend/tests/test_prompt_service.py`
+
+- **Proves:** the seed creates both examples once; a second run creates nothing.
+
+#### `parse_sse()` · `backend/tests/test_prompts_api.py`
+
+- **What it does:** turns an SSE body into a list of event dictionaries (same as the one in `test_api.py`).
+
+#### `test_prompt_lifecycle()` · `backend/tests/test_prompts_api.py`
+
+- **Proves:** through HTTP, each step works and returns the right data: create, new version, activate, roll back, read a version, edit description, render, list, archive.
+
+#### `test_errors_have_clear_codes()` · `backend/tests/test_prompts_api.py`
+
+- **Proves:** each error has the right status and code:
+  - duplicate → 409 `prompt_conflict`;
+  - unknown → 404 `prompt_not_found`;
+  - bad version → 404 `prompt_version_not_found`;
+  - missing variable → 400 `prompt_variable_missing`;
+  - bad name → 422.
+
+#### `test_admin_key_required_for_writes_when_configured()` · `backend/tests/test_prompts_api.py`
+
+- **Proves:** with `ADMIN_API_KEY` set:
+  - a write with a missing or wrong key → 401;
+  - the right key works;
+  - reads need no key.
+
+#### `test_without_database_prompts_return_503_and_chat_still_works()` · `backend/tests/test_prompts_api.py`
+
+- **Proves:** with no database:
+  - prompt endpoints → 503;
+  - a chat that names a prompt → 503;
+  - plain chat still works.
+
+#### `test_chat_uses_rendered_prompt_then_extra_system()` · `backend/tests/test_prompts_api.py`
+
+- **Proves:** the model receives the rendered prompt, a blank line, then the request's `system`; the reply records `{name, version}`.
+
+#### `test_chat_with_pinned_version_and_missing_variable()` · `backend/tests/test_prompts_api.py`
+
+- **Proves:**
+  - A pinned old version is used even when a newer one is active.
+  - No version uses the active one.
+  - Missing variables → 400.
+
+#### `test_default_prompt_applies_when_request_has_no_system()` · `backend/tests/test_prompts_api.py`
+
+- **Proves:**
+  - The default prompt is used when a request has no `system`.
+  - A request with its own `system` gets only that, and no `prompt` on the reply.
+
+#### `test_stream_reports_prompt_and_errors_before_stream()` · `backend/tests/test_prompts_api.py`
+
+- **Proves:**
+  - Streaming `start` and `done` events carry `prompt`.
+  - The streamed text is the rendered prompt.
+  - An unknown prompt on the streaming route is a normal 404, not a broken stream.
+
+#### `test_health_reports_database()` · `backend/tests/test_prompts_api.py`
+
+- **Proves:** `/health` reports `database: "ok"` when the database answers.
+
+---
+
+## 14. Debugging cheat sheet
 
 | Symptom | Most likely cause | Where to look |
 |---|---|---|
@@ -1488,3 +2496,12 @@ If one fails, the assertion message shows the expected vs actual value.
 | UI says "Can't reach the backend" | Backend down, wrong `NEXT_PUBLIC_API_URL`, or CORS | Browser console; `CORS_ORIGINS` |
 | Stream arrives all at once | A proxy is buffering | Proxy config; test with `curl -N` |
 | Trace one request end to end | — | Send `X-Request-ID: my-id` and search logs; the reply's `id` is in `chat completed` |
+| 503 `prompt_store_unavailable` | `DATABASE_URL` not set (or prompt used without a database) | `prompt store:` log at startup; `/health` → `database` |
+| `/health` says `database: "unavailable"` | Postgres down or wrong URL/password | `database ping failed` log; `Database.ping` |
+| 404 `prompt_not_found` / `prompt_version_not_found` | Wrong prompt name or version number | `GET /v1/prompts` |
+| 409 `prompt_archived` | Prompt was archived | `GET /v1/prompts?include_archived=true` |
+| 409 `prompt_conflict` | Name already taken, or two saves at once | Retry; pick another name |
+| 400 `prompt_variable_missing` | A `{{ variable }}` has no value | The message lists the missing names; `render` |
+| 401 `admin_auth_required` | `ADMIN_API_KEY` set, header missing or wrong | Admin key field on the Prompts page |
+| Model ignores the prompt | Prompt not applied, or `system` overrides it | Send the same request to `mock/echo-system` to see the final system prompt |
+| Tables missing (`relation "prompts" does not exist`) | Migrations not run | `uv run alembic upgrade head` |

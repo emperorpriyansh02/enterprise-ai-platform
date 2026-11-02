@@ -1,14 +1,22 @@
 import json
-from collections.abc import Callable
+import os
+from collections.abc import AsyncIterator, Callable
 
+import httpx
 import httpx2
 import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings
+from app.db.session import Database
 from app.llm.base import LLMRequest
 from app.main import create_app
+from app.prompts.service import PromptService
 from app.schemas.chat import Message
+
+# Database tests use in-memory SQLite unless TEST_DATABASE_URL points at a real database, e.g.
+#   TEST_DATABASE_URL=postgresql+asyncpg://eap:eap@localhost:5432/eap_test uv run pytest
+TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 
 def make_settings(**overrides) -> Settings:
@@ -18,6 +26,9 @@ def make_settings(**overrides) -> Settings:
         "openai_api_key": None,
         "gemini_api_key": None,
         "ollama_base_url": None,
+        "database_url": None,
+        "default_prompt_name": None,
+        "admin_api_key": None,
         "enable_mock_provider": True,
         "mock_stream_delay_s": 0.0,
         "default_model": "mock/echo",
@@ -70,3 +81,47 @@ class Recorder:
     @property
     def last_json(self) -> dict:
         return json.loads(self.requests[-1].content)
+
+
+@pytest.fixture
+async def database() -> AsyncIterator[Database]:
+    """A database with empty prompt tables, wiped after the test."""
+    db = Database(TEST_DATABASE_URL)
+    await db.drop_all()
+    await db.create_all()
+    yield db
+    await db.drop_all()
+    await db.aclose()
+
+
+@pytest.fixture
+async def prompt_service(database: Database) -> AsyncIterator[PromptService]:
+    async with database.session() as session:
+        yield PromptService(session)
+
+
+@pytest.fixture
+def api_factory(database: Database):
+    """Build an async HTTP client for the full app with a database: `async with api_factory() as api`."""
+
+    def factory(**settings_overrides) -> "AppClient":
+        return AppClient(create_app(make_settings(**settings_overrides), database=database))
+
+    return factory
+
+
+class AppClient:
+    """Runs the app's startup/shutdown and gives an httpx client bound to it (same event loop)."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __aenter__(self) -> httpx.AsyncClient:
+        self._lifespan = self.app.router.lifespan_context(self.app)
+        await self._lifespan.__aenter__()
+        self._client = httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app), base_url="http://test")
+        return self._client
+
+    async def __aexit__(self, *exc) -> None:
+        await self._client.aclose()
+        await self._lifespan.__aexit__(*exc)

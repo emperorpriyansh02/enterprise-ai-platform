@@ -59,6 +59,17 @@ class Settings(BaseSettings):
     enable_mock_provider: bool = True
     mock_stream_delay_s: float = 0.03
 
+    # --- Database (Layer 2 prompts; later RAG and RBAC). Blank = prompt features off. ---
+    # Example: postgresql+asyncpg://eap:eap@localhost:5432/eap
+    database_url: str | None = None
+
+    # --- Prompts (Layer 2) ---
+    # Prompt used when a chat request has neither `prompt` nor `system`. Blank = none.
+    default_prompt_name: str | None = None
+    # Required in the X-Admin-Key header for prompt changes. Blank = no check (dev only).
+    # Temporary until RBAC (Layer 5).
+    admin_api_key: SecretStr | None = None
+
     @field_validator(
         "cors_origins",
         "anthropic_models",
@@ -74,7 +85,15 @@ class Settings(BaseSettings):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
 
-    @field_validator("anthropic_effort", "openai_base_url", "ollama_base_url", mode="before")
+    @field_validator(
+        "anthropic_effort",
+        "openai_base_url",
+        "ollama_base_url",
+        "database_url",
+        "default_prompt_name",
+        "admin_api_key",
+        mode="before",
+    )
     @classmethod
     def _empty_to_none(cls, value: object) -> object:
         if isinstance(value, str) and not value.strip():

@@ -1,4 +1,8 @@
-"""Mock provider that echoes the last user message. Used by tests and keyless local demos.
+"""Mock provider for tests and keyless local demos.
+
+Models:
+- echo         replies "Echo: <last user message>"
+- echo-system  replies with the system prompt it received (to check what prompt reached the model)
 
 Disable it in production with ENABLE_MOCK_PROVIDER=false.
 """
@@ -16,11 +20,13 @@ class MockProvider(LLMProvider):
     name = NAME
 
     def __init__(self, *, stream_delay_s: float = 0.0) -> None:
-        super().__init__(["echo"])
+        super().__init__(["echo", "echo-system"])
         self._delay = stream_delay_s
 
     @staticmethod
     def _reply(request: LLMRequest) -> str:
+        if request.model == "echo-system":
+            return request.system or "(no system prompt)"
         last_user = next(m.content for m in reversed(request.messages) if m.role == "user")
         return f"Echo: {last_user}"
 

@@ -13,14 +13,17 @@ HELLO = {"model": "mock/echo", "messages": [{"role": "user", "content": "hello w
 def test_health(client: TestClient):
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "providers": ["mock"]}
+    assert response.json() == {"status": "ok", "providers": ["mock"], "database": "disabled"}
     assert response.headers["X-Request-ID"]
 
 
 def test_models(client: TestClient):
     body = client.get("/v1/models").json()
     assert body["default"] == "mock/echo"
-    assert body["data"] == [{"id": "mock/echo", "provider": "mock", "model": "echo"}]
+    assert body["data"] == [
+        {"id": "mock/echo", "provider": "mock", "model": "echo"},
+        {"id": "mock/echo-system", "provider": "mock", "model": "echo-system"},
+    ]
 
 
 def test_chat(client: TestClient):

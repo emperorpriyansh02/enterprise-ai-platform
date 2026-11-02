@@ -67,6 +67,54 @@ class ProviderUnavailableError(ProviderError):
     code = "provider_unavailable"
 
 
+# --- Prompts (Layer 2) ---
+
+
+class PromptNotFoundError(AppError):
+    status_code = 404
+    code = "prompt_not_found"
+
+
+class PromptVersionNotFoundError(AppError):
+    status_code = 404
+    code = "prompt_version_not_found"
+
+
+class PromptConflictError(AppError):
+    """A prompt with this name already exists, or two changes collided."""
+
+    status_code = 409
+    code = "prompt_conflict"
+
+
+class PromptArchivedError(AppError):
+    """The prompt is archived, so it can't be changed or used."""
+
+    status_code = 409
+    code = "prompt_archived"
+
+
+class PromptVariableError(AppError):
+    """A template variable has no value."""
+
+    status_code = 400
+    code = "prompt_variable_missing"
+
+
+class PromptStoreUnavailableError(AppError):
+    """No database is configured (DATABASE_URL), or it can't be reached."""
+
+    status_code = 503
+    code = "prompt_store_unavailable"
+
+
+class AdminAuthError(AppError):
+    """Missing or wrong X-Admin-Key header. Temporary until RBAC (Layer 5)."""
+
+    status_code = 401
+    code = "admin_auth_required"
+
+
 def register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def _handle_app_error(_: Request, exc: AppError) -> JSONResponse:

@@ -1,14 +1,38 @@
-# Local stack. Later layers add: postgres+pgvector (RAG), keycloak (OAuth), redis (cache).
-#   docker compose up --build                 # backend + frontend
+# Local stack. Later layers add: keycloak (OAuth), redis (cache).
+#   docker compose up --build                 # postgres + backend + frontend
 #   docker compose --profile local up --build # + Ollama for local models
+# Example prompts: docker compose exec backend python -m app.prompts.seed
 services:
+  postgres:
+    # pgvector image so the RAG layer (Layer 3) can reuse this database.
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: eap
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-eap} # dev default; set a real one outside local dev
+      POSTGRES_DB: eap
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eap -d eap"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
   backend:
     build: ./backend
     env_file:
       - path: ./backend/.env
         required: false
+    environment:
+      DATABASE_URL: postgresql+asyncpg://eap:${POSTGRES_PASSWORD:-eap}@postgres:5432/eap
     ports:
       - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
   frontend:
@@ -34,4 +58,5 @@ services:
     restart: unless-stopped
 
 volumes:
+  postgres: {}
   ollama: {}

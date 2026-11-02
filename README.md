@@ -12,7 +12,7 @@ observability and evals added one layer at a time.
 | # | Layer | Status | Where |
 |---|-------|--------|-------|
 | 1 | API calls: unified multi-provider LLM API (Claude, OpenAI, Gemini, Ollama), streaming | ✅ Built | `backend/app/llm`, `backend/app/api` |
-| 2 | System prompts: versioned templates | Planned | `backend/app/prompts` |
+| 2 | System prompts: versioned templates in Postgres, admin API, Prompts page | ✅ Built | `backend/app/prompts`, `frontend/components/prompts` |
 | 3 | RAG: Postgres + pgvector | Planned | `backend/app/rag` |
 | 4 | MCP tools | Planned | `backend/app/mcp` |
 | 5 | RBAC + OAuth (Keycloak / OIDC) | Planned | `backend/app/auth` |
@@ -31,14 +31,29 @@ A test (`backend/tests/test_docs_coverage.py`) fails if any function is missing 
 
 ## Quick start
 
-Needs Python 3.13 with [uv](https://docs.astral.sh/uv/), and Node 22.
+Needs Python 3.13 with [uv](https://docs.astral.sh/uv/), Node 22, and Postgres 16 for prompts (optional; chat works without it).
 
 **1. Backend** (http://localhost:8000, API docs at http://localhost:8000/docs)
 
 ```bash
 cd backend
-cp .env.example .env    # add at least one API key, or use the built-in mock/echo model
+cp .env.example .env    # add at least one API key, or use the built-in mock models
 uv sync
+```
+
+For managed prompts, set `DATABASE_URL=postgresql+asyncpg://eap:eap@localhost:5432/eap` in `backend/.env`, then:
+
+```bash
+uv run alembic upgrade head
+```
+
+```bash
+uv run python -m app.prompts.seed
+```
+
+Start the API:
+
+```bash
 uv run uvicorn app.main:app --reload
 ```
 
@@ -51,10 +66,14 @@ npm install
 npm run dev
 ```
 
-**Or with Docker:**
+**Or with Docker** (includes Postgres, and runs migrations on start):
 
 ```bash
 docker compose up --build
+```
+
+```bash
+docker compose exec backend python -m app.prompts.seed
 ```
 
 Add `--profile local` to also run Ollama, then set `OLLAMA_BASE_URL=http://ollama:11434` in
@@ -71,7 +90,13 @@ Only models listed in config can be called. See [`backend/.env.example`](backend
 | OpenAI | `OPENAI_API_KEY` (+ optional `OPENAI_BASE_URL`) | `OPENAI_MODELS` |
 | Google Gemini | `GEMINI_API_KEY` | `GEMINI_MODELS` |
 | Ollama | `OLLAMA_BASE_URL` | `OLLAMA_MODELS` |
-| Mock (echo) | `ENABLE_MOCK_PROVIDER=true` (default) | `echo` |
+| Mock | `ENABLE_MOCK_PROVIDER=true` (default) | `echo` (echoes your message), `echo-system` (replies with the system prompt it received) |
+
+| Setting | Purpose |
+|---------|---------|
+| `DATABASE_URL` | Postgres for managed prompts. Blank = prompt features off. |
+| `DEFAULT_PROMPT_NAME` | Prompt used when a request sends neither `prompt` nor `system`. |
+| `ADMIN_API_KEY` | If set, prompt changes need the `X-Admin-Key` header (stand-in until RBAC in Layer 5). |
 
 OpenAI and Gemini model names change often. Check the provider's current model list and set
 `OPENAI_MODELS` / `GEMINI_MODELS` to match.
@@ -80,10 +105,16 @@ OpenAI and Gemini model names change often. Check the provider's current model l
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/health` | Liveness + enabled providers |
+| GET | `/health` | Liveness, enabled providers, database status |
 | GET | `/v1/models` | Models you can call, and the default |
 | POST | `/v1/chat` | Chat completion (JSON) |
 | POST | `/v1/chat/stream` | Chat completion as server-sent events |
+| GET/POST | `/v1/prompts` | List / create managed prompts |
+| GET/PATCH/DELETE | `/v1/prompts/{name}` | Read / edit description / archive |
+| POST | `/v1/prompts/{name}/versions` | New version (`"activate": true` to switch to it) |
+| POST | `/v1/prompts/{name}/activate` | Make a version active (rollback = an older one) |
+| POST | `/v1/prompts/{name}/render` | Preview the final text without calling an LLM |
+| GET | `/v1/prompts/{name}/versions/{n}` | One version |
 
 ```bash
 curl -s localhost:8000/v1/chat -H 'content-type: application/json' -d '{
@@ -107,6 +138,10 @@ Response:
 }
 ```
 
+With a managed prompt (Layer 2): add `"prompt": {"name": "support-agent", "variables": {"company_name": "Acme", "support_email": "help@acme.com"}}`.
+The reply then includes `"prompt": {"name": "support-agent", "version": 1}`. Any `system` text is added after the prompt.
+See [backend/app/prompts/README.md](backend/app/prompts/README.md).
+
 Streaming events (`/v1/chat/stream`), one JSON object per SSE `data:` line:
 `start` → `delta` (text chunks) → `done` (finish reason, usage, latency), or `error`.
 
@@ -115,7 +150,8 @@ Errors always look like `{"error": {"code": "...", "message": "...", "provider":
 ## Development
 
 ```bash
-cd backend && uv run pytest          # tests (no API keys or network needed)
+cd backend && uv run pytest          # tests (no API keys, network or database needed: uses SQLite)
+cd backend && TEST_DATABASE_URL=postgresql+asyncpg://eap:eap@localhost:5432/eap_test uv run pytest  # same tests on Postgres
 cd backend && uv run ruff check .    # lint
 cd frontend && npm run lint && npm run build
 ```
@@ -130,16 +166,21 @@ backend/
     schemas/chat.py         public request/response models
     api/v1/routes.py        HTTP routes
     services/chat_service.py  orchestration (later layers plug in here)
+    db/                     database connection (async SQLAlchemy)
     llm/
       base.py               provider interface
       registry.py           provider setup + model allowlist
       providers/            anthropic, openai, gemini, ollama, mock
-    prompts/ rag/ mcp/ auth/ guardrails/ cache/ routing/ observability/   (layers 2–8)
+    prompts/                Layer 2: models, repository (SQL), service (rules), templates, seed
+    rag/ mcp/ auth/ guardrails/ cache/ routing/ observability/   (layers 3–8)
+  migrations/               Alembic database migrations
   evals/                    (layer 9)
   tests/
 frontend/
   app/page.tsx              chat page
-  components/chat.tsx       chat UI (model picker, system prompt, streaming)
+  app/prompts/page.tsx      prompts page
+  components/chat.tsx       chat UI (prompt + model pickers, variables, streaming)
+  components/prompts/       prompts UI (list, versions, rollback, preview, editor)
   lib/api.ts                typed API client + SSE parser
 docs/
   WORKFLOW_CODE_MAP.md      which functions run, in order, per workflow

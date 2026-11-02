@@ -9,24 +9,34 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.v1.prompts import router as prompts_router
 from app.api.v1.routes import health_router, router
 from app.core.config import Settings, get_settings
 from app.core.errors import register_error_handlers
 from app.core.logging import configure_logging
+from app.db.session import Database
 from app.llm.registry import ProviderRegistry
 
 logger = logging.getLogger("app.request")
 
 
-def create_app(settings: Settings | None = None, registry: ProviderRegistry | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    registry: ProviderRegistry | None = None,
+    database: Database | None = None,
+) -> FastAPI:
     settings = settings or get_settings()
     configure_logging(settings.log_level)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.registry = registry or ProviderRegistry.from_settings(settings)
+        app.state.database = database or (Database(settings.database_url) if settings.database_url else None)
+        logger.info("prompt store: %s", "enabled" if app.state.database else "disabled (no DATABASE_URL)")
         yield
         await app.state.registry.aclose()
+        if app.state.database is not None and database is None:  # close only what we opened
+            await app.state.database.aclose()
 
     app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
@@ -60,6 +70,7 @@ def create_app(settings: Settings | None = None, registry: ProviderRegistry | No
     register_error_handlers(app)
     app.include_router(health_router)
     app.include_router(router)
+    app.include_router(prompts_router)
     return app
 
 

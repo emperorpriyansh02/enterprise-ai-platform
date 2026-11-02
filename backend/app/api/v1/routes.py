@@ -3,7 +3,7 @@
 from collections.abc import AsyncIterator
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from sse_starlette import EventSourceResponse
 
 from app.api.deps import get_chat_service, get_registry
@@ -19,8 +19,13 @@ Service = Annotated[ChatService, Depends(get_chat_service)]
 
 
 @health_router.get("/health")
-async def health(registry: Registry) -> dict:
-    return {"status": "ok", "providers": registry.provider_names}
+async def health(request: Request, registry: Registry) -> dict:
+    database = request.app.state.database
+    if database is None:
+        db_status = "disabled"
+    else:
+        db_status = "ok" if await database.ping() else "unavailable"
+    return {"status": "ok", "providers": registry.provider_names, "database": db_status}
 
 
 @router.get("/models", response_model=ModelList)

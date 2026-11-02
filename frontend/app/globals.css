@@ -10,6 +10,7 @@
   --accent-fg: #ffffff;
   --danger: #dc2626;
   --warning: #b45309;
+  --success: #15803d;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -23,6 +24,7 @@
     --accent-fg: #ffffff;
     --danger: #f87171;
     --warning: #fbbf24;
+    --success: #4ade80;
   }
 }
 
@@ -36,6 +38,7 @@
   --color-accent-fg: var(--accent-fg);
   --color-danger: var(--danger);
   --color-warning: var(--warning);
+  --color-success: var(--success);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }

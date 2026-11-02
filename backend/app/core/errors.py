@@ -115,6 +115,64 @@ class AdminAuthError(AppError):
     code = "admin_auth_required"
 
 
+# --- Knowledge bases / RAG (Layer 3) ---
+
+
+class CollectionNotFoundError(AppError):
+    status_code = 404
+    code = "collection_not_found"
+
+
+class CollectionConflictError(AppError):
+    """A collection with this name already exists, or it's archived and can't be changed."""
+
+    status_code = 409
+    code = "collection_conflict"
+
+
+class DocumentNotFoundError(AppError):
+    status_code = 404
+    code = "document_not_found"
+
+
+class DuplicateDocumentError(AppError):
+    """The same text is already in this collection."""
+
+    status_code = 409
+    code = "duplicate_document"
+
+
+class UnsupportedFileTypeError(AppError):
+    status_code = 415
+    code = "unsupported_file_type"
+
+
+class FileTooLargeError(AppError):
+    status_code = 413
+    code = "file_too_large"
+
+
+class DocumentParseError(AppError):
+    """The file couldn't be read, or it has no text (e.g. a scanned PDF)."""
+
+    status_code = 422
+    code = "document_parse_error"
+
+
+class EmbeddingModelMismatchError(AppError):
+    """The collection was indexed with a different embedding model than the server uses now."""
+
+    status_code = 409
+    code = "embedding_model_mismatch"
+
+
+class RagUnavailableError(AppError):
+    """No database, no pgvector, or no embedding provider configured."""
+
+    status_code = 503
+    code = "rag_unavailable"
+
+
 def register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def _handle_app_error(_: Request, exc: AppError) -> JSONResponse:

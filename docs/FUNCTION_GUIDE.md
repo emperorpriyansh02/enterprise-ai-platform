@@ -33,7 +33,8 @@ learn the code and to debug it.
 11. [Frontend](#11-frontend)
 12. [Tests](#12-tests)
 13. [Prompts (Layer 2)](#13-prompts-layer-2)
-14. [Debugging cheat sheet](#14-debugging-cheat-sheet)
+14. [Knowledge bases / RAG (Layer 3)](#14-knowledge-bases--rag-layer-3)
+15. [Debugging cheat sheet](#15-debugging-cheat-sheet)
 
 ---
 
@@ -48,10 +49,10 @@ What callers send and receive over HTTP.
 | Shape | What it holds | Example |
 |---|---|---|
 | `Message` | One chat message: `role` (`"user"` or `"assistant"`) and `content` (non-empty text). | `{"role": "user", "content": "Hi"}` |
-| `ChatRequest` | What the caller sends: `model` (optional `"provider/model"`), `messages` (at least one, first must be from the user), `prompt` (optional managed prompt: `{name, version?, variables}`, Layer 2), `system` (optional system prompt, or extra instructions added after `prompt`), `temperature` (0–2, optional), `max_tokens` (1–128,000, optional), `provider_options` (extra vendor settings, passed through). | `{"model": "openai/gpt-5", "prompt": {"name": "support-agent", "variables": {"company_name": "Acme"}}, "messages": [...]}` |
+| `ChatRequest` | What the caller sends: `model` (optional `"provider/model"`), `messages` (at least one, first must be from the user), `prompt` (optional managed prompt: `{name, version?, variables}`, Layer 2), `system` (optional system prompt, or extra instructions added after `prompt`), `rag` (optional `{collections, top_k?}`: knowledge bases to search, Layer 3), `temperature` (0–2, optional), `max_tokens` (1–128,000, optional), `provider_options` (extra vendor settings, passed through). | `{"model": "openai/gpt-5", "prompt": {"name": "support-agent", "variables": {"company_name": "Acme"}}, "messages": [...]}` |
 | `Usage` | Token counts: `input_tokens`, `output_tokens`. | `{"input_tokens": 12, "output_tokens": 40}` |
-| `ChatResponse` | The full reply: `id`, `provider`, `model` (the one that actually answered), `content`, `finish_reason`, `usage`, `latency_ms`, `prompt` (`{name, version}` of the managed prompt used, or absent). | see section 5 |
-| `StreamEvent` | One streaming event: `type` (`start`/`delta`/`done`/`error`), `id`, and depending on type: `provider`, `model`, `delta` (text piece), `finish_reason`, `usage`, `latency_ms`, `prompt` (on `start`/`done`), `error`. | `{"type": "delta", "id": "chat_…", "delta": "Hel"}` |
+| `ChatResponse` | The full reply: `id`, `provider`, `model` (the one that actually answered), `content`, `finish_reason`, `usage`, `latency_ms`, `prompt` (`{name, version}` of the managed prompt used, or absent), `citations` (sources given to the model when `rag` was used; `[]` = none found). | see section 5 |
+| `StreamEvent` | One streaming event: `type` (`start`/`delta`/`done`/`error`), `id`, and depending on type: `provider`, `model`, `delta` (text piece), `finish_reason`, `usage`, `latency_ms`, `prompt` (on `start`/`done`), `citations` (on `start`), `error`. | `{"type": "delta", "id": "chat_…", "delta": "Hel"}` |
 | `ModelInfo` | One model you may call: `id` (`"provider/model"`), `provider`, `model`. | `{"id": "mock/echo", "provider": "mock", "model": "echo"}` |
 | `ModelList` | `default` (model id or null) + `data` (list of `ModelInfo`). | see section 4 |
 
@@ -76,6 +77,24 @@ What callers send and receive over HTTP.
 
 Database tables (`backend/app/prompts/models.py`): `prompts` (one row per prompt; `active_version` is a
 version *number*) and `prompt_versions` (one row per version, never edited; unique per prompt + number).
+
+### Knowledge-base shapes (`backend/app/rag/schemas.py`, Layer 3)
+
+| Shape | What it holds |
+|---|---|
+| `RagRef` | The `rag` field on a chat request: `collections` (1–10 names), optional `top_k` (1–20). |
+| `Citation` | One source given to the model: `index` (the [n] in the answer), `collection`, `document_id`, `document_title`, `chunk_id`, `position` (0 = first passage), `snippet` (first 300 characters), `score`. |
+| `CollectionCreate` | `name` (lowercase words with hyphens), `description`. |
+| `CollectionSummary` / `CollectionDetail` | `name`, `description`, `embedding_model` (which embedder indexed it), `documents` (counts per status), `archived`, timestamps; the detail adds `server_embedding_model` and `needs_reindex`. |
+| `DocumentTextCreate` | Pasted text: `title`, `text`. |
+| `DocumentOut` | One document: `id`, `title`, `filename`, `mime_type`, `size_bytes`, `status` (`pending`/`processing`/`ready`/`failed`), `error`, `chunk_count`, timestamps. |
+| `UploadResult` | `data` (accepted documents) and `errors` (refused files: `filename`, `code`, `message`). |
+| `SearchRequest` / `SearchResponse` | `query`, `top_k` → `hits` (each a `SearchHit`) plus the embedding model used. |
+| `SearchHit` | One passage: ids, `document_title`, `collection`, `position`, `content`, `score` (merged rank score), `vector_similarity` (0–1 or null), `keyword_score` (or null). |
+
+Database tables (`backend/app/rag/models.py`, Postgres only): `collections`, `documents` (with the
+extracted text, so they can be re-indexed) and `chunks` (passage text, a 768-number `embedding`, and a
+`search_vector` that Postgres fills in for keyword search).
 
 ### Internal shapes (`backend/app/llm/base.py`)
 
@@ -130,7 +149,8 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
   1. **Startup:** uses the given registry, or builds one from settings with `ProviderRegistry.from_settings()`, and stores it on `app.state.registry`.
   2. Uses the given database, or creates `Database(DATABASE_URL)` if that's set, or `None`. Stores it on `app.state.database` and logs `prompt store: enabled` / `disabled (no DATABASE_URL)`. No connection is opened yet, so a database that's down doesn't stop startup.
   3. Pauses (`yield`) while the server handles requests.
-  4. **Shutdown:** calls `app.state.registry.aclose()` to close all network clients, then closes the database pool, but only if `lifespan` created it (a test's database is left for the test to close).
+  3. With a database: picks the embedding provider (`build_embedder`), builds `RagRuntime` on `app.state.rag`, and starts its indexing worker (section 14). Without one, the runtime exists but reports RAG as disabled.
+  4. **Shutdown:** stops the RAG worker and embedder (`RagRuntime.stop`), calls `app.state.registry.aclose()` to close all network clients, then closes the database pool, but only if `lifespan` created it (a test's database is left for the test to close).
 - **Gives back:** nothing. It's a startup/shutdown hook.
 - **Can fail with:** if building a provider fails (for example, an SDK rejects a setting), the server fails to start and the error is printed.
 - **Debug tips:** if any request fails with `AttributeError: 'State' object has no attribute 'registry'`, startup didn't run. In tests, use `with TestClient(app)` (the `with` triggers startup).
@@ -315,8 +335,8 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 
 - **Where:** route `GET /health`. **Called by:** FastAPI. **Calls:** `ProviderRegistry.provider_names`, `Database.ping`.
 - **Takes in:** `request` (to reach `app.state.database`) and `registry`, from `get_registry`.
-- **What it does:** reports that the server is up, which providers are enabled, and the database status: `disabled` (no `DATABASE_URL`), `ok` (it answered `SELECT 1`), or `unavailable` (it didn't).
-- **Gives back:** `{"status": "ok", "providers": ["anthropic", "mock"], "database": "ok"}`.
+- **What it does:** reports that the server is up, which providers are enabled, the database status (`disabled` without `DATABASE_URL`, `ok` if it answered `SELECT 1`, `unavailable` if it didn't), and the knowledge-base status from `RagRuntime.status` (`ok`, `unavailable`, or `disabled`).
+- **Gives back:** `{"status": "ok", "providers": ["anthropic", "mock"], "database": "ok", "rag": "ok"}`.
 - **Can fail with:** nothing in normal operation; a database problem shows as `"unavailable"`, not an error.
 - **Debug tips:** used by Docker's health check. It does **not** contact any LLM vendor, so "ok" doesn't prove your API keys work.
 
@@ -380,7 +400,7 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 
 - **Where:** `backend/app/api/deps.py`. **Called by:** FastAPI, for the `chat` and `chat_stream` routes (via the `Service` dependency). **Calls:** `get_registry`, `ChatService.__init__`; FastAPI first runs `get_prompt_service` for it.
 - **Takes in:** `request`, the current HTTP request, and `prompts`, the `PromptService` (or `None` without a database) from `get_prompt_service`.
-- **What it does:** creates a new `ChatService` with the shared registry and this request's prompt service.
+- **What it does:** creates a new `ChatService` with the shared registry, this request's prompt service, its RAG service (from `get_rag_service`, or `None`), and the app's `RagRuntime`.
 - **Gives back:** a `ChatService` object (cheap; one per request).
 - **Can fail with:** same as `get_registry`.
 - **Debug tips:** this is where request-scoped wiring lives; later layers (auth) will add their services here too.
@@ -389,7 +409,7 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 
 - **Where:** `ChatService` constructor. **Called by:** `get_chat_service`.
 - **Takes in:** `registry`, the `ProviderRegistry`, and `prompts`, a `PromptService` or `None` (no database).
-- **What it does:** keeps both for `complete`, `stream` and `_build_system`.
+- **What it does:** keeps them for `complete`, `stream`, `_build_system` and `_retrieve`. Also takes `rag` (a `RagService` or `None`) and `rag_runtime` (for the "is RAG usable?" check).
 - **Gives back:** the service object.
 - **Can fail with:** nothing.
 - **Debug tips:** `prompts` is `None` exactly when `DATABASE_URL` isn't set.
@@ -411,13 +431,13 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 - **Takes in:** `request`, the validated `ChatRequest` from the caller.
 - **What it does:**
   1. **Picks the provider:** `registry.resolve(request.model)` turns `"openai/gpt-5"` into (OpenAI adapter, `"gpt-5"`). A missing model means the default.
-  2. **Builds the system prompt** with `_build_system()`: managed prompt (rendered) + the request's own `system` text. Also gives back which prompt version was used.
+  2. **Builds the system prompt** with `_build_system()`: managed prompt (rendered) + the request's own `system` text. Also gives back which prompt version was used. Then `_retrieve()` appends knowledge-base sources when the request has `rag` (section 14.8), and gives back the citations.
   3. **Makes an id** like `chat_3f2a…` with `_new_id()`.
   4. **Starts a timer.**
   5. **Converts** the public request into an internal `LLMRequest` (`_to_llm_request`) and calls `provider.complete(...)`. This is where the vendor is contacted.
   6. **Measures** how long it took (`_ms_since`).
   7. **Logs** `chat completed` with request id, provider, model, prompt (e.g. `support-agent@v3`), latency, tokens and finish reason.
-  8. **Builds** the `ChatResponse`. `model` comes from the vendor's answer, so after a Claude refusal fallback it shows the fallback model. `prompt` is `{name, version}` when a managed prompt was used.
+  8. **Builds** the `ChatResponse`. `model` comes from the vendor's answer, so after a Claude refusal fallback it shows the fallback model. `prompt` is `{name, version}` when a managed prompt was used; `citations` is set when `rag` was used. The log line also records `sources` (how many passages were added).
 - **Gives back:**
   ```json
   {"id": "chat_3f2a…", "provider": "openai", "model": "gpt-5-2026-01-01",
@@ -502,9 +522,9 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 - **Where:** `ChatService`. **Called by:** `chat_stream`. **Calls:** `ProviderRegistry.resolve`, `ChatService._build_system`, `_new_id`, `_to_llm_request`, the adapter's `stream`, `_ms_since`, `_prompt_label`, `AppError.to_dict`.
 - **Takes in:** `request`, the validated `ChatRequest`.
 - **What it does:**
-  1. Picks the provider (`resolve`), builds the system prompt (`_build_system`), makes an id, starts a timer, converts the request.
+  1. Picks the provider (`resolve`), builds the system prompt (`_build_system`), adds knowledge-base sources (`_retrieve`), makes an id, starts a timer, converts the request.
   2. Starts the adapter's stream and **waits for its first chunk**. Errors here are *raised* (not turned into events), so the route can still return an HTTP error. An adapter that yields nothing at all raises `ProviderError("Provider returned an empty stream")`.
-  3. Yields `start` (id, provider, model, and `prompt` if a managed prompt was used).
+  3. Yields `start` (id, provider, model, `prompt` if a managed prompt was used, and `citations` if `rag` was used).
   4. Loops over the adapter's chunks:
      - a text chunk → yields `delta` with the text;
      - the final chunk (`done=True`) → measures latency, logs `chat stream completed`, yields `done` with finish reason, usage, latency and `prompt`, then stops.
@@ -1003,7 +1023,7 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
 - **Takes in:** `record`, a log record (message, level, logger name, and any `extra={...}` fields).
 - **What it does:**
   1. Builds a dictionary with `ts` (UTC time), `level`, `logger`, `msg`.
-  2. Copies the known extra fields if present: `request_id`, `method`, `path`, `status`, `latency_ms`, `provider`, `model`, `input_tokens`, `output_tokens`, `finish_reason`, `error_code`, `prompt`.
+  2. Copies the known extra fields if present: `request_id`, `method`, `path`, `status`, `latency_ms`, `provider`, `model`, `input_tokens`, `output_tokens`, `finish_reason`, `error_code`, `prompt`, `sources`.
   3. Adds the traceback (`exc`) if an exception was logged.
   4. Converts it all to one JSON line (values it can't convert become strings).
 - **Gives back:** e.g. `{"ts": "2026-11-02T05:56:02.207+00:00", "level": "INFO", "logger": "app.services.chat_service", "msg": "chat stream completed", "request_id": "chat_…", "provider": "mock", ...}`.
@@ -1061,6 +1081,7 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
   - `input`: the text box;
   - `busy`: a reply is in progress;
   - `prompts`, `promptsAvailable`, `promptName`, `promptVars`: the Prompt dropdown's options, whether the prompt store is reachable, the chosen prompt, and the values typed for its variables.
+  - `collections`, `ragNames`, `showKnowledge`: the knowledge bases you can search, the ones ticked for this chat, and whether the picker row is open.
 - **What it does:**
   1. **Load-models effect** (runs once, after the first render):
      1. Calls `getModels()`.
@@ -1068,10 +1089,11 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
      3. Failure → shows the server's error message, or "Can't reach the backend. Is it running on port 8000?" for network/CORS failures.
      4. If the page closes mid-request, the request is cancelled and the cancel error is ignored.
   2. **Load-prompts effect** (runs once): calls `listPrompts()`. Success → fills the Prompt dropdown. Failure (e.g. no database) → the dropdown shows "Unavailable"; chat works without it.
-  3. Works out `selectedPrompt` and `missingVars` (variables of the chosen prompt that are still empty) on every render.
-  4. **Auto-scroll effect** (runs whenever `turns` changes): scrolls the newest message into view.
-  5. Renders the header (Prompt dropdown, Model dropdown, "System prompt"/"Extra instructions", "New chat"), a row of variable inputs when the chosen prompt has variables, the optional instructions box, an error banner, the message list (user bubbles on the right, assistant replies on the left), and the composer. When variables are missing, Send is disabled and the hint under the box names them.
-  6. Under each finished reply: `provider/model · prompt name vN · N in / N out · 1.23s`, plus a note for `length`, `refusal`, `content_filter` or "Stopped."
+  3. **Load-collections effect** (runs once): calls `listCollections()`. If there are any, a **Knowledge** button appears; it opens a row of checkboxes, one per collection, with its ready-document count. Ticked names are kept in `ragNames` (names that no longer exist are dropped). Failure → no button; chat works without it.
+  4. Works out `selectedPrompt` and `missingVars` (variables of the chosen prompt that are still empty) on every render.
+  5. **Auto-scroll effect** (runs whenever `turns` changes): scrolls the newest message into view.
+  6. Renders the header (Prompt dropdown, Model dropdown, "System prompt"/"Extra instructions", "Knowledge", "New chat"), a row of variable inputs when the chosen prompt has variables, the optional instructions box, an error banner, the message list (user bubbles on the right, assistant replies on the left), and the composer. When variables are missing, Send is disabled and the hint under the box names them.
+  7. Under each finished reply: `provider/model · prompt name vN · N in / N out · 1.23s`, plus a note for `length`, `refusal`, `content_filter` or "Stopped."
 - **Gives back:** the chat screen (JSX).
 - **Can fail with:** nothing thrown; errors are shown on screen.
 - **Debug tips:**
@@ -1123,8 +1145,8 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
   3. Adds two turns to the screen: the user's message and an empty assistant turn marked "streaming" (shows "Thinking…").
   4. Clears the input and marks the chat busy (the Send button becomes Stop).
   5. Creates an `AbortController` so Stop can cancel.
-  6. Calls `streamChat` with `{model, messages, system, prompt}`. `system` is sent only if the box isn't blank. `prompt` is `{name, variables}` (only the chosen prompt's variables) when a prompt is selected. For each event:
-     - `start` → saves provider, model and prompt on the assistant turn;
+  6. Calls `streamChat` with `{model, messages, system, prompt, rag}`. `system` is sent only if the box isn't blank. `prompt` is `{name, variables}` (only the chosen prompt's variables) when a prompt is selected. `rag` is `{collections: ragNames}` when any knowledge base is ticked. For each event:
+     - `start` → saves provider, model and prompt on the assistant turn, plus its `citations`, which render under the reply as a collapsible "Sources (n)" list, or "No matching sources found";
      - `delta` → appends the text, so the reply grows on screen;
      - `done` → saves usage, latency, finish reason, prompt, and marks it finished;
      - `error` → shows the error message under the reply.
@@ -1223,7 +1245,7 @@ If one fails, the assertion message shows the expected vs actual value.
 #### `make_settings()` · `backend/tests/conftest.py`
 
 - **Takes in:** any settings to override, e.g. `make_settings(openai_api_key="x")`.
-- **What it does:** builds `Settings` that **ignore your real `.env` and keys**: all API keys off, Ollama off, no database, no default prompt, no admin key, mock on with no delay, default model `mock/echo`. Then applies the overrides.
+- **What it does:** builds `Settings` that **ignore your real `.env` and keys**: all API keys off, Ollama off, no database, no default prompt, no admin key, no embedding provider or model choice, mock on with no delay, default model `mock/echo`. Then applies the overrides.
 - **Gives back:** a `Settings` object.
 - **Debug tips:** if tests behave differently on your machine, check that each test uses this helper rather than `get_settings()`.
 
@@ -1414,7 +1436,7 @@ If one fails, the assertion message shows the expected vs actual value.
 
 #### `test_health()` · `backend/tests/test_api.py`
 
-- **Proves:** `/health` returns `ok` with `["mock"]`, `database: "disabled"` and an `X-Request-ID` header.
+- **Proves:** `/health` returns `ok` with `["mock"]`, `database: "disabled"`, `rag: "disabled"` and an `X-Request-ID` header.
 
 #### `test_models()` · `backend/tests/test_api.py`
 
@@ -1551,7 +1573,7 @@ How the pieces split up:
 
 - **Where:** `Database`. **Called by:** the `database` test fixture. **Tests only.**
 - **Takes in:** nothing.
-- **What it does:** imports the prompt models (so their tables are known), then creates every table directly from the models.
+- **What it does:** gets the table list from `_tables` (on SQLite, the Postgres-only knowledge-base tables are left out). On Postgres, first enables the `vector` extension. Then creates those tables directly from the models.
 - **Gives back:** nothing.
 - **Can fail with:** database errors (e.g. no permission to create tables).
 - **Debug tips:** real databases must use Alembic migrations (`alembic upgrade head`), never this, so the migration history stays correct.
@@ -1559,7 +1581,7 @@ How the pieces split up:
 #### `Database.drop_all()` · `backend/app/db/session.py`
 
 - **Where:** `Database`. **Called by:** the `database` test fixture (before and after each test). **Tests only.**
-- **Takes in:** nothing. **What it does:** drops every table the models define. **Gives back:** nothing.
+- **Takes in:** nothing. **What it does:** drops every table from `_tables` (the same list `create_all` uses). **Gives back:** nothing.
 - **Can fail with:** database errors.
 - **Debug tips:** point `TEST_DATABASE_URL` at a **separate test database**: this deletes everything.
 
@@ -2081,7 +2103,7 @@ Each route only passes the request to `PromptService`; the rules and errors are 
 
 - **Where:** top bar (client component). **Called by:** `RootLayout`, on every page.
 - **Takes in:** nothing; reads the current path with `usePathname()`.
-- **What it does:** shows the app name and the **Chat** and **Prompts** links. The current page's link is highlighted and marked `aria-current="page"`.
+- **What it does:** shows the app name and the **Chat**, **Prompts** and **Knowledge** links. The current page's link is highlighted and marked `aria-current="page"`.
 - **Debug tips:** Next.js keeps a page you left mounted (hidden). That's why Chat keeps your draft and selections when you come back.
 
 #### `PromptsPage()` · `frontend/components/prompts/prompts-page.tsx`
@@ -2245,7 +2267,7 @@ Each route only passes the request to `PromptService`; the rules and errors are 
   - `path` (e.g. `/v1/prompts`);
   - `options`: `method`, `body` (sent as JSON), `adminKey` (sent as `X-Admin-Key`), `signal`.
 - **What it does:**
-  1. Builds the request: JSON content type only when there's a body; admin header only when a key is given.
+  1. Builds the request: JSON content type only when there's a `body`; a `form` (file upload) is sent as multipart, and the browser sets its content type; admin header only when a key is given.
   2. Sends it.
   3. Not OK → throws `ApiError`.
   4. Otherwise parses the JSON reply.
@@ -2479,7 +2501,1156 @@ Run them on SQLite (default) or real Postgres:
 
 ---
 
-## 14. Debugging cheat sheet
+## 14. Knowledge bases / RAG (Layer 3)
+
+Documents go into **collections**. Each document is parsed to text, split into passages ("chunks"),
+and each chunk is turned into 768 numbers (an "embedding") that captures its meaning. A chat question
+is embedded the same way. The closest passages, by meaning **and** by shared words, are added to the
+system prompt as numbered sources. The order things run in is in
+[WORKFLOW_CODE_MAP.md § 14](WORKFLOW_CODE_MAP.md#14-knowledge-bases--rag-layer-3).
+
+How the pieces split up:
+
+| Piece | File | Job |
+|---|---|---|
+| Routes | `backend/app/api/v1/collections.py` | receive requests, pass them on |
+| Rules | `backend/app/rag/service.py` | collections, documents, search, chat context |
+| SQL | `backend/app/rag/repository.py` | every query |
+| Parsers | `backend/app/rag/parsers.py` | file → text |
+| Chunking | `backend/app/rag/chunking.py` | text → passages |
+| Embedders | `backend/app/rag/embeddings.py` | text → vectors |
+| Retrieval helpers | `backend/app/rag/retrieval.py` | merging results, the Sources block |
+| Runtime | `backend/app/rag/runtime.py` | embedder, worker, availability |
+
+### 14.1 Availability, worker and startup
+
+#### `RagRuntime.__init__()` · `backend/app/rag/runtime.py`
+
+- **Called by:** `lifespan` (once per app).
+- **Takes in:** `database` (or `None`), `embedder` (or `None`, from `build_embedder`), `settings`.
+- **What it does:** keeps them. Creates an `IngestionWorker` only when there is both a database and an embedder.
+- **Gives back:** the runtime, stored on `app.state.rag`.
+- **Debug tips:** one runtime per app. Every request's `RagService` shares its embedder and worker.
+
+#### `RagRuntime.start()` · `backend/app/rag/runtime.py`
+
+- **Called by:** `lifespan` at startup. **Calls:** `IngestionWorker.start`.
+- **What it does:** starts the worker if there is one.
+- **Can fail with:** never stops startup; worker problems are logged.
+
+#### `RagRuntime.stop()` · `backend/app/rag/runtime.py`
+
+- **Called by:** `lifespan` at shutdown. **Calls:** `IngestionWorker.stop`, the embedder's `aclose`.
+- **What it does:** stops the worker tasks, then closes the embedder's network client.
+- **Debug tips:** a document being processed at that moment stays `processing`, and is picked up again on the next start.
+
+#### `RagRuntime.check()` · `backend/app/rag/runtime.py`
+
+- **Called by:** `require_rag_service` (every collections route), `ChatService._retrieve`, `RagRuntime.status`, `IngestionWorker.start`. **Calls:** `Database.has_pgvector`.
+- **What it does:** checks, in order, and stops at the first problem:
+  1. A database is configured.
+  2. It's PostgreSQL.
+  3. An embedder is configured.
+  4. The `vector` extension is installed. This one is checked against the database once; after it passes, it isn't asked again.
+- **Gives back:** nothing when everything is fine.
+- **Can fail with:** `RagUnavailableError` → **503** `rag_unavailable`. The message says exactly which step failed and how to fix it.
+- **Debug tips:** the quickest diagnosis is `GET /health` (`"rag"`), then any `/v1/collections` call for the reason.
+
+#### `RagRuntime.status()` · `backend/app/rag/runtime.py`
+
+- **Called by:** `health`. **Calls:** `check`.
+- **Gives back:**
+  - `"disabled"`: no database or no embedder;
+  - `"ok"`: `check` passed;
+  - `"unavailable"`: `check` failed.
+
+#### `RagRuntime.enqueue()` · `backend/app/rag/runtime.py`
+
+- **Called by:** `RagService._add`, `reindex_document`, `reindex_collection`.
+- **Takes in:** `document_id`.
+- **What it does:** hands the id to the worker's queue (does nothing if there's no worker).
+
+#### `IngestionWorker.__init__()` · `backend/app/rag/runtime.py`
+
+- **Called by:** `RagRuntime.__init__`. **Takes in:** `runtime`.
+- **What it does:** creates an empty queue of document ids and an empty task list.
+
+#### `IngestionWorker.start()` · `backend/app/rag/runtime.py`
+
+- **Called by:** `RagRuntime.start`. **Calls:** `_run`, `RagRuntime.check`, `RagRepository.unfinished_document_ids`, `enqueue`.
+- **What it does:**
+  1. Starts `RAG_INGEST_CONCURRENCY` background tasks (default 2), each running `_run`.
+  2. If RAG is usable, finds documents still `pending`/`processing` (interrupted by the last shutdown) and queues them again.
+- **Can fail with:** never raises. If RAG isn't usable yet, it logs `ingestion worker: not re-queuing documents (...)`.
+- **Debug tips:** after a restart, look for `re-queued N unfinished documents` in the log.
+
+#### `IngestionWorker.enqueue()` · `backend/app/rag/runtime.py`
+
+- **Called by:** `RagRuntime.enqueue`, `start`. **Takes in:** `document_id`. **What it does:** puts it on the queue (never blocks).
+
+#### `IngestionWorker._run()` · `backend/app/rag/runtime.py`
+
+- **Called by:** each background task, forever. **Calls:** `RagService.process_document`.
+- **What it does:** waits for the next id, opens a **new database session** for that job, processes the document, and marks the queue item done. Any unexpected error is logged (`ingestion failed for document ...`) and the loop carries on.
+- **Debug tips:** expected failures (bad embedder key, model mismatch) don't show up here; they're saved on the document as `failed` with an `error`.
+
+#### `IngestionWorker.drain()` · `backend/app/rag/runtime.py`
+
+- **Called by:** scripts or tests that must wait for indexing to finish.
+- **What it does:** waits until every queued document has been processed.
+
+#### `IngestionWorker.stop()` · `backend/app/rag/runtime.py`
+
+- **Called by:** `RagRuntime.stop`. **What it does:** cancels the background tasks and waits for them to end.
+
+#### `Database.is_postgres()` · `backend/app/db/session.py`
+
+- **Called by:** `RagRuntime.check`, `has_pgvector`, `_tables`, `create_all`. It's a read-only property, used as `db.is_postgres`.
+- **Gives back:** `True` if the engine talks to PostgreSQL.
+
+#### `Database.has_pgvector()` · `backend/app/db/session.py`
+
+- **Called by:** `RagRuntime.check`.
+- **What it does:** on Postgres, asks `pg_extension` whether `vector` is installed.
+- **Gives back:** `True`/`False` (always `False` on other databases).
+- **Can fail with:** a connection error, which `check` turns into 503 "Can't reach the database".
+
+#### `Database._tables()` · `backend/app/db/session.py`
+
+- **Called by:** `create_all`, `drop_all` (tests).
+- **What it does:** loads both model modules, so every table is known. On Postgres it returns every table; otherwise it leaves out tables marked `postgres_only` (the three knowledge-base tables, which need pgvector types).
+- **Gives back:** a list of tables in dependency order.
+
+### 14.2 Embedders
+
+#### `build_embedder()` · `backend/app/rag/embeddings.py`
+
+- **Called by:** `lifespan` (only when there's a database).
+- **Takes in:** `settings`.
+- **What it does:**
+  1. Picks the provider: `EMBEDDING_PROVIDER` if set; otherwise the first configured of OpenAI (key), Gemini (key), Ollama (URL), mock (`ENABLE_MOCK_PROVIDER`).
+  2. Picks the model: `EMBEDDING_MODEL`, or the provider's default (`text-embedding-3-small`, `gemini-embedding-001`, `nomic-embed-text`, `hash`).
+  3. Creates that embedder and logs `embedding model: <id>`.
+- **Gives back:** an `Embedder`, or `None`. `None` comes with a log line saying why: no provider at all, an unknown name, or a chosen provider that's missing its key.
+- **Debug tips:** adding an OpenAI key later switches the automatic choice from mock to OpenAI. Existing collections then need re-indexing (409 `embedding_model_mismatch`). Set `EMBEDDING_PROVIDER` explicitly in production.
+
+#### `Embedder.__init__()` · `backend/app/rag/embeddings.py`
+
+- **Called by:** every embedder's constructor. **Takes in:** `model`.
+- **What it does:** stores the model name and the fixed `dimensions` (768).
+
+#### `Embedder.id()` · `backend/app/rag/embeddings.py`
+
+- **Read-only property** (`embedder.id`). **Called by:** `RagService` (stored on collections, compared on every search and indexing job), logs.
+- **Gives back:** `"<provider>/<model>@<dimensions>"`, e.g. `"openai/text-embedding-3-small@768"`.
+
+#### `Embedder.embed()` · `backend/app/rag/embeddings.py`
+
+- **Called by:** `RagService.process_document` (`kind="document"`), `RagService.search` (`kind="query"`). **Calls:** the provider's `_embed_batch`, `normalize`.
+- **Takes in:**
+  - `texts`: a list of strings;
+  - `kind`: `"document"` or `"query"`. Some providers embed questions and passages slightly differently.
+- **What it does:**
+  1. Sends the texts in batches of `batch_size` (64; Ollama 32).
+  2. Checks that each batch returned one vector per text, each with exactly 768 numbers.
+  3. Scales every vector to length 1.
+- **Gives back:** one vector (768 floats) per text, in the same order.
+- **Can fail with:**
+  - the provider's mapped errors (`ProviderAuthError`, `ProviderRateLimitError`...);
+  - `ProviderError` "returned N numbers, expected 768" when the model can't produce 768 dimensions.
+- **Debug tips:** an indexing job that fails this way stores the message on the document's `error`.
+
+#### `Embedder._embed_batch()` · `backend/app/rag/embeddings.py`
+
+- **The contract** each embedder fills in.
+- **Takes in:** one batch of texts and the `kind`.
+- **Gives back:** the provider's raw vectors.
+
+#### `Embedder.aclose()` · `backend/app/rag/embeddings.py`
+
+- **Called by:** `RagRuntime.stop`. Does nothing by default (the mock has nothing to close).
+
+#### `OpenAIEmbedder.__init__()` · `backend/app/rag/embeddings.py`
+
+- **Takes in:** `api_key`, `model`, `timeout_s`, `max_retries`, `base_url` (Azure/compatible servers), `http_client` (tests).
+- **What it does:** creates an official async OpenAI client, the same way the chat adapter does.
+
+#### `OpenAIEmbedder._embed_batch()` · `backend/app/rag/embeddings.py`
+
+- **What it does:** calls `embeddings.create(model, input=texts, dimensions=768)` and sorts the results by their `index`, so the order always matches the input.
+- **Can fail with:** SDK errors, mapped by the OpenAI chat adapter's `_map_error` (same codes as chat).
+
+#### `OpenAIEmbedder.aclose()` · `backend/app/rag/embeddings.py`
+
+- **What it does:** closes the OpenAI client.
+
+#### `GeminiEmbedder.__init__()` · `backend/app/rag/embeddings.py`
+
+- **Takes in:** `api_key`, `model`, `timeout_s`, `max_retries`, `http_client`.
+- **What it does:** creates a `google-genai` client. As in the chat adapter, the timeout is converted to milliseconds and attempts = retries + 1.
+
+#### `GeminiEmbedder._embed_batch()` · `backend/app/rag/embeddings.py`
+
+- **What it does:** calls `embed_content` with `output_dimensionality=768`, and `task_type` `RETRIEVAL_QUERY` for questions or `RETRIEVAL_DOCUMENT` for passages, then reads each embedding's `values`.
+- **Can fail with:** errors mapped by the Gemini chat adapter's `_map_error`.
+- **Debug tips:** Gemini doesn't normalize reduced-size vectors; `embed` does that for it.
+
+#### `GeminiEmbedder.aclose()` · `backend/app/rag/embeddings.py`
+
+- **What it does:** closes the async Gemini client.
+
+#### `OllamaEmbedder.__init__()` · `backend/app/rag/embeddings.py`
+
+- **Takes in:** `base_url`, `model`, `timeout_s`, `http_client`.
+- **What it does:** uses the given HTTP client or creates one for the Ollama server.
+
+#### `OllamaEmbedder._embed_batch()` · `backend/app/rag/embeddings.py`
+
+- **What it does:**
+  1. For `nomic-embed*` models, adds the prefixes the model was trained with: `search_query: ` for questions, `search_document: ` for passages.
+  2. Sends `POST /api/embed` with `{model, input}` and reads `embeddings`.
+- **Can fail with:**
+  - HTTP errors via the Ollama adapter's `_raise_for_status`, e.g. 404 → "pull the model first";
+  - network errors via its `_map_error`.
+
+#### `OllamaEmbedder.aclose()` · `backend/app/rag/embeddings.py`
+
+- **What it does:** closes the HTTP client.
+
+#### `MockEmbedder.__init__()` · `backend/app/rag/embeddings.py`
+
+- **Takes in:** `model` (default `"hash"`; tests use `"hash-v2"` to simulate a model change).
+
+#### `MockEmbedder._embed_batch()` · `backend/app/rag/embeddings.py`
+
+- **What it does:** `_vector` for each text. No network.
+
+#### `MockEmbedder._vector()` · `backend/app/rag/embeddings.py`
+
+- **Takes in:** `text`.
+- **What it does:**
+  1. Splits the text into lowercase words.
+  2. Hashes each word to one of the 768 positions and adds +1 or −1 there.
+  3. Texts that share words get similar vectors. Words with the same meaning but different spelling do **not**; it's not a real model.
+  4. An empty text gets a single 1 so the vector is never all zeros (cosine distance can't be computed for a zero vector).
+- **Gives back:** a 768-number vector (not yet normalized).
+
+#### `normalize()` · `backend/app/rag/embeddings.py`
+
+- **Called by:** `Embedder.embed`.
+- **Takes in:** a vector.
+- **What it does:** divides every number by the vector's length, so the length becomes 1. A zero vector is returned unchanged.
+- **Gives back:** e.g. `[3, 4]` → `[0.6, 0.8]`.
+
+### 14.3 Parsing files
+
+#### `detect_type()` · `backend/app/rag/parsers.py`
+
+- **Called by:** `extract_text`.
+- **Takes in:** `filename`, and `content_type` (what the browser said).
+- **What it does:**
+  1. Looks the extension up first: `.txt .text .md .markdown .pdf .docx .html .htm`.
+  2. If that doesn't match, tries the content type, ignoring `; charset=...`.
+- **Gives back:** a MIME type, e.g. `"text/markdown"`.
+- **Can fail with:** `UnsupportedFileTypeError` → **415**, naming the file and the accepted types.
+
+#### `extract_text()` · `backend/app/rag/parsers.py`
+
+- **Called by:** `RagService.add_file`, in a worker thread so a big file doesn't block other requests. **Calls:** `detect_type`, one `_from_*` reader, `normalize_text`.
+- **Takes in:** `filename`, `content_type`, `data` (the raw bytes).
+- **What it does:**
+  1. Picks the reader for the type.
+  2. Gets a title and text from it.
+  3. Cleans the text.
+  4. Rejects empty text, with a hint about scans for PDFs.
+  5. Rejects more than 5,000,000 characters.
+  6. If there's no title, uses the file name without its extension. Titles are cut to 300 characters.
+- **Gives back:** `ExtractedDocument(title, text, mime_type)`.
+- **Can fail with:** `UnsupportedFileTypeError` (415), `DocumentParseError` (422).
+
+#### `normalize_text()` · `backend/app/rag/parsers.py`
+
+- **Called by:** `extract_text`, `RagService.add_text`.
+- **What it does:**
+  1. Turns Windows/Mac line ends into `\n`.
+  2. Removes NUL characters (Postgres can't store them in text).
+  3. Strips trailing spaces from each line.
+  4. Collapses 3+ newlines into one blank line.
+  5. Trims the ends.
+- **Gives back:** e.g. `"a  \n\n\n\nb\r\n"` → `"a\n\nb"`.
+
+#### `_decode()` · `backend/app/rag/parsers.py`
+
+- **Called by:** the text, Markdown and HTML readers.
+- **What it does:** decodes the bytes as UTF-8, dropping a BOM. If that fails, uses Latin-1, which never fails and suits old Windows text files.
+
+#### `_from_text()` · `backend/app/rag/parsers.py`
+
+- **Gives back:** no title, and the decoded text.
+
+#### `_from_markdown()` · `backend/app/rag/parsers.py`
+
+- **Gives back:** the first `# Heading` as the title (if there is one), and the decoded text, markdown kept as-is.
+
+#### `_from_pdf()` · `backend/app/rag/parsers.py`
+
+- **What it does:**
+  1. Opens the PDF with `pypdf`. If it's encrypted, tries an empty password.
+  2. Extracts each page's text and joins pages with blank lines.
+  3. Uses the PDF's metadata title, if set.
+- **Can fail with:** `DocumentParseError` for:
+  - a password-protected PDF;
+  - an unreadable or corrupt file.
+- **Debug tips:** scanned PDFs are images with no text layer. They pass here but produce empty text, which `extract_text` rejects with a hint.
+
+#### `_from_docx()` · `backend/app/rag/parsers.py`
+
+- **What it does:**
+  1. Opens the Word file with `python-docx`.
+  2. Takes every paragraph's text, then every table row as `cell | cell | cell`.
+  3. Uses the document's title property, if set.
+- **Can fail with:** `DocumentParseError` when the file isn't a valid `.docx` (it's a zip inside).
+- **Debug tips:** text in headers, footers and text boxes isn't read.
+
+#### `_from_html()` · `backend/app/rag/parsers.py`
+
+- **What it does:** runs the `_HTMLText` parser over the decoded page.
+- **Gives back:** the `<title>`, and the visible text.
+
+#### `_HTMLText.__init__()` · `backend/app/rag/parsers.py`
+
+- **What it does:** sets up an HTML parser that converts entities (`&pound;` → `£`), with an empty list of text parts, no title, and a counter for skipped regions.
+
+#### `_HTMLText.handle_starttag()` · `backend/app/rag/parsers.py`
+
+- **What it does:**
+  - `<script>`, `<style>`, `<noscript>`, `<template>`, `<svg>` → start skipping text;
+  - `<title>` → start collecting the title;
+  - block tags (`p`, `div`, `li`, headings...) → add a line break, so the text keeps its paragraphs.
+
+#### `_HTMLText.handle_endtag()` · `backend/app/rag/parsers.py`
+
+- **What it does:** the matching end of each case in `handle_starttag`.
+
+#### `_HTMLText.handle_data()` · `backend/app/rag/parsers.py`
+
+- **What it does:** ignores text inside skipped regions, adds title text to `title`, and keeps everything else.
+
+#### `_HTMLText.text()` · `backend/app/rag/parsers.py`
+
+- **Gives back:** the collected text with runs of spaces collapsed on each line (blank-line cleanup happens in `normalize_text`).
+
+### 14.4 Chunking
+
+#### `split_text()` · `backend/app/rag/chunking.py`
+
+- **Called by:** `RagService.process_document`. **Calls:** `_fit`, `_tail`.
+- **Takes in:**
+  - `text`;
+  - `size`: maximum characters per chunk (`RAG_CHUNK_SIZE`, 1200);
+  - `overlap`: characters repeated between chunks (`RAG_CHUNK_OVERLAP`, 200, capped at half of `size`).
+- **What it does:**
+  1. Splits the text into paragraphs (at blank lines).
+  2. Makes sure each paragraph fits (`_fit`).
+  3. Packs paragraphs into chunks until the next one wouldn't fit.
+  4. Starts each new chunk with the end of the previous one (`_tail`), when that still fits.
+- **Gives back:** a list of chunk strings, each at most `size` characters, in order. Empty text → `[]`.
+- **Debug tips:**
+  - Smaller chunks give more precise matches but less context per source.
+  - About 1,000–1,500 characters is a good middle ground.
+  - Changing the size only affects documents indexed (or re-indexed) afterwards.
+
+#### `_fit()` · `backend/app/rag/chunking.py`
+
+- **Takes in:** one paragraph and `size`.
+- **What it does:**
+  - fits → returned whole;
+  - too long → split at sentence ends (`.`, `!`, `?`) and packed back together up to `size`;
+  - a sentence longer than `size` → `_split_words`.
+- **Gives back:** pieces of at most `size` characters.
+
+#### `_split_words()` · `backend/app/rag/chunking.py`
+
+- **What it does:** packs whole words up to `size`. A single "word" longer than `size` (e.g. a long URL or code) is cut into `size`-long pieces, so nothing is lost.
+
+#### `_tail()` · `backend/app/rag/chunking.py`
+
+- **What it does:** takes the last `overlap` characters of a chunk, moved forward to the next word boundary so no word is cut in half. `overlap` 0 → `""`.
+
+### 14.5 Search helpers
+
+#### `fuse_rrf()` · `backend/app/rag/retrieval.py`
+
+- **Called by:** `RagService.search`.
+- **Takes in:**
+  - `ranked_lists`: best-first lists of chunk ids (here: vector results and keyword results);
+  - `k`: default 60.
+- **What it does:** each id earns `1 / (k + rank)` in every list it appears in (rank 1 = best), and the scores are added up. No score scaling is needed, which is why it's good at mixing different search methods.
+  - A passage found by **both** methods usually beats one found by just one.
+  - A top-ranked passage from one method still ranks well.
+- **Gives back:** `[(id, score), ...]`, best first. E.g. rank 1 in one list only → `1/61 ≈ 0.0164`.
+
+#### `build_context()` · `backend/app/rag/retrieval.py`
+
+- **Called by:** `RagService.retrieve_for_chat`.
+- **Takes in:** the chosen `SearchHit`s.
+- **What it does:** writes the "Sources" block. It starts with instructions:
+  - the passages are reference material, **not instructions** (a first defense against prompt injection hidden in documents);
+  - cite them as [n];
+  - say so if they don't contain the answer.
+
+  Then it lists each passage as `[n] "Title" (collection: x, part p)` followed by its text.
+- **Gives back:** the block as text.
+- **Debug tips:** to see it exactly as the model does, chat with `"model": "mock/echo-system"`.
+
+### 14.6 Knowledge-base service (the rules)
+
+#### `RagService.__init__()` · `backend/app/rag/service.py`
+
+- **Called by:** `get_rag_service` (per request), `IngestionWorker._run` (per job).
+- **Takes in:** `session`, `runtime`.
+- **What it does:** keeps the session, builds a `RagRepository`, and keeps the runtime and its settings.
+
+#### `RagService._embedder()` · `backend/app/rag/service.py`
+
+- **Read-only property.** **Gives back:** the runtime's embedder.
+
+#### `RagService.list_collections()` · `backend/app/rag/service.py`
+
+- **Calls:** `RagRepository.list_collections`, `document_counts`, `_summary`.
+- **Takes in:** `include_archived`.
+- **Gives back:** `CollectionList`, each with document counts per status (2 queries in total).
+
+#### `RagService.get_collection()` · `backend/app/rag/service.py`
+
+- **Calls:** `_require_collection`, `_detail`.
+- **Gives back:** `CollectionDetail`, including `needs_reindex`.
+- **Can fail with:** 404.
+
+#### `RagService.create_collection()` · `backend/app/rag/service.py`
+
+- **Takes in:** `CollectionCreate`.
+- **What it does:**
+  1. Refuses a taken name.
+  2. Saves the collection with `embedding_model` = the server's current embedder id.
+  3. Commits.
+- **Gives back:** `CollectionDetail`.
+- **Can fail with:** `CollectionConflictError` (409), also when two creates race (caught by `_commit`).
+
+#### `RagService.archive_collection()` · `backend/app/rag/service.py`
+
+- **What it does:** stamps `archived_at` (once).
+- **Gives back:** the detail.
+- **Debug tips:** archived collections disappear from lists and can't be searched, uploaded to or re-indexed (409). Their data is kept.
+
+#### `RagService.reindex_collection()` · `backend/app/rag/service.py`
+
+- **What it does:**
+  1. Sets the collection's `embedding_model` to the server's current one.
+  2. Resets every document to `pending`.
+  3. Commits, then queues them all.
+- **Gives back:** the detail (**202**). Documents become `ready` as the worker gets through them.
+- **When to use:** after changing `EMBEDDING_PROVIDER`/`EMBEDDING_MODEL`, or the chunk settings.
+
+#### `RagService.list_documents()` · `backend/app/rag/service.py`
+
+- **Gives back:** `DocumentList`, newest first.
+- **Can fail with:** 404 for an unknown collection.
+
+#### `RagService.get_document()` · `backend/app/rag/service.py`
+
+- **Takes in:** collection name, document id.
+- **Gives back:** `DocumentOut` (status, error, chunk count).
+- **Can fail with:** 404 if the document isn't in **that** collection.
+
+#### `RagService.add_file()` · `backend/app/rag/service.py`
+
+- **Called by:** `upload_documents` (once per file). **Calls:** `_require_collection(writable)`, `extract_text` (in a thread), `_add`.
+- **Takes in:** collection name, `filename`, `content_type`, `data` (bytes).
+- **What it does:**
+  1. Refuses files over `RAG_MAX_UPLOAD_MB`.
+  2. Extracts the text off the main thread.
+  3. Saves the document.
+- **Gives back:** `DocumentOut` with status `pending`.
+- **Can fail with:** 404, 409 (archived or duplicate), 413, 415, 422.
+
+#### `RagService.add_text()` · `backend/app/rag/service.py`
+
+- **Called by:** `add_text_document`.
+- **Takes in:** collection name, `DocumentTextCreate`.
+- **What it does:** cleans the pasted text, then saves it like a file (type `text/plain`, size = UTF-8 bytes).
+
+#### `RagService.delete_document()` · `backend/app/rag/service.py`
+
+- **What it does:** deletes the document. The database's cascade rule deletes its chunks too.
+- **Gives back:** nothing (**204**).
+- **Debug tips:** a document deleted while queued is skipped by the worker (`process_document` finds nothing).
+
+#### `RagService.reindex_document()` · `backend/app/rag/service.py`
+
+- **What it does:** resets the document to `pending` (clearing its error), commits, and queues it.
+- **Gives back:** `DocumentOut` (**202**).
+
+#### `RagService.process_document()` · `backend/app/rag/service.py`
+
+- **Called by:** `IngestionWorker._run`, in its own session. **Calls:** `split_text`, `Embedder.embed`, `RagRepository.replace_chunks`.
+- **Takes in:** `document_id`.
+- **What it does:**
+  1. Loads the document; gone → stop quietly.
+  2. Sets `processing` and commits, so the UI can show it.
+  3. Checks the collection's embedding model equals the server's.
+  4. Splits the text, embeds all chunks (`kind="document"`), and replaces the old chunks with the new ones.
+  5. Sets `ready` and `chunk_count`, and commits, all in one transaction, so search never sees half a document.
+  6. **Any error:** rolls back; sets `failed`, the reason in `error`, and `chunk_count` 0; commits; logs `document failed: ...`.
+- **Gives back:** nothing.
+- **Debug tips:** read the document's `error` field in the Knowledge page or `GET .../documents/{id}`.
+
+#### `RagService.search_collection()` · `backend/app/rag/service.py`
+
+- **Called by:** the test-search route.
+- **What it does:** runs `search` on one collection with the request's `top_k` (or `RAG_TOP_K`).
+- **Gives back:** `SearchResponse` (query, collection, embedding model, hits).
+
+#### `RagService.search()` · `backend/app/rag/service.py`
+
+- **Called by:** `search_collection`, `retrieve_for_chat`. **Calls:** `_require_collection`, `Embedder.embed`, `RagRepository.vector_search`, `RagRepository.keyword_search`, `fuse_rrf`, `_round`.
+- **Takes in:** collection `names` (duplicates ignored), `query`, `top_k`.
+- **What it does:**
+  1. Loads each collection; unknown → 404, archived → 409.
+  2. Each collection's embedding model must match the server's → otherwise 409 telling you to re-index.
+  3. Embeds the question (`kind="query"`).
+  4. Runs vector search and keyword search, each limited to `RAG_CANDIDATES` (only `ready` documents).
+  5. Merges them with `fuse_rrf` and keeps the top `top_k`.
+- **Gives back:** a list of `SearchHit`. Each has its merged `score`, plus `vector_similarity` and/or `keyword_score`, showing which method found it.
+- **Debug tips:**
+  - `keyword_score: null` means no shared words: it was found by meaning only.
+  - Vector search always returns its nearest passages, even weak ones. Judge relevance by `vector_similarity`.
+
+#### `RagService.retrieve_for_chat()` · `backend/app/rag/service.py`
+
+- **Called by:** `ChatService._retrieve`. **Calls:** `search`, `build_context`.
+- **Takes in:** `ref` (`RagRef`), `query` (the user's last message).
+- **What it does:**
+  1. Searches with `ref.top_k` (or `RAG_TOP_K`).
+  2. **Always** ends the read transaction afterwards, so no database connection is held during the LLM call.
+  3. Turns hits into citations numbered from 1, each with a 300-character snippet.
+  4. Builds the Sources block.
+- **Gives back:** `RetrievedContext(hits, context, citations)`; with no hits, an empty context and no citations.
+
+#### `RagService._add()` · `backend/app/rag/service.py`
+
+- **Called by:** `add_file`, `add_text`. **Calls:** `RagRepository.find_by_hash`, `RagRepository.add`, `_commit`, `RagRuntime.enqueue`, `_document_out`.
+- **What it does:**
+  1. Hashes the extracted text (SHA-256). The same text already in the collection → 409, even if it came in a different file format.
+  2. Saves a `pending` document, keeping the text for re-indexing, and touches the collection's `updated_at`.
+  3. Commits, then queues the document.
+- **Gives back:** `DocumentOut`.
+- **Can fail with:** `DuplicateDocumentError` (409), also when two identical uploads race (unique rule in `_commit`).
+
+#### `RagService._require_collection()` · `backend/app/rag/service.py`
+
+- **Takes in:** `name`, `writable` (true for uploads, re-index and search).
+- **Gives back:** the `Collection` row.
+- **Can fail with:** `CollectionNotFoundError` (404); `CollectionConflictError` (409) when `writable` and archived.
+
+#### `RagService._require_document()` · `backend/app/rag/service.py`
+
+- **Takes in:** a collection row, a document id.
+- **Gives back:** the `Document` row.
+- **Can fail with:** `DocumentNotFoundError` (404) if it doesn't exist or belongs to another collection.
+
+#### `RagService._detail()` · `backend/app/rag/service.py`
+
+- **What it does:** builds the summary with its counts, adds the server's embedding model, and sets `needs_reindex` when they differ.
+
+#### `RagService._commit()` · `backend/app/rag/service.py`
+
+- **Takes in:** `duplicate_message` (for document saves).
+- **What it does:** commits. If a unique rule is broken, rolls back and raises a clear conflict:
+  - with `duplicate_message` → `DuplicateDocumentError` (document saves);
+  - without it → `CollectionConflictError` (collection names).
+
+#### `_reset()` · `backend/app/rag/service.py`
+
+- **What it does:** sets a document back to `pending` with no error (before it's queued again).
+
+#### `_round()` · `backend/app/rag/service.py`
+
+- **What it does:** rounds a score to 6 decimals, keeping `None` as `None`.
+
+#### `_summary()` · `backend/app/rag/service.py`
+
+- **Takes in:** a collection row and its `{status: count}`.
+- **Gives back:** `CollectionSummary` (missing statuses count as 0).
+
+#### `_document_out()` · `backend/app/rag/service.py`
+
+- **Gives back:** the API view of a document row. The stored text and hash are left out.
+
+### 14.7 Knowledge-base repository (the SQL)
+
+#### `RagRepository.__init__()` · `backend/app/rag/repository.py`
+
+- **Takes in:** `session`. **What it does:** keeps it.
+
+#### `RagRepository.list_collections()` · `backend/app/rag/repository.py`
+
+- **What it does:** collections ordered by name; archived ones only if asked.
+
+#### `RagRepository.get_collection()` · `backend/app/rag/repository.py`
+
+- **What it does:** finds a collection by exact name (indexed).
+- **Gives back:** the row or `None`.
+
+#### `RagRepository.document_counts()` · `backend/app/rag/repository.py`
+
+- **What it does:** one grouped query counting documents per (collection, status).
+- **Gives back:** `{collection_id: {"ready": 3, "failed": 1}}`.
+
+#### `RagRepository.list_documents()` · `backend/app/rag/repository.py`
+
+- **What it does:** a collection's documents, newest first.
+
+#### `RagRepository.get_document()` · `backend/app/rag/repository.py`
+
+- **What it does:** a document by id, or `None`.
+
+#### `RagRepository.find_by_hash()` · `backend/app/rag/repository.py`
+
+- **What it does:** a document in the collection with the same content hash, or `None` (used for duplicate detection).
+
+#### `RagRepository.unfinished_document_ids()` · `backend/app/rag/repository.py`
+
+- **What it does:** ids of documents still `pending`/`processing`, oldest first (re-queued at startup).
+
+#### `RagRepository.replace_chunks()` · `backend/app/rag/repository.py`
+
+- **What it does:** deletes the document's existing chunks and stages the new ones. Both happen in the caller's transaction, so they take effect together on commit.
+
+#### `RagRepository.vector_search()` · `backend/app/rag/repository.py`
+
+- **Takes in:** collection ids, the question's `embedding`, `limit`.
+- **What it does:** orders chunks of `ready` documents in those collections by **cosine distance** to the question (`<=>`, using the HNSW index).
+- **Gives back:** `ChunkMatch(chunk, document_title, collection_name, score)`, where `score` = similarity = 1 − distance (1 = identical direction).
+- **Debug tips:** HNSW is an approximate index: very fast, and occasionally misses a true nearest passage.
+
+#### `RagRepository.keyword_search()` · `backend/app/rag/repository.py`
+
+- **Takes in:** collection ids, the question text, `limit`.
+- **What it does:**
+  1. Turns the question into a full-text query. English stemming applies, so "warranties" matches "warranty", and stop words like "how", "is", "the" are dropped.
+  2. Joins the words with **OR** (`plainto_tsquery`, then `&` → `|`). Postgres's own parsers require every word, which would miss a passage that lacks one of them.
+  3. Keeps chunks whose `search_vector` matches, ranked by `ts_rank_cd`, which rewards more and closer matches.
+- **Gives back:** `ChunkMatch` list, `score` = the rank.
+- **Debug tips:** a question made only of stop words matches nothing here, so results come from vector search alone.
+
+#### `RagRepository.add()` · `backend/app/rag/repository.py`
+
+- **What it does:** stages a new collection or document (written on commit).
+
+#### `RagRepository.delete()` · `backend/app/rag/repository.py`
+
+- **What it does:** deletes a document row; Postgres deletes its chunks (`ON DELETE CASCADE`).
+
+### 14.8 Request dependencies, routes and chat
+
+#### `get_rag_service()` · `backend/app/api/deps.py`
+
+- **Called by:** FastAPI, for `require_rag_service` and `get_chat_service`.
+- **Takes in:** `request`, `session` (from `get_db_session`).
+- **Gives back:** a `RagService` on this request's session, or `None` when there's no database or no embedder.
+- **Debug tips:** it shares the session with the prompt service in the same request.
+
+#### `require_rag_service()` · `backend/app/api/deps.py`
+
+- **Called by:** FastAPI, for every `/v1/collections` route.
+- **What it does:** runs `RagRuntime.check()`, then gives back the service.
+- **Can fail with:** **503** `rag_unavailable` with the exact reason.
+
+#### `ChatService._retrieve()` · `backend/app/services/chat_service.py`
+
+- **Called by:** `ChatService.complete`, `ChatService.stream`, right after `_build_system` and before the provider is called. **Calls:** `RagRuntime.check`, `RagService.retrieve_for_chat`.
+- **Takes in:** the `ChatRequest`, and the `system` text built so far.
+- **What it does:**
+  1. No `rag` in the request → returns `system` unchanged and no citations.
+  2. Checks RAG is usable (503 with the reason otherwise).
+  3. Searches with the **last user message** as the question.
+  4. Hits → appends the Sources block after the system text (or uses it alone).
+  5. No hits → leaves the system text alone and returns `citations: []`.
+- **Gives back:** `(system_text, citations or None)`.
+- **Can fail with:** 503, 404 (unknown collection), 409 (archived or model mismatch). These all happen before the LLM call, so streams fail with normal HTTP errors.
+- **Debug tips:**
+  - Only the last message is searched. A follow-up like "and for managers?" may retrieve poorly.
+  - Query rewriting is a future improvement.
+
+#### `list_collections()` · `backend/app/api/v1/collections.py`
+
+- **Route:** `GET /v1/collections?include_archived=false`. **Gives back:** `CollectionList`.
+
+#### `create_collection()` · `backend/app/api/v1/collections.py`
+
+- **Route:** `POST /v1/collections` (admin).
+- **Takes in:** `{name, description}`.
+- **Gives back:** **201** `CollectionDetail`.
+- **Errors:** 422 bad name, 409 taken, 401.
+
+#### `get_collection()` · `backend/app/api/v1/collections.py`
+
+- **Route:** `GET /v1/collections/{name}`. **Gives back:** `CollectionDetail`.
+- **Errors:** 404.
+
+#### `archive_collection()` · `backend/app/api/v1/collections.py`
+
+- **Route:** `DELETE /v1/collections/{name}` (admin). **Gives back:** the detail with `archived: true`.
+
+#### `reindex_collection()` · `backend/app/api/v1/collections.py`
+
+- **Route:** `POST /v1/collections/{name}/reindex` (admin). **Gives back:** **202** detail.
+
+#### `list_documents()` · `backend/app/api/v1/collections.py`
+
+- **Route:** `GET /v1/collections/{name}/documents`. **Gives back:** `DocumentList`.
+
+#### `upload_documents()` · `backend/app/api/v1/collections.py`
+
+- **Route:** `POST /v1/collections/{name}/documents` (admin), multipart with one or more `files` fields.
+- **What it does:**
+  1. Reads each file and calls `RagService.add_file`.
+  2. **Several files:** a refused file is listed in `errors` (`filename`, `code`, `message`) and the others continue.
+  3. **One file, or an unknown collection:** the error is returned as a normal error status.
+- **Gives back:** **202** `UploadResult`.
+- **Debug tips:** `curl -F files=@a.pdf -F files=@b.md localhost:8000/v1/collections/hr/documents`.
+
+#### `add_text_document()` · `backend/app/api/v1/collections.py`
+
+- **Route:** `POST /v1/collections/{name}/documents/text` (admin), `{title, text}`. **Gives back:** **202** `DocumentOut`.
+
+#### `get_document()` · `backend/app/api/v1/collections.py`
+
+- **Route:** `GET /v1/collections/{name}/documents/{id}`. **Gives back:** `DocumentOut` (poll this for status).
+
+#### `delete_document()` · `backend/app/api/v1/collections.py`
+
+- **Route:** `DELETE /v1/collections/{name}/documents/{id}` (admin). **Gives back:** **204**, no body.
+
+#### `reindex_document()` · `backend/app/api/v1/collections.py`
+
+- **Route:** `POST /v1/collections/{name}/documents/{id}/reindex` (admin). **Gives back:** **202** `DocumentOut`.
+
+#### `search_collection()` · `backend/app/api/v1/collections.py`
+
+- **Route:** `POST /v1/collections/{name}/search`, `{query, top_k?}`.
+- **Gives back:** `SearchResponse`. No LLM is called.
+- **Debug tips:** the fastest way to see why an answer used (or missed) a passage.
+
+#### `upgrade()` · `backend/migrations/versions/0002_create_rag.py`
+
+- **Called by:** `alembic upgrade head`.
+- **What it does:**
+  1. Enables the `vector` extension (needs a user allowed to create extensions).
+  2. Creates `collections` (unique name), `documents` (unique per collection + content hash), and `chunks`. Chunks hold a `vector(768)` column and a `tsvector` column that Postgres computes from the text.
+  3. Adds indexes: HNSW (cosine) on embeddings, GIN on the full-text column, and plain indexes on the ids.
+- **Can fail with:**
+  - "permission denied to create extension" → run it as a superuser once;
+  - "could not open extension control file" → install pgvector on the server.
+
+#### `downgrade()` · `backend/migrations/versions/0002_create_rag.py`
+
+- **What it does:** drops the three tables (all knowledge-base data is lost). The `vector` extension is left installed.
+
+### 14.9 Frontend
+
+#### `Knowledge()` · `frontend/app/knowledge/page.tsx`
+
+- **What it does:** the `/knowledge` route. It sets the tab title and renders `KnowledgePage`.
+
+#### `KnowledgePage()` · `frontend/components/knowledge/knowledge-page.tsx`
+
+- **Calls:** `useAdminKey`, `listCollections`, `NewCollectionForm`, `CollectionPanel`.
+- **What it does:** the same layout as the Prompts page:
+  - the header: title, admin key, **New collection**;
+  - an error banner;
+  - the list on the left: name, `ready/total`, or "archived", description; plus "Show archived";
+  - the selected collection's panel on the right.
+
+  The load-list effect re-runs when "Show archived" changes and after `reload`.
+
+#### `reload()` · `frontend/components/knowledge/knowledge-page.tsx`
+
+- **Called by:** `CollectionPanel` (after changes and while polling), and after creating a collection.
+- **What it does:** bumps a counter that re-runs the load-list effect, so counts stay current.
+
+#### `NewCollectionForm()` · `frontend/components/knowledge/knowledge-page.tsx`
+
+- **Takes in:** `adminKey`, `onCreated(name)`, `onCancel()`.
+- **What it does:** name (format checked by the browser) and description fields.
+
+#### `submit()` · `frontend/components/knowledge/knowledge-page.tsx`
+
+- **What it does:** `createCollection`, then opens the new collection. On failure, shows the error (e.g. name taken).
+
+#### `CollectionPanel()` · `frontend/components/knowledge/collection-panel.tsx`
+
+- **Takes in:** `name`, `adminKey`, `onChanged` (the page's `reload`).
+- **What it does:**
+  1. **Load effect:** `getCollection` + `listDocuments` together, on first view and after every change.
+  2. **Polling effect:** while any document is `pending`/`processing`, reloads every 2 seconds and refreshes the list. It stops by itself when everything is `ready`/`failed`.
+  3. Header:
+     - name and **Archive**;
+     - counts, the embedding model, and the JSON snippet for chat;
+     - a yellow **Re-index collection** banner when `needs_reindex`.
+  4. Then `UploadBox`, `PasteTextForm` (hidden for archived collections), `DocumentTable`, `SearchTester`.
+
+#### `run()` · `frontend/components/knowledge/collection-panel.tsx`
+
+- **What it does:** like the Prompts page's `run`:
+  1. Marks the panel busy and runs the action.
+  2. **Success:** refreshes the panel and the list, and returns the result.
+  3. **Failure:** shows the error and returns `undefined`.
+
+#### `UploadBox()` · `frontend/components/knowledge/collection-panel.tsx`
+
+- **Takes in:** `busy`, `onUpload(files)`.
+- **What it does:** a drop zone and a **Choose files** button (a hidden file input that accepts `.txt .md .markdown .pdf .docx .html .htm`, several at once). After an upload, refused files are listed with their reasons.
+
+#### `upload()` · `frontend/components/knowledge/collection-panel.tsx`
+
+- **Takes in:** a list of `File`s.
+- **What it does:** clears old errors, calls `onUpload`, shows any refused files, and resets the file input (so the same file can be picked again).
+
+#### `onDrop()` · `frontend/components/knowledge/collection-panel.tsx`
+
+- **Takes in:** the drop event.
+- **What it does:** stops the browser from opening the file, ends the highlight, and uploads the dropped files.
+
+#### `PasteTextForm()` · `frontend/components/knowledge/collection-panel.tsx`
+
+- **Takes in:** `busy`, `onSave(title, text)`.
+- **What it does:** a **Paste text instead** button that opens a title + text form.
+
+#### `submit()` · `frontend/components/knowledge/collection-panel.tsx`
+
+- **What it does:** the paste form's submit. Calls `onSave`; on success, clears and closes the form.
+
+#### `DocumentTable()` · `frontend/components/knowledge/collection-panel.tsx`
+
+- **Takes in:** `documents`, `canChange`, `onReindex(id)`, `onDelete(doc)`.
+- **What it does:** a table of documents. Each row has:
+  - the title (plus the file name, and any error in red);
+  - type, size, a status badge, passage count;
+  - **Re-index** and **Delete**.
+
+  Each row carries `data-status`. On narrow screens the table scrolls inside its box; the page itself doesn't scroll sideways.
+
+#### `SearchTester()` · `frontend/components/knowledge/collection-panel.tsx`
+
+- **Takes in:** `name`.
+- **What it does:** a question box and **Search**. Results are numbered like chat sources, with the merged score, meaning similarity, whether a keyword matched, and the passage text.
+
+#### `search()` · `frontend/components/knowledge/collection-panel.tsx`
+
+- **What it does:** `searchCollection(name, {query, top_k: 5})`, then shows the hits or the error.
+
+#### `StatusBadge()` · `frontend/components/knowledge/collection-panel.tsx`
+
+- **Takes in:** `status`.
+- **What it does:** a coloured pill: Pending (grey), Processing (pulsing blue), Ready (green), Failed (red).
+
+#### `typeLabel()` · `frontend/components/knowledge/collection-panel.tsx`
+
+- **Gives back:** a short name for a MIME type (`application/pdf` → `PDF`, the Word type → `Word`), or the MIME type itself if unknown.
+
+#### `formatBytes()` · `frontend/components/knowledge/collection-panel.tsx`
+
+- **Gives back:** a readable size: `71 B`, `35.9 KB`, `2.3 MB`.
+
+#### `collectionPath()` · `frontend/lib/api.ts`
+
+- **What it does:** builds `/v1/collections/<name>` with the name URL-encoded. Every collection function below uses it.
+
+#### `listCollections()` · `frontend/lib/api.ts`
+
+- **Called by:** `KnowledgePage`, `Chat`.
+- **Takes in:** `includeArchived`, `signal`.
+- **Gives back:** `{data: CollectionSummary[]}`.
+
+#### `getCollection()` · `frontend/lib/api.ts`
+
+- **Gives back:** `CollectionDetail`.
+
+#### `createCollection()` · `frontend/lib/api.ts`
+
+- **Takes in:** `{name, description}` and `adminKey`.
+- **What it does:** `POST /v1/collections`.
+
+#### `archiveCollection()` · `frontend/lib/api.ts`
+
+- **What it does:** `DELETE /v1/collections/{name}`.
+
+#### `reindexCollection()` · `frontend/lib/api.ts`
+
+- **What it does:** `POST /v1/collections/{name}/reindex`.
+
+#### `listDocuments()` · `frontend/lib/api.ts`
+
+- **Gives back:** `{data: KnowledgeDocument[]}`.
+
+#### `uploadDocuments()` · `frontend/lib/api.ts`
+
+- **Takes in:** collection name, `File[]`, `adminKey`.
+- **What it does:** puts each file in a `FormData` under `files` and sends it through `apiRequest`'s `form` option (multipart).
+- **Gives back:** `UploadResult`.
+
+#### `addTextDocument()` · `frontend/lib/api.ts`
+
+- **What it does:** `POST .../documents/text` with `{title, text}`.
+
+#### `deleteDocument()` · `frontend/lib/api.ts`
+
+- **What it does:** `DELETE .../documents/{id}`. The reply is 204, so `apiRequest` gives back `undefined`.
+
+#### `reindexDocument()` · `frontend/lib/api.ts`
+
+- **What it does:** `POST .../documents/{id}/reindex`.
+
+#### `searchCollection()` · `frontend/lib/api.ts`
+
+- **What it does:** `POST .../search` with `{query, top_k}`.
+- **Gives back:** the hits and the embedding model used.
+
+### 14.10 Knowledge-base tests
+
+Database tests are marked `requires_pgvector` (`backend/tests/conftest.py`): they run only when
+`TEST_DATABASE_URL` is Postgres, and are skipped otherwise with the reason shown.
+
+#### `make_pdf()` · `backend/tests/test_rag_parsers.py`
+
+- **What it does:** writes a minimal valid one-page PDF by hand, with the given text, or with no text, to imitate a scanned page.
+
+#### `make_docx()` · `backend/tests/test_rag_parsers.py`
+
+- **What it does:** builds a Word file with a title property, a paragraph and a two-cell table.
+
+#### `test_detect_type_by_extension_then_content_type()` · `backend/tests/test_rag_parsers.py`
+
+- **Proves:**
+  - extension first (`.MD` works);
+  - then content type (with charset);
+  - PNG → 415.
+
+#### `test_text_and_markdown_title()` · `backend/tests/test_rag_parsers.py`
+
+- **Proves:**
+  - Windows line ends are fixed and NULs removed.
+  - A Markdown `# Heading` becomes the title.
+
+#### `test_latin1_text_falls_back_cleanly()` · `backend/tests/test_rag_parsers.py`
+
+- **Proves:** non-UTF-8 text is still read ("Café").
+
+#### `test_html_skips_scripts_and_uses_title()` · `backend/tests/test_rag_parsers.py`
+
+- **Proves:**
+  - `<title>` becomes the title;
+  - entities are decoded;
+  - script and style text is dropped.
+
+#### `test_docx_paragraphs_tables_and_title()` · `backend/tests/test_rag_parsers.py`
+
+- **Proves:** Word paragraphs, table rows (`cell | cell`) and the title property are read.
+
+#### `test_pdf_text()` · `backend/tests/test_rag_parsers.py`
+
+- **Proves:** PDF text is extracted; with no metadata title, the file name is used.
+
+#### `test_pdf_without_text_explains_scans()` · `backend/tests/test_rag_parsers.py`
+
+- **Proves:** a text-less PDF gives a 422 whose message mentions scans.
+
+#### `test_broken_files_give_parse_errors()` · `backend/tests/test_rag_parsers.py`
+
+- **Proves:** corrupt PDF and DOCX files give `DocumentParseError`, not a crash.
+
+#### `test_empty_text_rejected()` · `backend/tests/test_rag_parsers.py`
+
+- **Proves:** whitespace-only files are refused.
+
+#### `test_normalize_collapses_blank_lines()` · `backend/tests/test_rag_parsers.py`
+
+- **Proves:** the text clean-up rules.
+
+#### `test_short_text_is_one_chunk()` · `backend/tests/test_rag_chunking.py`
+
+- **Proves:** short text stays as one chunk with its paragraph break.
+
+#### `test_chunks_respect_size_and_keep_paragraphs_together()` · `backend/tests/test_rag_chunking.py`
+
+- **Proves:** every chunk fits the size, and (with no overlap) each paragraph appears whole exactly once.
+
+#### `test_overlap_repeats_the_end_of_the_previous_chunk()` · `backend/tests/test_rag_chunking.py`
+
+- **Proves:** each chunk starts with words from the end of the previous one.
+
+#### `test_long_paragraph_splits_by_sentence_then_words()` · `backend/tests/test_rag_chunking.py`
+
+- **Proves:** long paragraphs and a 450-character "word" are split to fit, with nothing lost.
+
+#### `test_overlap_is_capped_at_half_the_size()` · `backend/tests/test_rag_chunking.py`
+
+- **Proves:** an overlap larger than the size can't break the size limit.
+
+#### `test_empty_text_gives_no_chunks()` · `backend/tests/test_rag_chunking.py`
+
+- **Proves:** whitespace gives `[]`.
+
+#### `vector()` · `backend/tests/test_rag_embeddings.py`
+
+- **What it does:** a 768-number test vector filled with one value.
+
+#### `is_unit()` · `backend/tests/test_rag_embeddings.py`
+
+- **What it does:** checks a vector has length 1.
+
+#### `reply()` · `backend/tests/test_rag_embeddings.py`
+
+- **What it does:** the fake provider server defined inside three embedder tests (OpenAI, Gemini, Ollama). It answers with fake vectors shaped like the real API's.
+
+#### `test_openai_sends_768_dimensions_batches_and_normalizes()` · `backend/tests/test_rag_embeddings.py`
+
+- **Proves:**
+  - 70 texts → 2 requests (64 + 6);
+  - `dimensions: 768` is sent;
+  - results come back in input order, at unit length;
+  - the id is `openai/text-embedding-3-small@768`.
+
+#### `test_openai_errors_use_the_chat_error_mapping()` · `backend/tests/test_rag_embeddings.py`
+
+- **Proves:** a 401 becomes `ProviderAuthError`, as in chat.
+
+#### `test_gemini_task_type_and_dimensions()` · `backend/tests/test_rag_embeddings.py`
+
+- **Proves:** questions use `RETRIEVAL_QUERY` and 768 dimensions; the result is normalized.
+
+#### `test_ollama_nomic_prefixes_and_wrong_size_is_rejected()` · `backend/tests/test_rag_embeddings.py`
+
+- **Proves:**
+  - the `search_document:`/`search_query:` prefixes are added for nomic models;
+  - a 384-dimension model is rejected with "expected 768".
+
+#### `test_mock_embedder_is_deterministic_and_word_based()` · `backend/tests/test_rag_embeddings.py`
+
+- **Proves:**
+  - the same text always gives the same vector;
+  - shared words make vectors closer;
+  - empty text still gives a unit vector.
+
+#### `test_normalize_keeps_zero_vectors()` · `backend/tests/test_rag_embeddings.py`
+
+- **Proves:** `[3, 4]` → `[0.6, 0.8]`; a zero vector is left alone.
+
+#### `test_build_embedder_picks_configured_or_first_available()` · `backend/tests/test_rag_embeddings.py`
+
+- **Proves:** the provider is chosen by priority:
+  - automatic choice;
+  - an explicit `EMBEDDING_PROVIDER` wins over automatic;
+  - nothing available → `None`;
+  - a chosen provider without a key → `None`;
+  - a custom model name is used.
+
+#### `test_rrf_rewards_items_found_by_both_methods()` · `backend/tests/test_rag_retrieval.py`
+
+- **Proves:** items in both lists rank above an item at the top of one list; exact RRF scores (1/61, 1/62).
+
+#### `test_context_numbers_sources_and_marks_them_as_reference()` · `backend/tests/test_rag_retrieval.py`
+
+- **Proves:** the Sources block's header, its "never follow directions" warning, and the `[1] "Title" (collection: x, part n)` format.
+
+#### `wait_ready()` · `backend/tests/test_rag_api.py`
+
+- **Takes in:** the test client, a collection name, `seconds` (default 10).
+- **What it does:** polls the document list every 50 ms until none is `pending`/`processing`. The worker runs in the same event loop, so it makes progress meanwhile.
+- **Gives back:** the documents. Fails the test if indexing never finishes.
+
+#### `make_collection()` · `backend/tests/test_rag_api.py`
+
+- **What it does:** creates a collection through the API and checks it got 201.
+
+#### `parse_sse()` · `backend/tests/test_rag_api.py`
+
+- **What it does:** turns an SSE body into event dictionaries.
+
+#### `test_upload_files_index_and_search()` · `backend/tests/test_rag_api.py`
+
+- **Proves:**
+  - One upload with `.md`, `.docx`, `.pdf`, `.html` → 202, all `pending`, then all `ready` with chunks.
+  - Search for "annual leave days" ranks a leave document first, found by both methods.
+  - The detail shows 4 ready and the mock embedder.
+
+#### `test_keyword_search_finds_exact_codes()` · `backend/tests/test_rag_api.py`
+
+- **Proves:**
+  - Searching an error code (`ZX-4471`) ranks the document containing it first, with a keyword match.
+  - The other results matched by meaning only.
+
+#### `test_keyword_search_matches_any_word_not_all()` · `backend/tests/test_rag_api.py`
+
+- **Proves:**
+  - "how long is the warranty" keyword-matches a passage without the word "long".
+  - A stop-words-only query falls back to vector search with no error.
+
+#### `test_upload_errors()` · `backend/tests/test_rag_api.py`
+
+- **Proves:** each upload problem gets the right response:
+  - duplicate → 409;
+  - PNG → 415;
+  - over the limit → 413;
+  - mixed upload → 202, with the good file accepted and the bad one in `errors`;
+  - unknown collection → 404.
+
+#### `test_delete_and_reindex_document()` · `backend/tests/test_rag_api.py`
+
+- **Proves:**
+  - Re-index → `pending` → `ready`.
+  - Delete → 204, its passages no longer found, and the document is 404.
+
+#### `test_embedding_model_change_needs_reindex()` · `backend/tests/test_rag_api.py`
+
+- **Proves:** after switching the embedder:
+  - the detail shows `needs_reindex`;
+  - search → 409 `embedding_model_mismatch`;
+  - re-index collection → 202 with the new model, and search works again.
+
+#### `test_archived_collection_is_hidden_and_unusable()` · `backend/tests/test_rag_api.py`
+
+- **Proves:**
+  - Archived collections are hidden from the list and can't be searched (409).
+  - Duplicate collection names → 409.
+
+#### `test_chat_adds_sources_and_returns_citations()` · `backend/tests/test_rag_api.py`
+
+- **Proves:**
+  - The model receives the request's system text, then `## Sources` with `[1] "Handbook"`.
+  - The reply's citations point to the right document and snippet.
+  - The stream's `start` carries citations (`top_k` 1).
+  - An empty collection gives `citations: []` and adds nothing.
+  - An unknown collection → 404.
+  - `/health` → `rag: ok`.
+
+#### `test_unfinished_documents_are_requeued_on_start()` · `backend/tests/test_rag_api.py`
+
+- **Proves:** a document left `processing` in the database becomes `ready` after a new app starts.
+
+#### `test_without_postgres_rag_is_unavailable_but_chat_works()` · `backend/tests/test_rag_api.py`
+
+- **Proves:** on SQLite, collections and chat-with-`rag` → 503 mentioning PostgreSQL, while plain chat still works. Runs everywhere.
+
+#### `test_without_database_rag_is_unavailable()` · `backend/tests/test_rag_api.py`
+
+- **Proves:** with no database at all, chat with `rag` → 503 `rag_unavailable`.
+
+---
+
+## 15. Debugging cheat sheet
 
 | Symptom | Most likely cause | Where to look |
 |---|---|---|
@@ -2505,3 +3676,10 @@ Run them on SQLite (default) or real Postgres:
 | 401 `admin_auth_required` | `ADMIN_API_KEY` set, header missing or wrong | Admin key field on the Prompts page |
 | Model ignores the prompt | Prompt not applied, or `system` overrides it | Send the same request to `mock/echo-system` to see the final system prompt |
 | Tables missing (`relation "prompts" does not exist`) | Migrations not run | `uv run alembic upgrade head` |
+| 503 `rag_unavailable` | No database, not Postgres, no embedder, or pgvector missing | The error message names which; `/health` → `rag`; `RagRuntime.check` |
+| Document stuck in `pending`/`processing` | Worker crashed or server stopped mid-job | Restart re-queues it; or `POST .../documents/{id}/reindex` |
+| Document `failed` | Its `error` says why (embedder error, model mismatch...) | Fix the cause, then re-index the document |
+| 409 `embedding_model_mismatch` | `EMBEDDING_PROVIDER`/`EMBEDDING_MODEL` changed since indexing | `POST /v1/collections/{name}/reindex` |
+| 415 / 422 on upload | Unsupported type / no readable text (e.g. scanned PDF) | `detect_type` / `extract_text` |
+| Answer ignores the documents | Wrong passages retrieved | Try the question in the Knowledge page's **Test search**; check `vector_similarity` / `keyword_score` |
+| Chat shows "No matching sources" | Collection empty or documents not `ready` | Knowledge page → document statuses |

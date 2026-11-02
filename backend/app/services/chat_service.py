@@ -1,8 +1,9 @@
 """Chat orchestration: the one place every chat request passes through.
 
-Steps today:  resolve model -> build system prompt (Layer 2) -> LLM call -> log
+Steps today:  resolve model -> build system prompt (Layer 2) -> add knowledge-base sources (Layer 3)
+              -> LLM call -> log
 Later layers plug in here, in this order:
-    auth/RBAC -> input guardrails -> cache -> router -> RAG / MCP tools
+    auth/RBAC -> input guardrails -> cache -> router -> MCP tools
     -> LLM call -> output guardrails -> observability / evals logging
 """
 
@@ -11,24 +12,36 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 
-from app.core.errors import AppError, PromptStoreUnavailableError, ProviderError
+from app.core.errors import AppError, PromptStoreUnavailableError, ProviderError, RagUnavailableError
 from app.llm.base import LLMRequest
 from app.llm.registry import ProviderRegistry
 from app.prompts.schemas import PromptUsed
 from app.prompts.service import PromptService
+from app.rag.runtime import RagRuntime
+from app.rag.schemas import Citation
+from app.rag.service import RagService
 from app.schemas.chat import ChatRequest, ChatResponse, StreamEvent
 
 logger = logging.getLogger(__name__)
 
 
 class ChatService:
-    def __init__(self, registry: ProviderRegistry, prompts: PromptService | None = None) -> None:
+    def __init__(
+        self,
+        registry: ProviderRegistry,
+        prompts: PromptService | None = None,
+        rag: RagService | None = None,
+        rag_runtime: RagRuntime | None = None,
+    ) -> None:
         self._registry = registry
         self._prompts = prompts  # None when no database is configured
+        self._rag = rag  # None when there's no database or embedding provider
+        self._rag_runtime = rag_runtime
 
     async def complete(self, request: ChatRequest) -> ChatResponse:
         provider, model = self._registry.resolve(request.model)
         system, prompt_used = await self._build_system(request)
+        system, citations = await self._retrieve(request, system)
         request_id = _new_id()
         started = time.perf_counter()
         result = await provider.complete(_to_llm_request(request, model, system))
@@ -40,6 +53,7 @@ class ChatService:
                 "provider": provider.name,
                 "model": result.model,
                 "prompt": _prompt_label(prompt_used),
+                "sources": len(citations) if citations is not None else None,
                 "latency_ms": latency_ms,
                 "input_tokens": result.usage.input_tokens,
                 "output_tokens": result.usage.output_tokens,
@@ -55,6 +69,7 @@ class ChatService:
             usage=result.usage,
             latency_ms=latency_ms,
             prompt=prompt_used,
+            citations=citations,
         )
 
     async def stream(self, request: ChatRequest) -> AsyncIterator[StreamEvent]:
@@ -65,6 +80,7 @@ class ChatService:
         """
         provider, model = self._registry.resolve(request.model)
         system, prompt_used = await self._build_system(request)
+        system, citations = await self._retrieve(request, system)
         request_id = _new_id()
         started = time.perf_counter()
         chunks = provider.stream(_to_llm_request(request, model, system))
@@ -79,6 +95,7 @@ class ChatService:
             provider=provider.name,
             model=first.model or model,
             prompt=prompt_used,
+            citations=citations,
         )
 
         try:
@@ -93,6 +110,7 @@ class ChatService:
                             "provider": provider.name,
                             "model": chunk.model or model,
                             "prompt": _prompt_label(prompt_used),
+                            "sources": len(citations) if citations is not None else None,
                             "latency_ms": latency_ms,
                             "input_tokens": chunk.usage.input_tokens if chunk.usage else 0,
                             "output_tokens": chunk.usage.output_tokens if chunk.usage else 0,
@@ -136,6 +154,22 @@ class ChatService:
             return request.system, None
         system = f"{rendered.text}\n\n{request.system}" if request.system else rendered.text
         return system, PromptUsed(name=rendered.name, version=rendered.version)
+
+    async def _retrieve(
+        self, request: ChatRequest, system: str | None
+    ) -> tuple[str | None, list[Citation] | None]:
+        """Add the best knowledge-base passages to the system prompt, when the request asks (`rag`)."""
+        if request.rag is None:
+            return system, None
+        if self._rag_runtime is not None:
+            await self._rag_runtime.check()  # 503 with the exact reason
+        if self._rag is None:
+            raise RagUnavailableError("Knowledge bases aren't available: no database or embedding provider.")
+        query = next(m.content for m in reversed(request.messages) if m.role == "user")
+        retrieved = await self._rag.retrieve_for_chat(request.rag, query)
+        if not retrieved.hits:
+            return system, []
+        return (f"{system}\n\n{retrieved.context}" if system else retrieved.context), retrieved.citations
 
 
 def _to_llm_request(request: ChatRequest, model: str, system: str | None) -> LLMRequest:

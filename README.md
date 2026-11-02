@@ -13,7 +13,7 @@ observability and evals added one layer at a time.
 |---|-------|--------|-------|
 | 1 | API calls: unified multi-provider LLM API (Claude, OpenAI, Gemini, Ollama), streaming | ✅ Built | `backend/app/llm`, `backend/app/api` |
 | 2 | System prompts: versioned templates in Postgres, admin API, Prompts page | ✅ Built | `backend/app/prompts`, `frontend/components/prompts` |
-| 3 | RAG: Postgres + pgvector | Planned | `backend/app/rag` |
+| 3 | RAG: knowledge bases (txt/md/pdf/docx/html), hybrid search on pgvector, cited answers | ✅ Built | `backend/app/rag`, `frontend/components/knowledge` |
 | 4 | MCP tools | Planned | `backend/app/mcp` |
 | 5 | RBAC + OAuth (Keycloak / OIDC) | Planned | `backend/app/auth` |
 | 6 | Guardrails | Planned | `backend/app/guardrails` |
@@ -31,7 +31,8 @@ A test (`backend/tests/test_docs_coverage.py`) fails if any function is missing 
 
 ## Quick start
 
-Needs Python 3.13 with [uv](https://docs.astral.sh/uv/), Node 22, and Postgres 16 for prompts (optional; chat works without it).
+Needs Python 3.13 with [uv](https://docs.astral.sh/uv/), Node 22, and Postgres 16 with the
+[pgvector](https://github.com/pgvector/pgvector) extension for prompts and knowledge bases (optional; chat works without it).
 
 **1. Backend** (http://localhost:8000, API docs at http://localhost:8000/docs)
 
@@ -41,7 +42,7 @@ cp .env.example .env    # add at least one API key, or use the built-in mock mod
 uv sync
 ```
 
-For managed prompts, set `DATABASE_URL=postgresql+asyncpg://eap:eap@localhost:5432/eap` in `backend/.env`, then:
+For managed prompts and knowledge bases, set `DATABASE_URL=postgresql+asyncpg://eap:eap@localhost:5432/eap` in `backend/.env`, then create the tables (this also enables pgvector, so run it as a user allowed to create extensions):
 
 ```bash
 uv run alembic upgrade head
@@ -96,7 +97,9 @@ Only models listed in config can be called. See [`backend/.env.example`](backend
 |---------|---------|
 | `DATABASE_URL` | Postgres for managed prompts. Blank = prompt features off. |
 | `DEFAULT_PROMPT_NAME` | Prompt used when a request sends neither `prompt` nor `system`. |
-| `ADMIN_API_KEY` | If set, prompt changes need the `X-Admin-Key` header (stand-in until RBAC in Layer 5). |
+| `ADMIN_API_KEY` | If set, prompt and knowledge-base changes need the `X-Admin-Key` header (stand-in until RBAC in Layer 5). |
+| `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` | Embeddings for knowledge bases: `openai`, `gemini`, `ollama` or `mock` (blank = first configured). Vectors are 768 numbers. See [backend/app/rag/README.md](backend/app/rag/README.md). |
+| `RAG_*` | Chunk size and overlap, passages per answer, upload limit, indexing concurrency. |
 
 OpenAI and Gemini model names change often. Check the provider's current model list and set
 `OPENAI_MODELS` / `GEMINI_MODELS` to match.
@@ -115,6 +118,12 @@ OpenAI and Gemini model names change often. Check the provider's current model l
 | POST | `/v1/prompts/{name}/activate` | Make a version active (rollback = an older one) |
 | POST | `/v1/prompts/{name}/render` | Preview the final text without calling an LLM |
 | GET | `/v1/prompts/{name}/versions/{n}` | One version |
+| GET/POST | `/v1/collections` | List / create knowledge bases |
+| GET/DELETE | `/v1/collections/{name}` | Details / archive |
+| POST | `/v1/collections/{name}/documents` | Upload files (multipart `files`); `.../documents/text` for pasted text |
+| GET/DELETE | `/v1/collections/{name}/documents/{id}` | Document status / delete |
+| POST | `/v1/collections/{name}/search` | Test search (no LLM) |
+| POST | `/v1/collections/{name}/reindex` | Re-embed everything (after changing the embedding model) |
 
 ```bash
 curl -s localhost:8000/v1/chat -H 'content-type: application/json' -d '{
@@ -142,6 +151,10 @@ With a managed prompt (Layer 2): add `"prompt": {"name": "support-agent", "varia
 The reply then includes `"prompt": {"name": "support-agent", "version": 1}`. Any `system` text is added after the prompt.
 See [backend/app/prompts/README.md](backend/app/prompts/README.md).
 
+With knowledge bases (Layer 3): add `"rag": {"collections": ["hr-policies"]}`. The best passages are added as numbered
+sources, the model cites them as [1], [2], and the reply includes `"citations"`.
+See [backend/app/rag/README.md](backend/app/rag/README.md).
+
 Streaming events (`/v1/chat/stream`), one JSON object per SSE `data:` line:
 `start` → `delta` (text chunks) → `done` (finish reason, usage, latency), or `error`.
 
@@ -150,7 +163,7 @@ Errors always look like `{"error": {"code": "...", "message": "...", "provider":
 ## Development
 
 ```bash
-cd backend && uv run pytest          # tests (no API keys, network or database needed: uses SQLite)
+cd backend && uv run pytest          # tests (no API keys, network or database needed: uses SQLite; pgvector tests skip)
 cd backend && TEST_DATABASE_URL=postgresql+asyncpg://eap:eap@localhost:5432/eap_test uv run pytest  # same tests on Postgres
 cd backend && uv run ruff check .    # lint
 cd frontend && npm run lint && npm run build
@@ -172,15 +185,18 @@ backend/
       registry.py           provider setup + model allowlist
       providers/            anthropic, openai, gemini, ollama, mock
     prompts/                Layer 2: models, repository (SQL), service (rules), templates, seed
-    rag/ mcp/ auth/ guardrails/ cache/ routing/ observability/   (layers 3–8)
+    rag/                    Layer 3: parsers, chunking, embedders, hybrid search, background indexing
+    mcp/ auth/ guardrails/ cache/ routing/ observability/   (layers 4–8)
   migrations/               Alembic database migrations
   evals/                    (layer 9)
   tests/
 frontend/
   app/page.tsx              chat page
   app/prompts/page.tsx      prompts page
+  app/knowledge/page.tsx    knowledge page
   components/chat.tsx       chat UI (prompt + model pickers, variables, streaming)
   components/prompts/       prompts UI (list, versions, rollback, preview, editor)
+  components/knowledge/     knowledge UI (collections, uploads, indexing status, test search)
   lib/api.ts                typed API client + SSE parser
 docs/
   WORKFLOW_CODE_MAP.md      which functions run, in order, per workflow

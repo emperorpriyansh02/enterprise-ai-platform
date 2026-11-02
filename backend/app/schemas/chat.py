@@ -5,6 +5,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
 from app.prompts.schemas import PromptRef, PromptUsed
+from app.rag.schemas import Citation, RagRef
 
 Role = Literal["user", "assistant"]
 FinishReason = Literal["stop", "length", "refusal", "content_filter", "other"]
@@ -28,6 +29,9 @@ class ChatRequest(BaseModel):
     )
     system: str | None = Field(
         default=None, description="System prompt, or extra instructions with `prompt`."
+    )
+    rag: RagRef | None = Field(
+        default=None, description="Knowledge bases to search for this message (Layer 3). Adds cited sources."
     )
     temperature: float | None = Field(
         default=None,
@@ -63,6 +67,9 @@ class ChatResponse(BaseModel):
     usage: Usage
     latency_ms: int
     prompt: PromptUsed | None = Field(default=None, description="Managed prompt version used, if any.")
+    citations: list[Citation] | None = Field(
+        default=None, description="Sources given to the model when `rag` was used ([] = none found)."
+    )
 
 
 class StreamEvent(BaseModel):
@@ -80,6 +87,7 @@ class StreamEvent(BaseModel):
     usage: Usage | None = None
     latency_ms: int | None = None
     prompt: PromptUsed | None = None
+    citations: list[Citation] | None = None  # on `start`, when `rag` was used
     error: dict | None = None
 
 

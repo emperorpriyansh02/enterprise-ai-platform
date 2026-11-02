@@ -4,8 +4,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   ApiError,
+  type Citation,
+  type CollectionSummary,
   type FinishReason,
   getModels,
+  listCollections,
   listPrompts,
   type Message,
   type ModelInfo,
@@ -23,6 +26,7 @@ interface Turn {
   streaming?: boolean;
   stopped?: boolean;
   error?: string;
+  citations?: Citation[]; // knowledge-base sources given to the model (from the `start` event)
   meta?: {
     provider?: string;
     model?: string;
@@ -55,6 +59,9 @@ export default function Chat() {
   const [promptsAvailable, setPromptsAvailable] = useState(true);
   const [promptName, setPromptName] = useState("");
   const [promptVars, setPromptVars] = useState<VariableValues>({});
+  const [collections, setCollections] = useState<CollectionSummary[]>([]);
+  const [ragNames, setRagNames] = useState<string[]>([]);
+  const [showKnowledge, setShowKnowledge] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -89,6 +96,17 @@ export default function Chat() {
         if ((err as Error).name === "AbortError") return;
         setPromptsAvailable(false); // no database configured: chat works without managed prompts
       });
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    listCollections({ signal: controller.signal })
+      .then((list) => {
+        setCollections(list.data);
+        setRagNames((current) => current.filter((n) => list.data.some((c) => c.name === n)));
+      })
+      .catch(() => setCollections([])); // knowledge bases not configured: chat works without them
     return () => controller.abort();
   }, []);
 
@@ -135,6 +153,7 @@ export default function Chat() {
                 variables: Object.fromEntries(selectedPrompt.active_variables.map((v) => [v, promptVars[v]])),
               }
             : undefined,
+          rag: ragNames.length > 0 ? { collections: ragNames } : undefined,
         },
         (event) => {
           switch (event.type) {
@@ -142,6 +161,7 @@ export default function Chat() {
               updateTurn(assistantKey, (t) => ({
                 ...t,
                 meta: { provider: event.provider, model: event.model, prompt: event.prompt },
+                citations: event.citations,
               }));
               break;
             case "delta":
@@ -181,7 +201,7 @@ export default function Chat() {
       abortRef.current = null;
       setBusy(false);
     }
-  }, [busy, input, missingVars.length, model, promptVars, selectedPrompt, system, turns, updateTurn]);
+  }, [busy, input, missingVars.length, model, promptVars, ragNames, selectedPrompt, system, turns, updateTurn]);
 
   const stop = () => abortRef.current?.abort();
   const newChat = () => {
@@ -244,6 +264,18 @@ export default function Chat() {
         >
           {selectedPrompt ? "Extra instructions" : "System prompt"}
         </button>
+        {collections.length > 0 && (
+          <button
+            type="button"
+            onClick={() => setShowKnowledge((s) => !s)}
+            aria-expanded={showKnowledge}
+            className={`rounded-md border px-2.5 py-1.5 text-sm hover:bg-surface ${
+              ragNames.length > 0 ? "border-accent text-accent" : "border-line"
+            }`}
+          >
+            Knowledge{ragNames.length > 0 ? ` (${ragNames.length})` : ""}
+          </button>
+        )}
         <button
           type="button"
           onClick={newChat}
@@ -252,6 +284,29 @@ export default function Chat() {
           New chat
         </button>
       </header>
+
+      {showKnowledge && collections.length > 0 && (
+        <fieldset className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-line py-3 text-sm">
+          <legend className="sr-only">Knowledge bases to search</legend>
+          <span className="text-xs text-muted">Search these knowledge bases:</span>
+          {collections.map((c) => (
+            <label key={c.name} className="flex items-center gap-1.5">
+              <input
+                type="checkbox"
+                checked={ragNames.includes(c.name)}
+                disabled={busy}
+                onChange={(e) =>
+                  setRagNames((current) =>
+                    e.target.checked ? [...current, c.name] : current.filter((n) => n !== c.name),
+                  )
+                }
+              />
+              <span className="font-mono text-xs">{c.name}</span>
+              <span className="text-xs text-muted">({c.documents.ready})</span>
+            </label>
+          ))}
+        </fieldset>
+      )}
 
       {selectedPrompt && selectedPrompt.active_variables.length > 0 && (
         <fieldset className="flex flex-wrap items-center gap-3 border-b border-line py-3">
@@ -336,6 +391,32 @@ export default function Chat() {
                     </p>
                   )}
                   {turn.stopped && <p className="mt-1 text-xs text-muted">Stopped.</p>}
+                  {turn.role === "assistant" && turn.citations && (
+                    <div className="mt-2" aria-label="Sources">
+                      {turn.citations.length === 0 ? (
+                        <p className="text-xs text-muted">No matching sources found in the knowledge base.</p>
+                      ) : (
+                        <details className="text-xs">
+                          <summary className="cursor-pointer text-muted">
+                            Sources ({turn.citations.length})
+                          </summary>
+                          <ol className="mt-1.5 flex flex-col gap-1.5">
+                            {turn.citations.map((c) => (
+                              <li key={c.chunk_id} className="rounded-md border border-line px-2.5 py-1.5">
+                                <p className="font-medium">
+                                  [{c.index}] {c.document_title}{" "}
+                                  <span className="font-normal text-muted">
+                                    · {c.collection} · part {c.position + 1}
+                                  </span>
+                                </p>
+                                <p className="mt-0.5 line-clamp-3 whitespace-pre-wrap text-muted">{c.snippet}</p>
+                              </li>
+                            ))}
+                          </ol>
+                        </details>
+                      )}
+                    </div>
+                  )}
                   {turn.meta?.finishReason && FINISH_NOTES[turn.meta.finishReason] && (
                     <p className="mt-1 text-xs text-warning">{FINISH_NOTES[turn.meta.finishReason]}</p>
                   )}

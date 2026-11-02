@@ -37,17 +37,41 @@ class Database:
             logger.warning("database ping failed", exc_info=True)
             return False
 
+    @property
+    def is_postgres(self) -> bool:
+        return self.engine.dialect.name == "postgresql"
+
+    async def has_pgvector(self) -> bool:
+        """True if this is Postgres and the `vector` extension is installed in it."""
+        if not self.is_postgres:
+            return False
+        async with self.engine.connect() as conn:
+            found = await conn.scalar(text("SELECT 1 FROM pg_extension WHERE extname = 'vector'"))
+        return found is not None
+
+    def _tables(self) -> list:
+        """Every table, except the Postgres-only ones (pgvector) when this isn't Postgres."""
+        import app.prompts.models
+        import app.rag.models  # noqa: F401
+
+        tables = Base.metadata.sorted_tables
+        if self.is_postgres:
+            return tables
+        return [t for t in tables if not t.info.get("postgres_only")]
+
     async def create_all(self) -> None:
         """Create all tables directly. Tests only; real databases use Alembic migrations."""
-        import app.prompts.models  # noqa: F401  (registers the tables on Base.metadata)
-
+        tables = self._tables()
         async with self.engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+            if self.is_postgres:
+                await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            await conn.run_sync(lambda sync_conn: Base.metadata.create_all(sync_conn, tables=tables))
 
     async def drop_all(self) -> None:
         """Drop all tables. Tests only."""
+        tables = self._tables()
         async with self.engine.begin() as conn:
-            await conn.run_sync(Base.metadata.drop_all)
+            await conn.run_sync(lambda sync_conn: Base.metadata.drop_all(sync_conn, tables=tables))
 
     async def aclose(self) -> None:
         await self.engine.dispose()

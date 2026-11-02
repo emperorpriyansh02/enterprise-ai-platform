@@ -25,7 +25,8 @@ async def health(request: Request, registry: Registry) -> dict:
         db_status = "disabled"
     else:
         db_status = "ok" if await database.ping() else "unavailable"
-    return {"status": "ok", "providers": registry.provider_names, "database": db_status}
+    rag_status = await request.app.state.rag.status() if db_status == "ok" else "disabled"
+    return {"status": "ok", "providers": registry.provider_names, "database": db_status, "rag": rag_status}
 
 
 @router.get("/models", response_model=ModelList)

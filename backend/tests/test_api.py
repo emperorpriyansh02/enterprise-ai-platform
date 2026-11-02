@@ -13,7 +13,12 @@ HELLO = {"model": "mock/echo", "messages": [{"role": "user", "content": "hello w
 def test_health(client: TestClient):
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "providers": ["mock"], "database": "disabled"}
+    assert response.json() == {
+        "status": "ok",
+        "providers": ["mock"],
+        "database": "disabled",
+        "rag": "disabled",
+    }
     assert response.headers["X-Request-ID"]
 
 

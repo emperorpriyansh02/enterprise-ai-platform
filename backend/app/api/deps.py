@@ -12,6 +12,8 @@ from app.core.errors import AdminAuthError, PromptStoreUnavailableError
 from app.db.session import Database
 from app.llm.registry import ProviderRegistry
 from app.prompts.service import PromptService
+from app.rag.runtime import RagRuntime
+from app.rag.service import RagService
 from app.services.chat_service import ChatService
 
 
@@ -49,10 +51,31 @@ def require_prompt_service(
     return service
 
 
+def get_rag_service(
+    request: Request, session: Annotated[AsyncSession | None, Depends(get_db_session)]
+) -> RagService | None:
+    """A RagService for this request, or None when there's no database or embedder."""
+    runtime: RagRuntime = request.app.state.rag
+    if session is None or runtime.embedder is None:
+        return None
+    return RagService(session, runtime)
+
+
+async def require_rag_service(
+    request: Request, service: Annotated[RagService | None, Depends(get_rag_service)]
+) -> RagService:
+    """Stops the request with 503 `rag_unavailable` (and the reason) unless knowledge bases work."""
+    await request.app.state.rag.check()
+    assert service is not None  # check() passed, so there is a database and an embedder
+    return service
+
+
 def get_chat_service(
-    request: Request, prompts: Annotated[PromptService | None, Depends(get_prompt_service)]
+    request: Request,
+    prompts: Annotated[PromptService | None, Depends(get_prompt_service)],
+    rag: Annotated[RagService | None, Depends(get_rag_service)],
 ) -> ChatService:
-    return ChatService(get_registry(request), prompts)
+    return ChatService(get_registry(request), prompts, rag, request.app.state.rag)
 
 
 def require_admin(request: Request, x_admin_key: Annotated[str | None, Header()] = None) -> None:

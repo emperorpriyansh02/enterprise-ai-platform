@@ -19,6 +19,7 @@ _EXTRA_FIELDS = (
     "finish_reason",
     "error_code",
     "prompt",
+    "sources",
 )
 
 

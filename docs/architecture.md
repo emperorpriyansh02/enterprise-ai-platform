@@ -1,6 +1,6 @@
 # Architecture
 
-## Request flow (Layers 1–2, today)
+## Request flow (Layers 1–3, today)
 
 ```
 Browser (Next.js chat UI)
@@ -13,6 +13,8 @@ ChatService  app/services/chat_service.py      ◄── every later layer plugs
    │  registry.resolve("provider/model")       ◄── allowlist: only configured models
    │  _build_system()  ──►  PromptService  ──►  Postgres (prompts, prompt_versions)
    │                        render {{ variables }}, record {name, version}
+   │  _retrieve()      ──►  RagService  ──►  embed question ──► pgvector + full-text ──► RRF
+   │                        append numbered Sources, return citations
    ▼
 LLMProvider adapters  app/llm/providers/
    ├─ anthropic_provider.py   official anthropic SDK
@@ -70,5 +72,16 @@ response
 - **Database is optional.** Without `DATABASE_URL`, chat works as in Layer 1 and prompt endpoints
   return 503. The read transaction for a prompt ends before the LLM call, so streaming doesn't hold
   a database connection.
+- **Knowledge bases (Layer 3).** Uploads are parsed and saved as `pending`, then indexed by a
+  background worker in the API process (chunk → embed → store), so uploads return immediately (202).
+  Unfinished documents are re-queued on restart.
+- **Hybrid retrieval.** Vector search (pgvector, HNSW, cosine) finds passages by meaning; Postgres
+  full-text search (OR of the question's words) finds exact names and codes. Reciprocal Rank Fusion
+  merges the two without having to calibrate their scores against each other.
+- **One embedding space per collection.** Every vector has 768 numbers (all three providers support it).
+  Each collection records the embedding model that indexed it; searching it with a different model is a
+  409 until it's re-indexed, instead of silently returning nonsense.
+- **Sources are data, not instructions.** Retrieved passages go into a clearly marked "Sources" block
+  that tells the model not to follow directions inside them (stronger guardrails in Layer 6).
 - **Testability.** Every adapter accepts an injected HTTP client; tests replay realistic provider
   responses through a mock transport, so the suite needs no keys and no network.

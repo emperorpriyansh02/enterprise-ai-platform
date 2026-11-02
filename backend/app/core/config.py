@@ -70,6 +70,20 @@ class Settings(BaseSettings):
     # Temporary until RBAC (Layer 5).
     admin_api_key: SecretStr | None = None
 
+    # --- Knowledge bases / RAG (Layer 3). Needs DATABASE_URL on Postgres with pgvector. ---
+    # openai | gemini | ollama | mock. Blank = first available, in that order.
+    embedding_provider: str | None = None
+    # Blank = the provider's default (see app/rag/embeddings.py). Vectors are always 768 numbers.
+    embedding_model: str | None = None
+    rag_chunk_size: int = Field(default=1200, ge=200, description="Characters per chunk.")
+    rag_chunk_overlap: int = Field(default=200, ge=0, description="Characters repeated between chunks.")
+    rag_top_k: int = Field(default=5, ge=1, le=20, description="Passages added to a chat by default.")
+    rag_candidates: int = Field(
+        default=20, ge=1, le=200, description="Matches taken from each search method."
+    )
+    rag_max_upload_mb: float = Field(default=20, gt=0)
+    rag_ingest_concurrency: int = Field(default=2, ge=1, le=16)
+
     @field_validator(
         "cors_origins",
         "anthropic_models",
@@ -92,6 +106,8 @@ class Settings(BaseSettings):
         "database_url",
         "default_prompt_name",
         "admin_api_key",
+        "embedding_provider",
+        "embedding_model",
         mode="before",
     )
     @classmethod

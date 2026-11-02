@@ -1,4 +1,5 @@
-// Typed client for the backend API: models + chat streaming (Layer 1), prompts (Layer 2).
+// Typed client for the backend API: models + chat streaming (Layer 1), prompts (Layer 2),
+// knowledge bases (Layer 3).
 
 export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -14,6 +15,7 @@ export interface ChatRequest {
   model?: string;
   messages: Message[];
   prompt?: PromptRef;
+  rag?: RagRef;
   system?: string;
   temperature?: number;
   max_tokens?: number;
@@ -31,7 +33,14 @@ export interface ApiErrorBody {
 }
 
 export type StreamEvent =
-  | { type: "start"; id: string; provider: string; model: string; prompt?: PromptUsed }
+  | {
+      type: "start";
+      id: string;
+      provider: string;
+      model: string;
+      prompt?: PromptUsed;
+      citations?: Citation[];
+    }
   | { type: "delta"; id: string; delta: string }
   | {
       type: "done";
@@ -103,6 +112,78 @@ export interface RenderResult {
   variables: string[];
 }
 
+// --- Knowledge bases (Layer 3) ---
+
+export type DocumentStatus = "pending" | "processing" | "ready" | "failed";
+
+export interface RagRef {
+  collections: string[];
+  top_k?: number;
+}
+
+export interface Citation {
+  index: number;
+  collection: string;
+  document_id: string;
+  document_title: string;
+  chunk_id: string;
+  position: number;
+  snippet: string;
+  score: number;
+}
+
+export interface DocumentCounts {
+  pending: number;
+  processing: number;
+  ready: number;
+  failed: number;
+}
+
+export interface CollectionSummary {
+  name: string;
+  description: string;
+  embedding_model: string;
+  documents: DocumentCounts;
+  archived: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CollectionDetail extends CollectionSummary {
+  server_embedding_model: string | null;
+  needs_reindex: boolean;
+}
+
+export interface KnowledgeDocument {
+  id: string;
+  title: string;
+  filename: string | null;
+  mime_type: string;
+  size_bytes: number;
+  status: DocumentStatus;
+  error: string | null;
+  chunk_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface UploadResult {
+  data: KnowledgeDocument[];
+  errors: { filename: string; code: string; message: string }[];
+}
+
+export interface SearchHit {
+  chunk_id: string;
+  document_id: string;
+  document_title: string;
+  collection: string;
+  position: number;
+  content: string;
+  score: number;
+  vector_similarity: number | null;
+  keyword_score: number | null;
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -131,9 +212,19 @@ async function toApiError(response: Response): Promise<ApiError> {
 }
 
 /** Send a JSON request and parse the JSON reply. Throws ApiError on HTTP errors. */
+/**
+ * Send a request and parse the JSON reply. `body` is sent as JSON; `form` as multipart (file uploads,
+ * where the browser sets the content type). Throws ApiError on HTTP errors. 204 replies give undefined.
+ */
 async function apiRequest<T>(
   path: string,
-  options: { method?: string; body?: unknown; adminKey?: string; signal?: AbortSignal } = {},
+  options: {
+    method?: string;
+    body?: unknown;
+    form?: FormData;
+    adminKey?: string;
+    signal?: AbortSignal;
+  } = {},
 ): Promise<T> {
   const headers: Record<string, string> = {};
   if (options.body !== undefined) headers["Content-Type"] = "application/json";
@@ -141,10 +232,11 @@ async function apiRequest<T>(
   const response = await fetch(`${API_URL}${path}`, {
     method: options.method ?? "GET",
     headers,
-    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    body: options.form ?? (options.body === undefined ? undefined : JSON.stringify(options.body)),
     signal: options.signal,
   });
   if (!response.ok) throw await toApiError(response);
+  if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 
@@ -261,4 +353,69 @@ function parseEvent(block: string): StreamEvent | null {
     .join("\n");
   if (!data) return null; // keep-alive comments (": ping") carry no data
   return JSON.parse(data) as StreamEvent;
+}
+
+const collectionPath = (name: string) => `/v1/collections/${encodeURIComponent(name)}`;
+
+export function listCollections(
+  options: { includeArchived?: boolean; signal?: AbortSignal } = {},
+): Promise<{ data: CollectionSummary[] }> {
+  const query = options.includeArchived ? "?include_archived=true" : "";
+  return apiRequest(`/v1/collections${query}`, { signal: options.signal });
+}
+
+export function getCollection(name: string): Promise<CollectionDetail> {
+  return apiRequest(collectionPath(name));
+}
+
+export function createCollection(
+  body: { name: string; description: string },
+  adminKey?: string,
+): Promise<CollectionDetail> {
+  return apiRequest("/v1/collections", { method: "POST", body, adminKey });
+}
+
+export function archiveCollection(name: string, adminKey?: string): Promise<CollectionDetail> {
+  return apiRequest(collectionPath(name), { method: "DELETE", adminKey });
+}
+
+export function reindexCollection(name: string, adminKey?: string): Promise<CollectionDetail> {
+  return apiRequest(`${collectionPath(name)}/reindex`, { method: "POST", adminKey });
+}
+
+export function listDocuments(name: string): Promise<{ data: KnowledgeDocument[] }> {
+  return apiRequest(`${collectionPath(name)}/documents`);
+}
+
+export function uploadDocuments(name: string, files: File[], adminKey?: string): Promise<UploadResult> {
+  const form = new FormData();
+  for (const file of files) form.append("files", file);
+  return apiRequest(`${collectionPath(name)}/documents`, { method: "POST", form, adminKey });
+}
+
+export function addTextDocument(
+  name: string,
+  body: { title: string; text: string },
+  adminKey?: string,
+): Promise<KnowledgeDocument> {
+  return apiRequest(`${collectionPath(name)}/documents/text`, { method: "POST", body, adminKey });
+}
+
+export function deleteDocument(name: string, documentId: string, adminKey?: string): Promise<void> {
+  return apiRequest(`${collectionPath(name)}/documents/${documentId}`, { method: "DELETE", adminKey });
+}
+
+export function reindexDocument(
+  name: string,
+  documentId: string,
+  adminKey?: string,
+): Promise<KnowledgeDocument> {
+  return apiRequest(`${collectionPath(name)}/documents/${documentId}/reindex`, { method: "POST", adminKey });
+}
+
+export function searchCollection(
+  name: string,
+  body: { query: string; top_k?: number },
+): Promise<{ query: string; collections: string[]; embedding_model: string; hits: SearchHit[] }> {
+  return apiRequest(`${collectionPath(name)}/search`, { method: "POST", body });
 }

@@ -18,6 +18,12 @@ from app.schemas.chat import Message
 #   TEST_DATABASE_URL=postgresql+asyncpg://eap:eap@localhost:5432/eap_test uv run pytest
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
+# Knowledge-base tests need Postgres with pgvector; on SQLite they're skipped with this reason.
+requires_pgvector = pytest.mark.skipif(
+    not TEST_DATABASE_URL.startswith("postgresql"),
+    reason="needs Postgres + pgvector: set TEST_DATABASE_URL=postgresql+asyncpg://...",
+)
+
 
 def make_settings(**overrides) -> Settings:
     """Settings that ignore the developer's real .env and environment."""
@@ -29,6 +35,8 @@ def make_settings(**overrides) -> Settings:
         "database_url": None,
         "default_prompt_name": None,
         "admin_api_key": None,
+        "embedding_provider": None,
+        "embedding_model": None,
         "enable_mock_provider": True,
         "mock_stream_delay_s": 0.0,
         "default_model": "mock/echo",

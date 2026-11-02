@@ -12,7 +12,8 @@ from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 
-import app.prompts.models  # noqa: F401  (registers tables on Base.metadata)
+import app.prompts.models
+import app.rag.models  # noqa: F401
 from app.core.config import Settings
 from app.db.base import Base
 

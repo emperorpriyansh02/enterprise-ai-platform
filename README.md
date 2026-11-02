@@ -21,7 +21,13 @@ observability and evals added one layer at a time.
 | 8 | Observability (OpenTelemetry) | Planned (JSON logs today) | `backend/app/observability` |
 | 9 | Evals | Planned | `backend/evals` |
 
-See [docs/architecture.md](docs/architecture.md) for the request flow and design decisions.
+## Code guides
+
+- [docs/WORKFLOW_CODE_MAP.md](docs/WORKFLOW_CODE_MAP.md): for each workflow (startup, chat, streaming, errors, frontend...), which functions run, in order.
+- [docs/FUNCTION_GUIDE.md](docs/FUNCTION_GUIDE.md): every function in plain language (what it takes in, what it does, what it gives back, how it fails, how to debug it), plus a debugging cheat sheet.
+- [docs/architecture.md](docs/architecture.md): request flow and design decisions.
+
+A test (`backend/tests/test_docs_coverage.py`) fails if any function is missing from the two guides, so they stay complete as the code grows.
 
 ## Quick start
 
@@ -135,6 +141,9 @@ frontend/
   app/page.tsx              chat page
   components/chat.tsx       chat UI (model picker, system prompt, streaming)
   lib/api.ts                typed API client + SSE parser
-docs/architecture.md
+docs/
+  WORKFLOW_CODE_MAP.md      which functions run, in order, per workflow
+  FUNCTION_GUIDE.md         every function explained, for learning and debugging
+  architecture.md
 docker-compose.yml
 ```

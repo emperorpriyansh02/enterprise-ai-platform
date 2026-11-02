@@ -1,0 +1,37 @@
+# Local stack. Later layers add: postgres+pgvector (RAG), keycloak (OAuth), redis (cache).
+#   docker compose up --build                 # backend + frontend
+#   docker compose --profile local up --build # + Ollama for local models
+services:
+  backend:
+    build: ./backend
+    env_file:
+      - path: ./backend/.env
+        required: false
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # The browser calls the backend directly, so this is the host-facing URL.
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest # pin a specific version for production
+    profiles: ["local"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  ollama: {}

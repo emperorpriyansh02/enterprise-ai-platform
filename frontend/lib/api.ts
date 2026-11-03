@@ -1,5 +1,8 @@
 // Typed client for the backend API: models + chat streaming (Layer 1), prompts (Layer 2),
-// knowledge bases (Layer 3), MCP tools (Layer 4).
+// knowledge bases (Layer 3), MCP tools (Layer 4), the signed-in user (Layer 5).
+//
+// Every request carries `Authorization: Bearer <token>` when someone is signed in: the sign-in code
+// (components/auth-provider.tsx) registers how to get the token with `setAccessTokenProvider`.
 
 export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -148,6 +151,8 @@ export interface CollectionSummary {
   embedding_model: string;
   documents: DocumentCounts;
   archived: boolean;
+  allowed_roles: RoleName[]; // empty = everyone
+  created_by: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -166,6 +171,7 @@ export interface KnowledgeDocument {
   status: DocumentStatus;
   error: string | null;
   chunk_count: number;
+  created_by: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -227,7 +233,8 @@ export interface McpServer {
   url: string | null;
   header_names: string[];
   enabled: boolean;
-  allowed_roles: string[];
+  allowed_roles: RoleName[]; // empty = everyone
+  created_by: string | null;
   last_error: string | null;
   last_connected_at: string | null;
   tools: McpTool[];
@@ -244,6 +251,7 @@ export interface McpServerCreate {
   env?: Record<string, string>;
   url?: string;
   headers?: Record<string, string>;
+  allowed_roles?: RoleName[];
 }
 
 export interface AvailableServer {
@@ -258,6 +266,28 @@ export interface ToolCallOutcome {
   duration_ms: number;
 }
 
+// --- Users and roles (Layer 5) ---
+
+export const ROLES = ["eap-admin", "eap-editor", "eap-user"] as const;
+export type RoleName = (typeof ROLES)[number];
+
+export const ROLE_LABELS: Record<RoleName, string> = {
+  "eap-admin": "Admin",
+  "eap-editor": "Editor",
+  "eap-user": "User",
+};
+
+export interface Me {
+  subject: string;
+  username: string;
+  name: string | null;
+  email: string | null;
+  roles: string[];
+  permissions: string[]; // e.g. "prompts:write"
+  auth_enabled: boolean;
+  is_dev: boolean;
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -266,6 +296,19 @@ export class ApiError extends Error {
   ) {
     super(message);
   }
+}
+
+let accessTokenProvider: (() => Promise<string | null>) | null = null;
+
+/** Called once by the sign-in code: how to get the current access token (null = none). */
+export function setAccessTokenProvider(provider: (() => Promise<string | null>) | null): void {
+  accessTokenProvider = provider;
+}
+
+/** `{Authorization: "Bearer …"}` when someone is signed in, else `{}`. */
+async function authHeaders(): Promise<Record<string, string>> {
+  const token = accessTokenProvider ? await accessTokenProvider() : null;
+  return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
 async function toApiError(response: Response): Promise<ApiError> {
@@ -295,13 +338,11 @@ async function apiRequest<T>(
     method?: string;
     body?: unknown;
     form?: FormData;
-    adminKey?: string;
     signal?: AbortSignal;
   } = {},
 ): Promise<T> {
-  const headers: Record<string, string> = {};
+  const headers: Record<string, string> = await authHeaders();
   if (options.body !== undefined) headers["Content-Type"] = "application/json";
-  if (options.adminKey) headers["X-Admin-Key"] = options.adminKey;
   const response = await fetch(`${API_URL}${path}`, {
     method: options.method ?? "GET",
     headers,
@@ -317,6 +358,11 @@ export function getModels(signal?: AbortSignal): Promise<ModelList> {
   return apiRequest<ModelList>("/v1/models", { signal });
 }
 
+/** Who is signed in (or the dev user), their roles and permissions. */
+export function getMe(): Promise<Me> {
+  return apiRequest<Me>("/v1/me");
+}
+
 export function listPrompts(
   options: { includeArchived?: boolean; signal?: AbortSignal } = {},
 ): Promise<{ data: PromptSummary[] }> {
@@ -328,53 +374,42 @@ export function getPrompt(name: string): Promise<PromptDetail> {
   return apiRequest(`/v1/prompts/${encodeURIComponent(name)}`);
 }
 
-export function createPrompt(
-  body: { name: string; description: string; template: string; note: string },
-  adminKey?: string,
-): Promise<PromptDetail> {
-  return apiRequest("/v1/prompts", { method: "POST", body, adminKey });
+export function createPrompt(body: {
+  name: string;
+  description: string;
+  template: string;
+  note: string;
+}): Promise<PromptDetail> {
+  return apiRequest("/v1/prompts", { method: "POST", body });
 }
 
-export function updatePromptDescription(
-  name: string,
-  description: string,
-  adminKey?: string,
-): Promise<PromptDetail> {
+export function updatePromptDescription(name: string, description: string): Promise<PromptDetail> {
   return apiRequest(`/v1/prompts/${encodeURIComponent(name)}`, {
     method: "PATCH",
     body: { description },
-    adminKey,
   });
 }
 
 export function addPromptVersion(
   name: string,
   body: { template: string; note: string; activate: boolean },
-  adminKey?: string,
 ): Promise<PromptVersion> {
   return apiRequest(`/v1/prompts/${encodeURIComponent(name)}/versions`, {
     method: "POST",
     body,
-    adminKey,
   });
 }
 
-export function activatePromptVersion(
-  name: string,
-  version: number,
-  adminKey?: string,
-): Promise<PromptDetail> {
+export function activatePromptVersion(name: string, version: number): Promise<PromptDetail> {
   return apiRequest(`/v1/prompts/${encodeURIComponent(name)}/activate`, {
     method: "POST",
     body: { version },
-    adminKey,
   });
 }
 
-export function archivePrompt(name: string, adminKey?: string): Promise<PromptDetail> {
+export function archivePrompt(name: string): Promise<PromptDetail> {
   return apiRequest(`/v1/prompts/${encodeURIComponent(name)}`, {
     method: "DELETE",
-    adminKey,
   });
 }
 
@@ -400,6 +435,7 @@ export async function streamChat(
   const response = await fetch(`${API_URL}/v1/chat/stream`, {
     method: "POST",
     headers: {
+      ...(await authHeaders()),
       "Content-Type": "application/json",
       Accept: "text/event-stream",
     },
@@ -450,21 +486,28 @@ export function getCollection(name: string): Promise<CollectionDetail> {
   return apiRequest(collectionPath(name));
 }
 
-export function createCollection(
-  body: { name: string; description: string },
-  adminKey?: string,
+export function createCollection(body: {
+  name: string;
+  description: string;
+  allowed_roles?: RoleName[];
+}): Promise<CollectionDetail> {
+  return apiRequest("/v1/collections", { method: "POST", body });
+}
+
+export function updateCollection(
+  name: string,
+  body: { description?: string; allowed_roles?: RoleName[] },
 ): Promise<CollectionDetail> {
-  return apiRequest("/v1/collections", { method: "POST", body, adminKey });
+  return apiRequest(collectionPath(name), { method: "PATCH", body });
 }
 
-export function archiveCollection(name: string, adminKey?: string): Promise<CollectionDetail> {
-  return apiRequest(collectionPath(name), { method: "DELETE", adminKey });
+export function archiveCollection(name: string): Promise<CollectionDetail> {
+  return apiRequest(collectionPath(name), { method: "DELETE" });
 }
 
-export function reindexCollection(name: string, adminKey?: string): Promise<CollectionDetail> {
+export function reindexCollection(name: string): Promise<CollectionDetail> {
   return apiRequest(`${collectionPath(name)}/reindex`, {
     method: "POST",
-    adminKey,
   });
 }
 
@@ -472,43 +515,34 @@ export function listDocuments(name: string): Promise<{ data: KnowledgeDocument[]
   return apiRequest(`${collectionPath(name)}/documents`);
 }
 
-export function uploadDocuments(name: string, files: File[], adminKey?: string): Promise<UploadResult> {
+export function uploadDocuments(name: string, files: File[]): Promise<UploadResult> {
   const form = new FormData();
   for (const file of files) form.append("files", file);
   return apiRequest(`${collectionPath(name)}/documents`, {
     method: "POST",
     form,
-    adminKey,
   });
 }
 
 export function addTextDocument(
   name: string,
   body: { title: string; text: string },
-  adminKey?: string,
 ): Promise<KnowledgeDocument> {
   return apiRequest(`${collectionPath(name)}/documents/text`, {
     method: "POST",
     body,
-    adminKey,
   });
 }
 
-export function deleteDocument(name: string, documentId: string, adminKey?: string): Promise<void> {
+export function deleteDocument(name: string, documentId: string): Promise<void> {
   return apiRequest(`${collectionPath(name)}/documents/${documentId}`, {
     method: "DELETE",
-    adminKey,
   });
 }
 
-export function reindexDocument(
-  name: string,
-  documentId: string,
-  adminKey?: string,
-): Promise<KnowledgeDocument> {
+export function reindexDocument(name: string, documentId: string): Promise<KnowledgeDocument> {
   return apiRequest(`${collectionPath(name)}/documents/${documentId}/reindex`, {
     method: "POST",
-    adminKey,
   });
 }
 
@@ -531,51 +565,43 @@ export function listAvailableTools(signal?: AbortSignal): Promise<{ data: Availa
 }
 
 /** Ready-made server definitions (the built-in demo server, with the backend's own Python). */
-export function listMcpPresets(adminKey?: string): Promise<{ data: McpServerCreate[] }> {
-  return apiRequest("/v1/tools/presets", { adminKey });
+export function listMcpPresets(): Promise<{ data: McpServerCreate[] }> {
+  return apiRequest("/v1/tools/presets", {});
 }
 
-export function listMcpServers(adminKey?: string): Promise<{ data: McpServer[] }> {
-  return apiRequest("/v1/tools/servers", { adminKey });
+export function listMcpServers(): Promise<{ data: McpServer[] }> {
+  return apiRequest("/v1/tools/servers", {});
 }
 
-export function getMcpServer(name: string, adminKey?: string): Promise<McpServer> {
-  return apiRequest(serverPath(name), { adminKey });
+export function getMcpServer(name: string): Promise<McpServer> {
+  return apiRequest(serverPath(name), {});
 }
 
-export function createMcpServer(body: McpServerCreate, adminKey?: string): Promise<McpServer> {
-  return apiRequest("/v1/tools/servers", { method: "POST", body, adminKey });
+export function createMcpServer(body: McpServerCreate): Promise<McpServer> {
+  return apiRequest("/v1/tools/servers", { method: "POST", body });
 }
 
 export function updateMcpServer(
   name: string,
-  body: { description?: string; enabled?: boolean },
-  adminKey?: string,
+  body: { description?: string; enabled?: boolean; allowed_roles?: RoleName[] },
 ): Promise<McpServer> {
-  return apiRequest(serverPath(name), { method: "PATCH", body, adminKey });
+  return apiRequest(serverPath(name), { method: "PATCH", body });
 }
 
-export function deleteMcpServer(name: string, adminKey?: string): Promise<void> {
-  return apiRequest(serverPath(name), { method: "DELETE", adminKey });
+export function deleteMcpServer(name: string): Promise<void> {
+  return apiRequest(serverPath(name), { method: "DELETE" });
 }
 
-export function refreshMcpServer(name: string, adminKey?: string): Promise<McpServer> {
+export function refreshMcpServer(name: string): Promise<McpServer> {
   return apiRequest(`${serverPath(name)}/refresh`, {
     method: "POST",
-    adminKey,
   });
 }
 
-export function setMcpToolEnabled(
-  server: string,
-  tool: string,
-  enabled: boolean,
-  adminKey?: string,
-): Promise<McpTool> {
+export function setMcpToolEnabled(server: string, tool: string, enabled: boolean): Promise<McpTool> {
   return apiRequest(`${serverPath(server)}/tools/${encodeURIComponent(tool)}`, {
     method: "PATCH",
     body: { enabled },
-    adminKey,
   });
 }
 
@@ -583,11 +609,9 @@ export function callMcpTool(
   server: string,
   tool: string,
   args: Record<string, unknown>,
-  adminKey?: string,
 ): Promise<ToolCallOutcome> {
   return apiRequest(`${serverPath(server)}/tools/${encodeURIComponent(tool)}/call`, {
     method: "POST",
     body: { arguments: args },
-    adminKey,
   });
 }

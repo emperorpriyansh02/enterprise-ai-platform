@@ -2,15 +2,17 @@
 
 import { type FormEvent, useCallback, useEffect, useState } from "react";
 
-import { AdminKeyInput, useAdminKey } from "@/components/prompts/admin-key";
+import { useAuth } from "@/components/auth-provider";
 import { errorMessage } from "@/components/prompts/messages";
-import { type CollectionSummary, createCollection, listCollections } from "@/lib/api";
+import RolePicker from "@/components/role-picker";
+import { type CollectionSummary, createCollection, listCollections, type RoleName } from "@/lib/api";
 
 import CollectionPanel from "./collection-panel";
 import { ALERT, BUTTON, INPUT, PRIMARY } from "./styles";
 
 export default function KnowledgePage() {
-  const [adminKey, setAdminKey] = useAdminKey();
+  const { can } = useAuth();
+  const canWrite = can("knowledge:write");
   const [collections, setCollections] = useState<CollectionSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -50,17 +52,18 @@ export default function KnowledgePage() {
             Upload documents into collections. Chat can search them and cite its sources.
           </p>
         </div>
-        <AdminKeyInput value={adminKey} onChange={setAdminKey} />
-        <button
-          type="button"
-          className={PRIMARY}
-          onClick={() => {
-            setCreating(true);
-            setSelected(null);
-          }}
-        >
-          New collection
-        </button>
+        {canWrite && (
+          <button
+            type="button"
+            className={PRIMARY}
+            onClick={() => {
+              setCreating(true);
+              setSelected(null);
+            }}
+          >
+            New collection
+          </button>
+        )}
       </header>
 
       {loadError && (
@@ -121,7 +124,6 @@ export default function KnowledgePage() {
         <section aria-label="Collection details" className="min-w-0">
           {creating ? (
             <NewCollectionForm
-              adminKey={adminKey}
               onCancel={() => setCreating(false)}
               onCreated={(name) => {
                 setCreating(false);
@@ -130,7 +132,7 @@ export default function KnowledgePage() {
               }}
             />
           ) : selected ? (
-            <CollectionPanel key={selected} name={selected} adminKey={adminKey} onChanged={reload} />
+            <CollectionPanel key={selected} name={selected} canWrite={canWrite} onChanged={reload} />
           ) : (
             <p className="text-sm text-muted">Select a collection to see and add its documents.</p>
           )}
@@ -141,16 +143,15 @@ export default function KnowledgePage() {
 }
 
 function NewCollectionForm({
-  adminKey,
   onCreated,
   onCancel,
 }: {
-  adminKey: string;
   onCreated: (name: string) => void;
   onCancel: () => void;
 }) {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
+  const [roles, setRoles] = useState<RoleName[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -159,7 +160,7 @@ function NewCollectionForm({
     setSaving(true);
     setError(null);
     try {
-      const created = await createCollection({ name, description }, adminKey);
+      const created = await createCollection({ name, description, allowed_roles: roles });
       onCreated(created.name);
     } catch (err) {
       setError(errorMessage(err));
@@ -191,6 +192,7 @@ function NewCollectionForm({
           className={INPUT}
         />
       </label>
+      <RolePicker value={roles} onChange={setRoles} disabled={saving} />
       {error && (
         <p role="alert" className={ALERT}>
           {error}

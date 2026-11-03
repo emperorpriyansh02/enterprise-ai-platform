@@ -3,18 +3,17 @@
 import { type FormEvent, useState } from "react";
 
 import { ALERT, BUTTON, INPUT, PRIMARY } from "@/components/knowledge/styles";
-import { createMcpServer, listMcpPresets, type Transport } from "@/lib/api";
+import RolePicker from "@/components/role-picker";
+import { createMcpServer, listMcpPresets, type RoleName, type Transport } from "@/lib/api";
 
 import { parsePairs, toolsError } from "./messages";
 
 const LABEL = "mb-1 block text-xs font-medium text-muted";
 
 export default function ServerForm({
-  adminKey,
   onCreated,
   onCancel,
 }: {
-  adminKey: string;
   onCreated: (name: string) => void;
   onCancel: () => void;
 }) {
@@ -26,6 +25,7 @@ export default function ServerForm({
   const [env, setEnv] = useState("");
   const [url, setUrl] = useState("");
   const [headers, setHeaders] = useState("");
+  const [roles, setRoles] = useState<RoleName[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -33,7 +33,7 @@ export default function ServerForm({
   const fillDemo = async () => {
     setError(null);
     try {
-      const demo = (await listMcpPresets(adminKey)).data.find((p) => p.name === "demo");
+      const demo = (await listMcpPresets()).data.find((p) => p.name === "demo");
       if (!demo) return;
       setName(demo.name);
       setDescription(demo.description);
@@ -62,6 +62,7 @@ export default function ServerForm({
                 .map((a) => a.trim())
                 .filter(Boolean),
               env: parsePairs(env, "="),
+              allowed_roles: roles,
             }
           : {
               name,
@@ -69,8 +70,8 @@ export default function ServerForm({
               transport,
               url,
               headers: parsePairs(headers, ":"),
+              allowed_roles: roles,
             },
-        adminKey,
       );
       onCreated(created.name);
     } catch (err) {
@@ -199,6 +200,7 @@ export default function ServerForm({
         </>
       )}
 
+      <RolePicker value={roles} onChange={setRoles} disabled={saving} label="Whose chats may use its tools" />
       {error && (
         <p role="alert" className={ALERT}>
           {error}

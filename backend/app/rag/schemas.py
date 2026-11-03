@@ -6,6 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.auth.permissions import RoleName
 from app.prompts.schemas import NAME_PATTERN
 
 DocumentStatus = Literal["pending", "processing", "ready", "failed"]
@@ -16,6 +17,14 @@ DocumentStatus = Literal["pending", "processing", "ready", "failed"]
 class CollectionCreate(BaseModel):
     name: str = Field(min_length=2, max_length=64, pattern=NAME_PATTERN, examples=["hr-policies"])
     description: str = Field(default="", max_length=500)
+    allowed_roles: list[RoleName] = Field(
+        default_factory=list, description="Roles that may see and use it. Empty = everyone."
+    )
+
+
+class CollectionUpdate(BaseModel):
+    description: str | None = Field(default=None, max_length=500)
+    allowed_roles: list[RoleName] | None = Field(default=None, description="Empty list = everyone.")
 
 
 class DocumentTextCreate(BaseModel):
@@ -47,6 +56,7 @@ class DocumentOut(BaseModel):
     status: DocumentStatus
     error: str | None
     chunk_count: int
+    created_by: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -81,6 +91,8 @@ class CollectionSummary(BaseModel):
     embedding_model: str
     documents: DocumentCounts
     archived: bool
+    allowed_roles: list[str] = Field(default_factory=list, description="Empty = everyone.")
+    created_by: str | None = None
     created_at: datetime
     updated_at: datetime
 

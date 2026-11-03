@@ -10,6 +10,7 @@ from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    JSON,
     Computed,
     DateTime,
     ForeignKey,
@@ -44,6 +45,9 @@ class Collection(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     # Which embedder made this collection's vectors, e.g. "openai/text-embedding-3-small@768".
     embedding_model: Mapped[str] = mapped_column(String(200))
+    # Roles that may see and use this collection; empty = everyone (Layer 5). Admins always may.
+    allowed_roles: Mapped[list[str]] = mapped_column(JSON, default=list)
+    created_by: Mapped[str | None] = mapped_column(String(255))
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
@@ -69,6 +73,7 @@ class Document(Base):
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     error: Mapped[str | None] = mapped_column(Text)
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_by: Mapped[str | None] = mapped_column(String(255))  # who uploaded it (Layer 5)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

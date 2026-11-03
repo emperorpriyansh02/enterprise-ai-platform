@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth.principal import Principal
 from app.core.config import Settings
 from app.core.errors import (
     AppError,
@@ -48,10 +49,19 @@ logger = logging.getLogger(__name__)
 
 
 class MCPService:
-    def __init__(self, session: AsyncSession, manager: MCPManager, settings: Settings) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        manager: MCPManager,
+        settings: Settings,
+        *,
+        principal: Principal | None = None,
+    ) -> None:
         self._session = session
         self._manager = manager
         self._settings = settings
+        # The caller (Layer 5): chats only see servers whose `allowed_roles` include one of theirs.
+        self._principal = principal
 
     @property
     def _secret_key(self) -> str | None:
@@ -68,7 +78,7 @@ class MCPService:
     async def get_server(self, name: str) -> ServerOut:
         return await self._out(await self._require_server(name))
 
-    async def create_server(self, body: ServerCreate, *, created_by: str | None = None) -> ServerOut:
+    async def create_server(self, body: ServerCreate) -> ServerOut:
         """Save the server, then try to connect and list its tools (a failure is kept in `last_error`)."""
         if body.transport == "stdio" and not self._settings.mcp_allow_stdio:
             raise MCPStdioDisabledError("Local (stdio) MCP servers are switched off (MCP_ALLOW_STDIO=false).")
@@ -87,8 +97,8 @@ class MCPService:
             header_names=[] if stdio else sorted(body.headers),
             header_secret=None if stdio else encrypt_secrets(body.headers, self._secret_key),
             enabled=True,
-            allowed_roles=[],
-            created_by=created_by,
+            allowed_roles=list(dict.fromkeys(body.allowed_roles)),
+            created_by=self._principal.username if self._principal else None,
         )
         self._session.add(server)
         await self._commit()
@@ -101,6 +111,8 @@ class MCPService:
             server.description = body.description
         if body.enabled is not None:
             server.enabled = body.enabled
+        if body.allowed_roles is not None:
+            server.allowed_roles = list(dict.fromkeys(body.allowed_roles))
         await self._commit()
         if not server.enabled:
             await self._manager.disconnect(server.name)
@@ -147,14 +159,11 @@ class MCPService:
     # --- Chat ---
 
     async def available_tools(self) -> AvailableTools:
-        """What the chat page can offer: enabled servers with at least one enabled tool."""
-        servers = list(
-            (
-                await self._session.scalars(
-                    select(MCPServerRow).where(MCPServerRow.enabled.is_(True)).order_by(MCPServerRow.name)
-                )
-            ).all()
+        """What the chat page can offer: enabled servers the caller may use, with an enabled tool."""
+        rows = await self._session.scalars(
+            select(MCPServerRow).where(MCPServerRow.enabled.is_(True)).order_by(MCPServerRow.name)
         )
+        servers = [s for s in rows.all() if self._may_use(s)]
         tools = await self._tools_by_server([s.id for s in servers], enabled_only=True)
         return AvailableTools(
             data=[
@@ -177,7 +186,7 @@ class MCPService:
         rows = (await self._session.scalars(select(MCPServerRow).where(MCPServerRow.name.in_(names)))).all()
         servers = {s.name: s for s in rows}
         for name in names:
-            if name not in servers or not servers[name].enabled:
+            if name not in servers or not servers[name].enabled or not self._may_use(servers[name]):
                 raise MCPServerNotFoundError(f'No enabled MCP server named "{name}".')
         tools = await self._tools_by_server([s.id for s in servers.values()], enabled_only=True)
         entries: list[ToolEntry] = []
@@ -255,6 +264,10 @@ class MCPService:
         for name, row in existing.items():
             if name not in seen:
                 await self._session.delete(row)  # the server no longer offers it
+
+    def _may_use(self, server: MCPServerRow) -> bool:
+        """May the caller's chats use this server? (Its `allowed_roles`; admins always may.)"""
+        return self._principal is None or self._principal.may_use(server.allowed_roles)
 
     def _target(self, server: MCPServerRow) -> ServerTarget:
         """How to connect, with secrets decrypted. Checks that stdio is allowed."""
@@ -368,6 +381,7 @@ def _server_out(server: MCPServerRow, tools: list[MCPToolRow]) -> ServerOut:
         header_names=list(server.header_names or []),
         enabled=server.enabled,
         allowed_roles=list(server.allowed_roles or []),
+        created_by=server.created_by,
         last_error=server.last_error,
         last_connected_at=server.last_connected_at,
         tools=[_tool_out(t) for t in tools],

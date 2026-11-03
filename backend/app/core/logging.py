@@ -20,6 +20,16 @@ _EXTRA_FIELDS = (
     "error_code",
     "prompt",
     "sources",
+    # Layer 4: MCP tools
+    "server",
+    "tool",
+    "tools",
+    "is_error",
+    "result_chars",
+    "tool_calls",
+    "tool_rounds",
+    # Layer 5: who made the request
+    "user",
 )
 
 

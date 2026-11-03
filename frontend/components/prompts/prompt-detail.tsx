@@ -23,11 +23,11 @@ const PRIMARY = "rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-accen
 
 export default function PromptDetailPanel({
   name,
-  adminKey,
+  canWrite,
   onChanged,
 }: {
   name: string;
-  adminKey: string;
+  canWrite: boolean; // the user's roles allow prompts:write (editors and admins)
   onChanged: () => void;
 }) {
   const [detail, setDetail] = useState<PromptDetail | null>(null);
@@ -75,7 +75,7 @@ export default function PromptDetailPanel({
   };
 
   const saveVersion = async (template: string, note: string, activate: boolean): Promise<boolean> => {
-    const created = await run(() => addPromptVersion(name, { template, note, activate }, adminKey));
+    const created = await run(() => addPromptVersion(name, { template, note, activate }));
     if (created) setViewing(created.version);
     return created !== undefined;
   };
@@ -100,18 +100,24 @@ export default function PromptDetailPanel({
           {detail.archived ? (
             <span className="rounded-full bg-surface px-2 py-0.5 text-xs text-muted">Archived</span>
           ) : (
-            <button
-              type="button"
-              disabled={busy}
-              className={BUTTON}
-              onClick={() => {
-                if (window.confirm(`Archive "${detail.name}"? Chat requests will no longer be able to use it.`)) {
-                  void run(() => archivePrompt(detail.name, adminKey));
-                }
-              }}
-            >
-              Archive
-            </button>
+            canWrite && (
+              <button
+                type="button"
+                disabled={busy}
+                className={BUTTON}
+                onClick={() => {
+                  if (
+                    window.confirm(
+                      `Archive "${detail.name}"? Chat requests will no longer be able to use it.`,
+                    )
+                  ) {
+                    void run(() => archivePrompt(detail.name));
+                  }
+                }}
+              >
+                Archive
+              </button>
+            )
           )}
         </div>
         {editingDescription ? (
@@ -127,7 +133,7 @@ export default function PromptDetailPanel({
               disabled={busy}
               className={PRIMARY}
               onClick={async () => {
-                if (await run(() => updatePromptDescription(detail.name, description, adminKey))) {
+                if (await run(() => updatePromptDescription(detail.name, description))) {
                   setEditingDescription(false);
                 }
               }}
@@ -141,7 +147,7 @@ export default function PromptDetailPanel({
         ) : (
           <p className="text-sm text-muted">
             {detail.description || "No description."}{" "}
-            {!detail.archived && (
+            {!detail.archived && canWrite && (
               <button
                 type="button"
                 className="text-accent underline-offset-2 hover:underline"
@@ -171,9 +177,9 @@ export default function PromptDetailPanel({
         versions={detail.versions}
         activeVersion={detail.active_version}
         viewing={shown?.version ?? null}
-        canChange={!detail.archived && !busy}
+        canChange={!detail.archived && !busy && canWrite}
         onView={setViewing}
-        onActivate={(version) => void run(() => activatePromptVersion(detail.name, version, adminKey))}
+        onActivate={(version) => void run(() => activatePromptVersion(detail.name, version))}
       />
 
       {shown && (
@@ -190,13 +196,8 @@ export default function PromptDetailPanel({
         </section>
       )}
 
-      {!detail.archived && shown && (
-        <VersionEditor
-          key={`editor-${shown.version}`}
-          startFrom={shown}
-          busy={busy}
-          onSave={saveVersion}
-        />
+      {!detail.archived && shown && canWrite && (
+        <VersionEditor key={`editor-${shown.version}`} startFrom={shown} busy={busy} onSave={saveVersion} />
       )}
     </article>
   );
@@ -236,8 +237,15 @@ function VersionList({
                 Active
               </span>
             ) : (
-              <button type="button" disabled={!canChange} className={BUTTON} onClick={() => onActivate(v.version)}>
-                {activeVersion !== null && v.version < activeVersion ? `Roll back to v${v.version}` : "Make active"}
+              <button
+                type="button"
+                disabled={!canChange}
+                className={BUTTON}
+                onClick={() => onActivate(v.version)}
+              >
+                {activeVersion !== null && v.version < activeVersion
+                  ? `Roll back to v${v.version}`
+                  : "Make active"}
               </button>
             )}
             <button
@@ -349,7 +357,9 @@ function VersionEditor({
         >
           Save as new version
         </button>
-        {unchanged && <span className="ml-3 text-xs text-muted">Edit the template to save a new version.</span>}
+        {unchanged && (
+          <span className="ml-3 text-xs text-muted">Edit the template to save a new version.</span>
+        )}
       </div>
     </section>
   );

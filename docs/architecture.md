@@ -1,16 +1,18 @@
 # Architecture
 
-## Request flow (Layers 1–4, today)
+## Request flow (Layers 1–5, today)
 
 ```
-Browser (Next.js chat UI)
-   │  POST /v1/chat/stream  (SSE)        POST /v1/chat  (JSON)
+Browser (Next.js UI) ── sign in: Keycloak, authorization code + PKCE ──► access token (JWT)
+   │  POST /v1/chat/stream  (SSE)        POST /v1/chat  (JSON)      Authorization: Bearer <token>
    ▼
 FastAPI  app/api/v1/routes.py
-   │  validation (schemas/chat.py) · request-id + JSON logs (main.py)
+   │  validation (schemas/chat.py) · request-id + JSON logs with user (main.py)
+   │  get_principal: TokenVerifier (JWKS signature, iss, aud, exp) → roles     ◄── Layer 5
+   │  require("chat:use")  → 403 if the roles don't allow it
    ▼
 ChatService  app/services/chat_service.py      ◄── every later layer plugs in here
-   │  registry.resolve("provider/model")       ◄── allowlist: only configured models
+   │  registry.resolve("provider/model")       ◄── allowlist: only configured models; MODEL_ROLES per role
    │  _build_system()  ──►  PromptService  ──►  Postgres (prompts, prompt_versions)
    │                        render {{ variables }}, record {name, version}
    │  _retrieve()      ──►  RagService  ──►  embed question ──► pgvector + full-text ──► RRF
@@ -33,7 +35,7 @@ LLMProvider adapters  app/llm/providers/
 
 ```
 request
-  → [5] auth: validate Keycloak JWT, load roles
+  → [5] auth: validate Keycloak JWT, load roles, check permissions
   → [2] prompts: pick + render the versioned system prompt
   → [6] input guardrails: injection / PII / policy
   → [7a] cache: return early on a hit
@@ -108,5 +110,24 @@ response
 - **Tool failures don't fail the chat.** A tool error, timeout or unreachable server becomes an error
   result for the model to handle; the reply's `tool_calls` trace shows what ran, with what arguments,
   and how long it took.
+- **Identity is the provider's job; permissions are ours (Layer 5).** Keycloak (any OIDC provider)
+  signs users in and puts their roles in the access token. The backend only verifies tokens (public
+  keys from the JWKS, cached, re-read on key rotation; `iss`, `aud`, `exp`; asymmetric algorithms only)
+  and maps roles to permissions in code (`app/auth/permissions.py`), so changing what a role can do is
+  a reviewed code change, not a console click.
+- **Three roles, checked twice.** `eap-user` (chat, read), `eap-editor` (+ change prompts and knowledge),
+  `eap-admin` (+ MCP servers). Routes declare the permission they need (`require(...)`); services filter
+  what a role may see. The UI hides what you can't do, but the backend is what enforces it.
+- **Resource rules hide, not just refuse.** Collections and MCP servers may list `allowed_roles`
+  (empty = everyone; admins always pass). Others don't see them, and get the same 404 as for a name
+  that doesn't exist, so names of restricted collections don't leak. Models can be limited with
+  `MODEL_ROLES` (403, since model names aren't secret).
+- **Browser sign-in with PKCE, no secret in the frontend.** The web client is public; oidc-client-ts runs
+  the authorization code flow with PKCE (S256), keeps tokens in sessionStorage, and renews them
+  before they expire. The frontend reads the provider settings from `/v1/auth/config` at runtime.
+- **Who did it.** Every request log line names the user; prompts, collections, documents and MCP
+  servers record `created_by`.
+- **Sign-in off for local development.** `AUTH_ENABLED=false` makes every request act as a dev user
+  (`DEV_USER_ROLES`); the startup log warns about it and the UI shows "sign-in off".
 - **Testability.** Every adapter accepts an injected HTTP client; tests replay realistic provider
   responses through a mock transport, so the suite needs no keys and no network.

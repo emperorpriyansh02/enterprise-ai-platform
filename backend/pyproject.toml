@@ -16,6 +16,7 @@ dependencies = [
     "openai>=3.42.1",
     "pgvector>=0.5.1",
     "pydantic-settings>=2.16.2",
+    "pyjwt>=2.10",
     "pypdf>=6.21.4",
     "python-docx>=1.2.0",
     "python-multipart>=0.0.33",

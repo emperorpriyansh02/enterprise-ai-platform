@@ -6,8 +6,11 @@ export function errorMessage(err: unknown): string {
     if (err.code === "prompt_store_unavailable") {
       return "The prompt store isn't configured. Set DATABASE_URL in backend/.env and restart the backend.";
     }
-    if (err.code === "admin_auth_required") {
-      return "This change needs the admin key. Enter it at the top of the page.";
+    if (err.code === "forbidden") {
+      return `Your role can't do this. ${err.message}`;
+    }
+    if (err.code === "auth_required" || err.code === "invalid_token") {
+      return "Your sign-in has expired. Reload the page to sign in again.";
     }
     return err.message;
   }

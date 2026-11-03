@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth.principal import Principal
 from app.core.errors import (
     AppError,
     CollectionConflictError,
@@ -31,6 +32,7 @@ from app.rag.schemas import (
     CollectionDetail,
     CollectionList,
     CollectionSummary,
+    CollectionUpdate,
     DocumentCounts,
     DocumentList,
     DocumentOut,
@@ -54,11 +56,16 @@ class RetrievedContext:
 
 
 class RagService:
-    def __init__(self, session: AsyncSession, runtime: RagRuntime) -> None:
+    def __init__(
+        self, session: AsyncSession, runtime: RagRuntime, *, principal: Principal | None = None
+    ) -> None:
         self._session = session
         self._repo = RagRepository(session)
         self._runtime = runtime
         self._settings = runtime.settings
+        # The caller (Layer 5): collections their roles don't allow look like they don't exist.
+        # None = no limits (the background worker).
+        self._principal = principal
 
     @property
     def _embedder(self):
@@ -67,7 +74,11 @@ class RagService:
     # --- Collections ---
 
     async def list_collections(self, *, include_archived: bool = False) -> CollectionList:
-        collections = await self._repo.list_collections(include_archived=include_archived)
+        collections = [
+            c
+            for c in await self._repo.list_collections(include_archived=include_archived)
+            if self._visible(c)
+        ]
         counts = await self._repo.document_counts([c.id for c in collections])
         return CollectionList(data=[_summary(c, counts.get(c.id, {})) for c in collections])
 
@@ -78,9 +89,24 @@ class RagService:
         if await self._repo.get_collection(body.name) is not None:
             raise CollectionConflictError(f'A collection named "{body.name}" already exists.')
         collection = Collection(
-            id=uuid.uuid4(), name=body.name, description=body.description, embedding_model=self._embedder.id
+            id=uuid.uuid4(),
+            name=body.name,
+            description=body.description,
+            embedding_model=self._embedder.id,
+            allowed_roles=list(dict.fromkeys(body.allowed_roles)),
+            created_by=self._username,
         )
         self._repo.add(collection)
+        await self._commit()
+        return await self._detail(collection)
+
+    async def update_collection(self, name: str, body: CollectionUpdate) -> CollectionDetail:
+        """Change the description and/or who may use the collection."""
+        collection = await self._require_collection(name, writable=True)
+        if body.description is not None:
+            collection.description = body.description
+        if body.allowed_roles is not None:
+            collection.allowed_roles = list(dict.fromkeys(body.allowed_roles))
         await self._commit()
         return await self._detail(collection)
 
@@ -274,6 +300,7 @@ class RagService:
             text=extracted.text,
             status="pending",
             chunk_count=0,
+            created_by=self._username,
         )
         self._repo.add(document)
         collection.updated_at = datetime.now(UTC)
@@ -281,9 +308,17 @@ class RagService:
         self._runtime.enqueue(document.id)
         return _document_out(document)
 
+    @property
+    def _username(self) -> str | None:
+        return self._principal.username if self._principal else None
+
+    def _visible(self, collection: Collection) -> bool:
+        """May the caller see and use this collection? (Its `allowed_roles`; admins always may.)"""
+        return self._principal is None or self._principal.may_use(collection.allowed_roles)
+
     async def _require_collection(self, name: str, *, writable: bool = False) -> Collection:
         collection = await self._repo.get_collection(name)
-        if collection is None:
+        if collection is None or not self._visible(collection):
             raise CollectionNotFoundError(f'No collection named "{name}".')
         if writable and collection.archived_at is not None:
             raise CollectionConflictError(f'Collection "{name}" is archived.')
@@ -329,6 +364,8 @@ def _summary(collection: Collection, counts: dict[str, int]) -> CollectionSummar
         embedding_model=collection.embedding_model,
         documents=DocumentCounts(**counts),
         archived=collection.archived_at is not None,
+        allowed_roles=list(collection.allowed_roles or []),
+        created_by=collection.created_by,
         created_at=collection.created_at,
         updated_at=collection.updated_at,
     )
@@ -344,6 +381,7 @@ def _document_out(document: Document) -> DocumentOut:
         status=document.status,
         error=document.error,
         chunk_count=document.chunk_count,
+        created_by=document.created_by,
         created_at=document.created_at,
         updated_at=document.updated_at,
     )

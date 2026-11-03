@@ -71,17 +71,18 @@ async def test_errors_have_clear_codes(api_factory):
     assert bad_name.status_code == 422
 
 
-async def test_admin_key_required_for_writes_when_configured(api_factory):
-    async with api_factory(admin_api_key="s3cret") as api:
-        no_key = await api.post("/v1/prompts", json=SUPPORT)
-        wrong_key = await api.post("/v1/prompts", json=SUPPORT, headers={"X-Admin-Key": "nope"})
-        ok = await api.post("/v1/prompts", json=SUPPORT, headers={"X-Admin-Key": "s3cret"})
-        read = await api.get("/v1/prompts/support")  # reads stay open
+async def test_writes_need_the_editor_role(api_factory):
+    async with api_factory(dev_user_roles=["eap-user"]) as api:
+        refused = await api.post("/v1/prompts", json=SUPPORT)
+        read = await api.get("/v1/prompts")  # every role may read
+    async with api_factory(dev_user_roles=["eap-editor"]) as api:
+        created = await api.post("/v1/prompts", json=SUPPORT)
 
-    assert (no_key.status_code, no_key.json()["error"]["code"]) == (401, "admin_auth_required")
-    assert wrong_key.status_code == 401
-    assert ok.status_code == 201
+    assert (refused.status_code, refused.json()["error"]["code"]) == (403, "forbidden")
+    assert "prompts:write" in refused.json()["error"]["message"]
     assert read.status_code == 200
+    assert created.status_code == 201
+    assert created.json()["versions"][0]["created_by"] == "dev"  # the dev user's name
 
 
 def test_without_database_prompts_return_503_and_chat_still_works():

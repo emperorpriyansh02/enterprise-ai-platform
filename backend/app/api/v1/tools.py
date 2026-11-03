@@ -1,14 +1,16 @@
 """MCP tools API (Layer 4): the server registry, the tool allowlist, and a "try a tool" call.
 
-`GET /v1/tools` (what a chat may use) is open. Everything under /servers shows how servers are
-started or reached, so it needs X-Admin-Key when ADMIN_API_KEY is set (until RBAC in Layer 5).
+`GET /v1/tools` (what a chat may use) needs `tools:use` (every role) and lists only servers the
+caller's roles may use. Everything under /servers and /presets shows how servers are started or
+reached, so it needs `tools:admin` (admins only).
 """
 
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Response
 
-from app.api.deps import require_admin, require_mcp_service
+from app.api.deps import require, require_mcp_service
+from app.auth.permissions import TOOLS_ADMIN, TOOLS_USE
 from app.mcp.schemas import (
     AvailableTools,
     PresetList,
@@ -26,10 +28,10 @@ from app.mcp.service import MCPService, presets
 router = APIRouter(prefix="/v1/tools", tags=["tools"])
 
 Tools = Annotated[MCPService, Depends(require_mcp_service)]
-Admin = Depends(require_admin)
+Admin = Depends(require(TOOLS_ADMIN))
 
 
-@router.get("", response_model=AvailableTools)
+@router.get("", response_model=AvailableTools, dependencies=[Depends(require(TOOLS_USE))])
 async def list_available_tools(service: Tools) -> AvailableTools:
     """Enabled servers with their enabled tools: what a chat request can name in `tools.servers`."""
     return await service.available_tools()

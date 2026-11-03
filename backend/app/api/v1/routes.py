@@ -6,7 +6,9 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Request
 from sse_starlette import EventSourceResponse
 
-from app.api.deps import get_chat_service, get_registry
+from app.api.deps import get_chat_service, get_registry, get_settings_from_app, require
+from app.auth.permissions import CHAT
+from app.auth.principal import Principal
 from app.llm.registry import ProviderRegistry
 from app.schemas.chat import ChatRequest, ChatResponse, ModelList, StreamEvent
 from app.services.chat_service import ChatService
@@ -36,8 +38,15 @@ async def health(request: Request, registry: Registry) -> dict:
 
 
 @router.get("/models", response_model=ModelList)
-async def list_models(registry: Registry) -> ModelList:
-    return ModelList(default=registry.default_model, data=registry.catalog())
+async def list_models(
+    request: Request, registry: Registry, principal: Annotated[Principal, Depends(require(CHAT))]
+) -> ModelList:
+    """The models the caller may use (MODEL_ROLES), and the default (the first allowed one if needed)."""
+    model_roles = get_settings_from_app(request).model_roles
+    allowed = [m for m in registry.catalog() if principal.may_use(model_roles.get(m.id))]
+    ids = [m.id for m in allowed]
+    default = registry.default_model if registry.default_model in ids else (ids[0] if ids else None)
+    return ModelList(default=default, data=allowed)
 
 
 @router.post("/chat", response_model=ChatResponse)

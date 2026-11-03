@@ -2,10 +2,13 @@
 
 import { type DragEvent, type FormEvent, useEffect, useRef, useState } from "react";
 
+import RolePicker, { rolesLabel } from "@/components/role-picker";
 import { errorMessage } from "@/components/prompts/messages";
 import {
   addTextDocument,
   archiveCollection,
+  type RoleName,
+  updateCollection,
   type CollectionDetail,
   deleteDocument,
   type DocumentStatus,
@@ -27,11 +30,11 @@ const POLL_MS = 2000;
 
 export default function CollectionPanel({
   name,
-  adminKey,
+  canWrite,
   onChanged,
 }: {
   name: string;
-  adminKey: string;
+  canWrite: boolean; // the user's roles allow knowledge:write (editors and admins)
   onChanged: () => void;
 }) {
   const [collection, setCollection] = useState<CollectionDetail | null>(null);
@@ -95,7 +98,7 @@ export default function CollectionPanel({
     );
   }
 
-  const writable = !collection.archived;
+  const writable = !collection.archived && canWrite;
 
   return (
     <article className="flex flex-col gap-6">
@@ -105,38 +108,54 @@ export default function CollectionPanel({
           {collection.archived ? (
             <span className="rounded-full bg-surface px-2 py-0.5 text-xs text-muted">Archived</span>
           ) : (
-            <button
-              type="button"
-              disabled={busy}
-              className={BUTTON}
-              onClick={() => {
-                if (window.confirm(`Archive "${collection.name}"? Chat will no longer be able to search it.`)) {
-                  void run(() => archiveCollection(collection.name, adminKey));
-                }
-              }}
-            >
-              Archive
-            </button>
+            canWrite && (
+              <button
+                type="button"
+                disabled={busy}
+                className={BUTTON}
+                onClick={() => {
+                  if (
+                    window.confirm(`Archive "${collection.name}"? Chat will no longer be able to search it.`)
+                  ) {
+                    void run(() => archiveCollection(collection.name));
+                  }
+                }}
+              >
+                Archive
+              </button>
+            )
           )}
         </div>
         <p className="text-sm text-muted">{collection.description || "No description."}</p>
+        <AccessRow
+          key={collection.allowed_roles.join(",")}
+          roles={collection.allowed_roles}
+          createdBy={collection.created_by}
+          editable={writable}
+          busy={busy}
+          onSave={(roles) => run(() => updateCollection(collection.name, { allowed_roles: roles }))}
+        />
         <p className="text-xs text-muted">
-          {collection.documents.ready} ready · {collection.documents.pending + collection.documents.processing}{" "}
-          indexing · {collection.documents.failed} failed · Embeddings:{" "}
+          {collection.documents.ready} ready ·{" "}
+          {collection.documents.pending + collection.documents.processing} indexing ·{" "}
+          {collection.documents.failed} failed · Embeddings:{" "}
           <code className="rounded bg-surface px-1">{collection.embedding_model}</code> · Use in chat as{" "}
           <code className="rounded bg-surface px-1">{`"rag": {"collections": ["${collection.name}"]}`}</code>
         </p>
         {collection.needs_reindex && writable && (
-          <div role="status" className="flex flex-wrap items-center gap-3 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm">
+          <div
+            role="status"
+            className="flex flex-wrap items-center gap-3 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-sm"
+          >
             <span className="mr-auto">
-              The server now uses <code>{collection.server_embedding_model}</code>. Search won&apos;t work until
-              this collection is re-indexed.
+              The server now uses <code>{collection.server_embedding_model}</code>. Search won&apos;t work
+              until this collection is re-indexed.
             </span>
             <button
               type="button"
               disabled={busy}
               className={PRIMARY}
-              onClick={() => void run(() => reindexCollection(collection.name, adminKey))}
+              onClick={() => void run(() => reindexCollection(collection.name))}
             >
               Re-index collection
             </button>
@@ -150,25 +169,22 @@ export default function CollectionPanel({
       </header>
 
       {writable && (
-        <UploadBox
-          busy={busy}
-          onUpload={(files) => run(() => uploadDocuments(collection.name, files, adminKey))}
-        />
+        <UploadBox busy={busy} onUpload={(files) => run(() => uploadDocuments(collection.name, files))} />
       )}
       {writable && (
         <PasteTextForm
           busy={busy}
-          onSave={(title, text) => run(() => addTextDocument(collection.name, { title, text }, adminKey))}
+          onSave={(title, text) => run(() => addTextDocument(collection.name, { title, text }))}
         />
       )}
 
       <DocumentTable
         documents={documents}
         canChange={writable && !busy}
-        onReindex={(id) => void run(() => reindexDocument(collection.name, id, adminKey))}
+        onReindex={(id) => void run(() => reindexDocument(collection.name, id))}
         onDelete={(doc) => {
           if (window.confirm(`Delete "${doc.title}" and its passages?`)) {
-            void run(() => deleteDocument(collection.name, doc.id, adminKey));
+            void run(() => deleteDocument(collection.name, doc.id));
           }
         }}
       />
@@ -362,7 +378,12 @@ function DocumentTable({
                     >
                       Re-index
                     </button>
-                    <button type="button" disabled={!canChange} className={BUTTON} onClick={() => onDelete(doc)}>
+                    <button
+                      type="button"
+                      disabled={!canChange}
+                      className={BUTTON}
+                      onClick={() => onDelete(doc)}
+                    >
                       Delete
                     </button>
                   </td>
@@ -399,7 +420,9 @@ function SearchTester({ name }: { name: string }) {
   return (
     <section aria-label="Test search" className="flex flex-col gap-2 border-t border-line pt-5">
       <h3 className="text-sm font-semibold">Test search</h3>
-      <p className="text-xs text-muted">See which passages a chat question would retrieve. No AI model is called.</p>
+      <p className="text-xs text-muted">
+        See which passages a chat question would retrieve. No AI model is called.
+      </p>
       <form onSubmit={search} className="flex gap-2">
         <input
           value={query}
@@ -428,7 +451,9 @@ function SearchTester({ name }: { name: string }) {
                   <span>part {hit.position + 1}</span>
                   <span>score {hit.score.toFixed(4)}</span>
                   <span>
-                    {hit.vector_similarity !== null ? `meaning ${hit.vector_similarity.toFixed(2)}` : "no meaning match"}
+                    {hit.vector_similarity !== null
+                      ? `meaning ${hit.vector_similarity.toFixed(2)}`
+                      : "no meaning match"}
                   </span>
                   <span>{hit.keyword_score !== null ? "keyword match" : "no keyword match"}</span>
                 </p>
@@ -472,4 +497,63 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** Who may see and use the collection, and an editor for it (editors and admins). */
+function AccessRow({
+  roles,
+  createdBy,
+  editable,
+  busy,
+  onSave,
+}: {
+  roles: RoleName[];
+  createdBy: string | null;
+  editable: boolean;
+  busy: boolean;
+  onSave: (roles: RoleName[]) => Promise<unknown>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState<RoleName[]>(roles);
+  if (editing) {
+    return (
+      <div className="flex flex-wrap items-end gap-3 rounded-md border border-line p-3">
+        <RolePicker value={draft} onChange={setDraft} disabled={busy} />
+        <button
+          type="button"
+          className={PRIMARY}
+          disabled={busy}
+          onClick={async () => {
+            if ((await onSave(draft)) !== undefined) setEditing(false);
+          }}
+        >
+          Save access
+        </button>
+        <button type="button" className={BUTTON} onClick={() => setEditing(false)}>
+          Cancel
+        </button>
+      </div>
+    );
+  }
+  return (
+    <p className="text-xs text-muted">
+      Access: <strong className="text-foreground">{rolesLabel(roles)}</strong>
+      {createdBy && ` · created by ${createdBy}`}
+      {editable && (
+        <>
+          {" "}
+          <button
+            type="button"
+            className="text-accent underline-offset-2 hover:underline"
+            onClick={() => {
+              setDraft(roles);
+              setEditing(true);
+            }}
+          >
+            Change
+          </button>
+        </>
+      )}
+    </p>
+  );
 }

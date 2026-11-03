@@ -15,7 +15,7 @@ observability and evals added one layer at a time.
 | 2 | System prompts: versioned templates in Postgres, admin API, Prompts page | ✅ Built | `backend/app/prompts`, `frontend/components/prompts` |
 | 3 | RAG: knowledge bases (txt/md/pdf/docx/html), hybrid search on pgvector, cited answers | ✅ Built | `backend/app/rag`, `frontend/components/knowledge` |
 | 4 | MCP tools: stdio + HTTP MCP servers, admin tool allowlist, model ↔ tool loop for all providers, Tools page | ✅ Built | `backend/app/mcp`, `frontend/components/tools` |
-| 5 | RBAC + OAuth (Keycloak / OIDC) | Planned | `backend/app/auth` |
+| 5 | RBAC + OAuth: Keycloak sign-in (PKCE), roles admin / editor / user, per-collection, per-tool-server and per-model access | ✅ Built | `backend/app/auth`, `frontend/lib/auth.ts`, `infra/keycloak` |
 | 6 | Guardrails | Planned | `backend/app/guardrails` |
 | 7 | Cache + router | Planned | `backend/app/cache`, `backend/app/routing` |
 | 8 | Observability (OpenTelemetry) | Planned (JSON logs today) | `backend/app/observability` |
@@ -67,11 +67,15 @@ npm install
 npm run dev
 ```
 
-**Or with Docker** (includes Postgres, and runs migrations on start):
+**Or with Docker** (includes Postgres and Keycloak, and runs migrations on start):
 
 ```bash
 docker compose up --build
 ```
+
+Open http://localhost:3000 and sign in as `alice` / `alice-dev` (admin), `bob` / `bob-dev` (editor) or
+`carol` / `carol-dev` (user). These are development accounts from [infra/keycloak](infra/keycloak/README.md).
+`AUTH_ENABLED=false docker compose up` runs without sign-in.
 
 ```bash
 docker compose exec backend python -m app.prompts.seed
@@ -97,12 +101,15 @@ Only models listed in config can be called. See [`backend/.env.example`](backend
 |---------|---------|
 | `DATABASE_URL` | Postgres for managed prompts. Blank = prompt features off. |
 | `DEFAULT_PROMPT_NAME` | Prompt used when a request sends neither `prompt` nor `system`. |
-| `ADMIN_API_KEY` | If set, prompt and knowledge-base changes need the `X-Admin-Key` header (stand-in until RBAC in Layer 5). |
 | `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` | Embeddings for knowledge bases: `openai`, `gemini`, `ollama` or `mock` (blank = first configured). Vectors are 768 numbers. See [backend/app/rag/README.md](backend/app/rag/README.md). |
 | `RAG_*` | Chunk size and overlap, passages per answer, upload limit, indexing concurrency. |
 | `SECRET_KEY` | Encrypts MCP server secrets (env values, headers) in the database. Needed only to save secrets. |
 | `MCP_ALLOW_STDIO` | Allow MCP servers the backend starts as local commands (default `true`). `false` = HTTP servers only. |
 | `MCP_*` | Tool rounds per message (5), call and connect timeouts, max tool result length. See [backend/app/mcp/README.md](backend/app/mcp/README.md). |
+| `AUTH_ENABLED` | Sign-in with Keycloak / OIDC. `false` (default locally) = every request acts as a dev user with `DEV_USER_ROLES`. |
+| `OIDC_ISSUER` / `OIDC_AUDIENCE` / `OIDC_CLIENT_ID` | The provider (exactly the tokens' `iss`), the API audience (`eap-api`), the frontend's public client (`eap-web`). |
+| `OIDC_JWKS_URL` | Where the backend reads signing keys, if not at the issuer's address (Docker: `http://keycloak:8080/...`). |
+| `MODEL_ROLES` | JSON: limit models to roles, e.g. `{"anthropic/claude-opus-5-5": ["eap-admin"]}`. Unlisted = open. |
 
 OpenAI and Gemini model names change often. Check the provider's current model list and set
 `OPENAI_MODELS` / `GEMINI_MODELS` to match.
@@ -111,7 +118,9 @@ OpenAI and Gemini model names change often. Check the provider's current model l
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/health` | Liveness, enabled providers, database / RAG / tools status |
+| GET | `/health` | Liveness, enabled providers, database / RAG / tools status (public) |
+| GET | `/v1/auth/config` | Sign-in settings for the frontend (public) |
+| GET | `/v1/me` | The signed-in user, roles and permissions |
 | GET | `/v1/models` | Models you can call, and the default |
 | POST | `/v1/chat` | Chat completion (JSON) |
 | POST | `/v1/chat/stream` | Chat completion as server-sent events |
@@ -122,7 +131,7 @@ OpenAI and Gemini model names change often. Check the provider's current model l
 | POST | `/v1/prompts/{name}/render` | Preview the final text without calling an LLM |
 | GET | `/v1/prompts/{name}/versions/{n}` | One version |
 | GET/POST | `/v1/collections` | List / create knowledge bases |
-| GET/DELETE | `/v1/collections/{name}` | Details / archive |
+| GET/PATCH/DELETE | `/v1/collections/{name}` | Details / description and `allowed_roles` / archive |
 | POST | `/v1/collections/{name}/documents` | Upload files (multipart `files`); `.../documents/text` for pasted text |
 | GET/DELETE | `/v1/collections/{name}/documents/{id}` | Document status / delete |
 | POST | `/v1/collections/{name}/search` | Test search (no LLM) |
@@ -173,6 +182,9 @@ See [backend/app/mcp/README.md](backend/app/mcp/README.md).
 Streaming events (`/v1/chat/stream`), one JSON object per SSE `data:` line:
 `start` → `delta` (text chunks), with `tool_call` / `tool_result` pairs when tools run → `done` (finish reason, usage, latency), or `error`.
 
+With sign-in on, send the access token: `-H "Authorization: Bearer $TOKEN"`. Without it → 401; a role that
+lacks the permission → 403 (the message names it).
+
 Errors always look like `{"error": {"code": "...", "message": "...", "provider": "..."}}`.
 
 ## Development
@@ -202,7 +214,8 @@ backend/
     prompts/                Layer 2: models, repository (SQL), service (rules), templates, seed
     rag/                    Layer 3: parsers, chunking, embedders, hybrid search, background indexing
     mcp/                    Layer 4: MCP connections, server registry + tool allowlist, toolbox, demo server
-    auth/ guardrails/ cache/ routing/ observability/   (layers 5–8)
+    auth/                   Layer 5: roles + permissions, token checks (JWKS), the caller (Principal)
+    guardrails/ cache/ routing/ observability/   (layers 6–8)
   migrations/               Alembic database migrations
   evals/                    (layer 9)
   tests/
@@ -215,6 +228,9 @@ frontend/
   components/prompts/       prompts UI (list, versions, rollback, preview, editor)
   components/knowledge/     knowledge UI (collections, uploads, indexing status, test search)
   components/tools/         tools UI (MCP servers, tool allowlist, try a tool)
+  components/auth-provider.tsx  sign-in state, page gate, permissions for the UI
+  lib/auth.ts               OIDC sign-in (authorization code + PKCE, oidc-client-ts)
+infra/keycloak/             Keycloak realm: roles, web client, demo users
   lib/api.ts                typed API client + SSE parser
 docs/
   WORKFLOW_CODE_MAP.md      which functions run, in order, per workflow

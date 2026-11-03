@@ -207,13 +207,15 @@ async def test_invalid_server_definitions_are_rejected(api_factory):
         assert {no_command.status_code, bad_url.status_code, bad_name.status_code} == {422}
 
 
-async def test_admin_key_protects_server_management(api_factory):
-    async with api_factory(admin_api_key="admin-key") as api:
-        assert (await api.post("/v1/tools/servers", json=DEMO)).status_code == 401
-        assert (await api.get("/v1/tools/servers")).status_code == 401
+async def test_server_management_needs_the_admin_role(api_factory):
+    async with api_factory(dev_user_roles=["eap-editor"]) as api:
+        assert (await api.post("/v1/tools/servers", json=DEMO)).status_code == 403
+        assert (await api.get("/v1/tools/servers")).status_code == 403
+        assert (await api.get("/v1/tools/presets")).status_code == 403
         assert (await api.get("/v1/tools")).status_code == 200  # what chats can use stays readable
-        allowed = await api.post("/v1/tools/servers", json=DEMO, headers={"X-Admin-Key": "admin-key"})
-        assert allowed.status_code == 201
+    async with api_factory() as api:  # the default dev user is an admin
+        created = await api.post("/v1/tools/servers", json=DEMO)
+        assert created.status_code == 201 and created.json()["created_by"] == "dev"
 
 
 async def test_demo_preset_can_be_registered_as_is(api_factory):

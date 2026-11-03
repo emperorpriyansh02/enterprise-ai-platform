@@ -1,7 +1,9 @@
-# Local stack. Later layers add: keycloak (OAuth), redis (cache).
-#   docker compose up --build                 # postgres + backend + frontend
+# Local stack. Later layers add: redis (cache).
+#   docker compose up --build                 # postgres + keycloak + backend + frontend
 #   docker compose --profile local up --build # + Ollama for local models
 # Example prompts: docker compose exec backend python -m app.prompts.seed
+# Sign in at http://localhost:3000 as alice / alice-dev (admin), bob / bob-dev (editor) or carol / carol-dev (user).
+# AUTH_ENABLED=false docker compose up         # no sign-in: every request acts as a dev admin
 services:
   postgres:
     # pgvector image so the RAG layer (Layer 3) can reuse this database.
@@ -21,6 +23,23 @@ services:
       retries: 10
     restart: unless-stopped
 
+  keycloak:
+    # OAuth / OIDC sign-in (Layer 5). Imports the `eap` realm (roles, web client, demo users) on first start.
+    image: quay.io/keycloak/keycloak:26.8.1
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin} # dev default
+      # Tokens say iss=http://localhost:8080/realms/eap (the address the browser uses);
+      # the backend fetches signing keys over the Docker network (OIDC_JWKS_URL below).
+      KC_HOSTNAME: http://localhost:8080
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./infra/keycloak:/opt/keycloak/data/import:ro
+    restart: unless-stopped
+
   backend:
     build: ./backend
     env_file:
@@ -28,11 +47,16 @@ services:
         required: false
     environment:
       DATABASE_URL: postgresql+asyncpg://eap:${POSTGRES_PASSWORD:-eap}@postgres:5432/eap
+      AUTH_ENABLED: ${AUTH_ENABLED:-true}
+      OIDC_ISSUER: http://localhost:8080/realms/eap
+      OIDC_JWKS_URL: http://keycloak:8080/realms/eap/protocol/openid-connect/certs
     ports:
       - "8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
+      keycloak:
+        condition: service_started
     restart: unless-stopped
 
   frontend:

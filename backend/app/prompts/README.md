@@ -54,8 +54,8 @@ POST /v1/chat
 | POST | `/v1/prompts/{name}/activate` | Make a version active (`{"version": 1}`) |
 | POST | `/v1/prompts/{name}/render` | Preview the final text without calling an LLM |
 
-If `ADMIN_API_KEY` is set, write requests need the header `X-Admin-Key: <value>`. This is a
-stand-in until role-based access control (Layer 5).
+Reading needs the `prompts:read` permission (every role); changes need `prompts:write` (editors and
+admins). Each new version records `created_by` (the signed-in user). See `backend/app/auth/README.md`.
 
 ## Setup
 

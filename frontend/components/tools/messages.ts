@@ -4,8 +4,8 @@ import { ApiError } from "@/lib/api";
 /** A short, actionable message for any error from the tools API. */
 export function toolsError(err: unknown): string {
   if (err instanceof ApiError) {
-    if (err.code === "admin_auth_required") {
-      return "Managing tools needs the admin key. Enter it at the top of the page.";
+    if (err.code === "forbidden") {
+      return "Managing MCP servers needs the Admin role.";
     }
     if (err.code === "tools_unavailable") {
       return "MCP tools need a database. Set DATABASE_URL in backend/.env and restart the backend.";

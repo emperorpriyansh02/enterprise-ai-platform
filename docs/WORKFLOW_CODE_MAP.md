@@ -31,13 +31,17 @@ files use the same section numbers.
 13. [Prompts (Layer 2)](#13-prompts-layer-2)
 14. [Knowledge bases / RAG (Layer 3)](#14-knowledge-bases--rag-layer-3)
 15. [MCP tools (Layer 4)](#15-mcp-tools-layer-4)
+16. [RBAC + OAuth (Layer 5)](#16-rbac--oauth-layer-5)
 
 ---
 
 ## The big picture
 
 ```
-Browser ──► Next.js chat UI ──► FastAPI route ──► ChatService ──► ProviderRegistry.resolve()
+Browser (signed in, Bearer token) ──► Next.js UI ──► FastAPI route ──► get_principal + require (Layer 5)
+                                                       │
+                                                       ▼
+                                                  ChatService ──► ProviderRegistry.resolve() + model roles
                                                        │
                                                        ├──► PromptService (managed prompt from Postgres, Layer 2)
                                                        ├──► RagService (cited passages from pgvector, Layer 3)
@@ -308,7 +312,6 @@ Two models: `mock/echo` and `mock/echo-system`.
 | `PromptArchivedError` | 409 | `prompt_archived` |
 | `PromptVariableError` | 400 | `prompt_variable_missing` |
 | `PromptStoreUnavailableError` | 503 | `prompt_store_unavailable` |
-| `AdminAuthError` | 401 | `admin_auth_required` |
 | `CollectionNotFoundError` | 404 | `collection_not_found` |
 | `CollectionConflictError` | 409 | `collection_conflict` |
 | `DocumentNotFoundError` | 404 | `document_not_found` |
@@ -318,6 +321,17 @@ Two models: `mock/echo` and `mock/echo-system`.
 | `DocumentParseError` | 422 | `document_parse_error` |
 | `EmbeddingModelMismatchError` | 409 | `embedding_model_mismatch` |
 | `RagUnavailableError` | 503 | `rag_unavailable` |
+| `ToolsUnavailableError` | 503 | `tools_unavailable` |
+| `MCPServerNotFoundError` | 404 | `mcp_server_not_found` |
+| `MCPToolNotFoundError` | 404 | `mcp_tool_not_found` |
+| `MCPServerConflictError` | 409 | `mcp_server_conflict` |
+| `MCPConnectionError` | 502 | `mcp_connection_failed` |
+| `MCPStdioDisabledError` | 403 | `mcp_stdio_disabled` |
+| `SecretKeyMissingError` | 400 | `secret_key_missing` |
+| `AuthRequiredError` | 401 | `auth_required` (with `WWW-Authenticate: Bearer`) |
+| `InvalidTokenError` | 401 | `invalid_token` |
+| `ForbiddenError` | 403 | `forbidden` |
+| `AuthUnavailableError` | 503 | `auth_unavailable` |
 
 ---
 
@@ -504,7 +518,7 @@ Every prompts route first gets its dependencies from `backend/app/api/deps.py`:
 1. `get_db_session()` · `backend/app/api/deps.py` — one session per request, via `Database.session()` · `backend/app/db/session.py`. `None` when no database is configured.
 2. `get_prompt_service()` · `backend/app/api/deps.py` — builds `PromptService.__init__()` · `backend/app/prompts/service.py` (which builds `PromptRepository.__init__()` · `backend/app/prompts/repository.py`). Reads `DEFAULT_PROMPT_NAME` through `get_settings_from_app()` · `backend/app/api/deps.py`.
 3. `require_prompt_service()` · `backend/app/api/deps.py` — no database → 503 `prompt_store_unavailable`, and the route never runs.
-4. Write routes only: `require_admin()` · `backend/app/api/deps.py` — if `ADMIN_API_KEY` is set, the `X-Admin-Key` header must match, or 401 `admin_auth_required`.
+4. Every route needs `prompts:read`, and write routes `prompts:write`: `require()` · `backend/app/api/deps.py` (section 16.3). Otherwise 403 `forbidden`.
 
 Then, per route:
 
@@ -554,9 +568,9 @@ Inside `ChatService.complete()` / `ChatService.stream()` (sections 5 and 6):
 
 1. `Prompts()` · `frontend/app/prompts/page.tsx` — the route; renders `PromptsPage()` · `frontend/components/prompts/prompts-page.tsx`.
 2. `PromptsPage()` · `frontend/components/prompts/prompts-page.tsx`
-   1. `useAdminKey()` · `frontend/components/prompts/admin-key.tsx` — reads the saved admin key through `subscribe()` · `frontend/components/prompts/admin-key.tsx` and `readKey()` · `frontend/components/prompts/admin-key.tsx`.
+   1. `useAuth()` · `frontend/components/auth-provider.tsx` — `can("prompts:write")` decides whether **New prompt** and the edit controls show.
    2. **Load-list effect** → `listPrompts()` · `frontend/lib/api.ts` → `apiRequest()` · `frontend/lib/api.ts`; errors pass through `errorMessage()` · `frontend/components/prompts/messages.ts`.
-   3. Shows `AdminKeyInput()` · `frontend/components/prompts/admin-key.tsx`; typing calls `setKey()` · `frontend/components/prompts/admin-key.tsx`, which saves it for this browser tab.
+   3. Without `prompts:write`, the page is read-only (the backend refuses changes anyway).
    4. After any change, `reload()` · `frontend/components/prompts/prompts-page.tsx` re-runs the load-list effect.
 3. **New prompt** button → `NewPromptForm()` · `frontend/components/prompts/prompts-page.tsx`
    1. While typing the template, `extractVariables()` · `frontend/lib/template.ts` feeds `VariableChips()` · `frontend/components/prompts/prompt-detail.tsx`.
@@ -569,7 +583,7 @@ Inside `ChatService.complete()` / `ChatService.stream()` (sections 5 and 6):
    5. Edit description → `run()` · `frontend/components/prompts/prompt-detail.tsx` → `updatePromptDescription()` · `frontend/lib/api.ts`.
    6. Archive → confirm dialog → `run()` · `frontend/components/prompts/prompt-detail.tsx` → `archivePrompt()` · `frontend/lib/api.ts`.
    7. After each successful `run`, the panel reloads and the list refreshes (`reload()` · `frontend/components/prompts/prompts-page.tsx`).
-5. All write calls send the admin key as `X-Admin-Key` (when one is entered).
+5. Every call carries the signed-in user's token (section 16.3).
 
 ### 13.5 Frontend: prompts in Chat
 
@@ -608,7 +622,7 @@ Fixtures (`backend/tests/conftest.py`):
   `parse_sse()` · `backend/tests/test_prompts_api.py` (helper),
   `test_prompt_lifecycle()` · `backend/tests/test_prompts_api.py`,
   `test_errors_have_clear_codes()` · `backend/tests/test_prompts_api.py`,
-  `test_admin_key_required_for_writes_when_configured()` · `backend/tests/test_prompts_api.py`,
+  `test_writes_need_the_editor_role()` · `backend/tests/test_prompts_api.py`,
   `test_without_database_prompts_return_503_and_chat_still_works()` · `backend/tests/test_prompts_api.py`,
   `test_chat_uses_rendered_prompt_then_extra_system()` · `backend/tests/test_prompts_api.py`,
   `test_chat_with_pinned_version_and_missing_variable()` · `backend/tests/test_prompts_api.py`,
@@ -645,7 +659,7 @@ chat with rag ──► embed question ──► vector search + keyword search 
 
 ### 14.2 Adding documents (`POST /v1/collections/{name}/documents`, `.../documents/text`)
 
-Every collections route first runs `get_db_session()` · `backend/app/api/deps.py` → `get_rag_service()` · `backend/app/api/deps.py` (`RagService.__init__()` · `backend/app/rag/service.py`, which creates `RagRepository.__init__()` · `backend/app/rag/repository.py`) → `require_rag_service()` · `backend/app/api/deps.py` (calls `RagRuntime.check()` · `backend/app/rag/runtime.py`; 503 with the reason if RAG can't work). Writes also run `require_admin()` · `backend/app/api/deps.py`.
+Every collections route first runs `get_db_session()` · `backend/app/api/deps.py` → `get_rag_service()` · `backend/app/api/deps.py` (`RagService.__init__()` · `backend/app/rag/service.py`, which creates `RagRepository.__init__()` · `backend/app/rag/repository.py`) → `require_rag_service()` · `backend/app/api/deps.py` (calls `RagRuntime.check()` · `backend/app/rag/runtime.py`; 503 with the reason if RAG can't work). Reads need `knowledge:read` and writes `knowledge:write`, via `require()` · `backend/app/api/deps.py`; collections the caller's roles don't allow look missing (section 16.4).
 
 1. Files: `upload_documents()` · `backend/app/api/v1/collections.py` — for each file:
    1. `RagService.add_file()` · `backend/app/rag/service.py`
@@ -806,7 +820,7 @@ chat ──► model ──► tool calls? ──► Toolbox ──► MCPManage
 
 ### 15.2 Registering a server — `POST /v1/tools/servers`
 
-Every `/v1/tools` route first runs `get_db_session()` · `backend/app/api/deps.py` → `get_mcp_service()` · `backend/app/api/deps.py` (`MCPService.__init__()` · `backend/app/mcp/service.py`) → `require_mcp_service()` · `backend/app/api/deps.py` (503 `tools_unavailable` without a database). Routes under `/servers` and `/presets` also run `require_admin()` · `backend/app/api/deps.py`.
+Every `/v1/tools` route first runs `get_db_session()` · `backend/app/api/deps.py` → `get_mcp_service()` · `backend/app/api/deps.py` (`MCPService.__init__()` · `backend/app/mcp/service.py`) → `require_mcp_service()` · `backend/app/api/deps.py` (503 `tools_unavailable` without a database). `GET /v1/tools` needs `tools:use`; routes under `/servers` and `/presets` need `tools:admin`, via `require()` · `backend/app/api/deps.py` (section 16.3).
 
 1. FastAPI checks the body with `ServerCreate._check_transport()` · `backend/app/mcp/schemas.py` (stdio needs `command`, http needs an `http(s)://` URL).
 2. `create_server()` · `backend/app/api/v1/tools.py` → `MCPService.create_server()` · `backend/app/mcp/service.py`
@@ -885,7 +899,7 @@ Each adapter's `_params`/`_payload` adds `tools` and replays `turns`; `complete`
 ### 15.8 Frontend: the Tools page (`/tools`) and tools in Chat
 
 1. `Tools()` · `frontend/app/tools/page.tsx` → `ToolsPage()` · `frontend/components/tools/tools-page.tsx`
-   1. Load effect → `listMcpServers()` · `frontend/lib/api.ts` (with the admin key); errors through `toolsError()` · `frontend/components/tools/messages.ts`; `reload()` · `frontend/components/tools/tools-page.tsx` after changes.
+   1. Load effect → `listMcpServers()` · `frontend/lib/api.ts` (admins only; others see a note); errors through `toolsError()` · `frontend/components/tools/messages.ts`; `reload()` · `frontend/components/tools/tools-page.tsx` after changes.
    2. **Add server** → `ServerForm()` · `frontend/components/tools/server-form.tsx`
       1. **Use demo server** → `fillDemo()` · `frontend/components/tools/server-form.tsx` → `listMcpPresets()` · `frontend/lib/api.ts`.
       2. **Add and connect** → `submit()` · `frontend/components/tools/server-form.tsx` → `parsePairs()` · `frontend/components/tools/messages.ts` (env/header lines) → `createMcpServer()` · `frontend/lib/api.ts`.
@@ -944,9 +958,91 @@ Real MCP servers over stdio (the demo server and `backend/tests/mcp_test_server.
   `test_stdio_servers_can_be_switched_off()` · `backend/tests/test_tools_api.py`,
   `test_unreachable_server_is_saved_with_its_error()` · `backend/tests/test_tools_api.py`,
   `test_invalid_server_definitions_are_rejected()` · `backend/tests/test_tools_api.py`,
-  `test_admin_key_protects_server_management()` · `backend/tests/test_tools_api.py`,
+  `test_server_management_needs_the_admin_role()` · `backend/tests/test_tools_api.py`,
   `test_demo_preset_can_be_registered_as_is()` · `backend/tests/test_tools_api.py`,
   `test_try_a_tool_and_delete_a_server()` · `backend/tests/test_tools_api.py`,
   `test_refresh_keeps_choices_and_rechecks_tools()` · `backend/tests/test_tools_api.py`,
   `test_tool_rounds_are_limited()` · `backend/tests/test_tools_api.py`,
   `test_manager_is_created_and_closed_with_the_app()` · `backend/tests/test_tools_api.py`
+
+---
+
+## 16. RBAC + OAuth (Layer 5)
+
+Users sign in with Keycloak (OpenID Connect, authorization code + PKCE). Every API request carries
+the access token; the backend checks it, reads the roles, and allows, filters or refuses.
+Code: `backend/app/auth/`, `backend/app/api/deps.py`, `backend/app/api/v1/auth.py`,
+`frontend/lib/auth.ts`, `frontend/components/auth-provider.tsx`. Keycloak setup: `infra/keycloak/`.
+
+```
+eap-user    chat:use  prompts:read  knowledge:read  tools:use
+eap-editor  + prompts:write  knowledge:write
+eap-admin   + tools:admin, and passes every allowed_roles rule
+```
+
+### 16.1 Startup
+
+1. `Settings._check_auth()` · `backend/app/core/config.py` — `AUTH_ENABLED=true` needs `OIDC_ISSUER`; trims a trailing `/`.
+2. In `lifespan()` · `backend/app/main.py`: sign-in on → `TokenVerifier.__init__()` · `backend/app/auth/tokens.py` on `app.state.auth` (no network yet); off → a warning that every request acts as the dev user.
+3. Shutdown: `TokenVerifier.aclose()` · `backend/app/auth/tokens.py`.
+
+### 16.2 Signing in (browser)
+
+1. `RootLayout()` · `frontend/app/layout.tsx` wraps the app in `AuthProvider()` · `frontend/components/auth-provider.tsx`; its effect runs `load()` · `frontend/components/auth-provider.tsx`:
+   1. `getAuthConfig()` · `frontend/lib/auth.ts` → `auth_config()` · `backend/app/api/v1/auth.py` (`GET /v1/auth/config`, public).
+   2. `setAccessTokenProvider()` · `frontend/lib/api.ts` with `currentAccessToken()` · `frontend/lib/auth.ts` (sign-in on) or nothing (off).
+   3. On and no valid token → status `signed-out`. Otherwise `getMe()` · `frontend/lib/api.ts` → `me()` · `backend/app/api/v1/auth.py` → status `ready`.
+2. `AuthGate()` · `frontend/components/auth-provider.tsx` shows the page only when `ready`; else **Sign in to continue**.
+3. **Sign in** → `signIn()` · `frontend/lib/auth.ts` → `getUserManager()` · `frontend/lib/auth.ts` → redirect to Keycloak with a PKCE challenge (S256) and the current path in `state`.
+4. Keycloak login → back to `/auth/callback` → `AuthCallbackPage()` · `frontend/app/auth/callback/page.tsx` → `AuthCallback()` · `frontend/components/auth-callback.tsx` → `completeSignIn()` · `frontend/lib/auth.ts` (code + verifier → tokens in sessionStorage) → back to the saved path; `AuthProvider` loads `me` again.
+5. Tokens are renewed automatically before they expire; if that fails, `signedOut()` · `frontend/components/auth-provider.tsx` shows the sign-in screen again.
+6. `NavBar()` · `frontend/components/nav.tsx` (via `useAuth()` · `frontend/components/auth-provider.tsx`) shows the user, role badges and **Sign out** (`signOut()` · `frontend/lib/auth.ts`), and only the links `can()` · `frontend/components/auth-provider.tsx` allows.
+
+### 16.3 Every API request
+
+1. `apiRequest()` · `frontend/lib/api.ts` / `streamChat()` · `frontend/lib/api.ts` add `Authorization: Bearer <token>` through `authHeaders()` · `frontend/lib/api.ts`.
+2. The route's dependencies: `get_principal()` · `backend/app/api/deps.py`
+   1. Sign-in off → `dev_principal()` · `backend/app/auth/principal.py` (`DEV_USER_ROLES`).
+   2. On → no Bearer header → 401 `auth_required`; otherwise `TokenVerifier.verify()` · `backend/app/auth/tokens.py`:
+      1. Algorithm must be asymmetric; `TokenVerifier._key()` · `backend/app/auth/tokens.py` → `TokenVerifier._needs_fetch()` · `backend/app/auth/tokens.py` → maybe `TokenVerifier._fetch_keys()` · `backend/app/auth/tokens.py` (→ `TokenVerifier._discover_jwks_url()` · `backend/app/auth/tokens.py` when `OIDC_JWKS_URL` is blank).
+      2. PyJWT checks signature, `iss`, `aud`, `exp`.
+      3. `principal_from_claims()` · `backend/app/auth/tokens.py` → `Principal` (realm roles + `eap-api` client roles).
+   3. Saves the username for the `request` log line (`request_context()` · `backend/app/main.py`).
+3. `require()` · `backend/app/api/deps.py` → its `check()` · `backend/app/api/deps.py`: `Principal.can()` · `backend/app/auth/principal.py` → `Principal.permissions()` · `backend/app/auth/principal.py` → `permissions_for()` · `backend/app/auth/permissions.py`. Missing → 403 with `_roles()` · `backend/app/api/deps.py` in the message.
+4. `Principal.is_admin()` · `backend/app/auth/principal.py` tells whether the caller is an admin.
+
+### 16.4 Per-resource rules
+
+Each uses `Principal.may_use()` · `backend/app/auth/principal.py` → `roles_allow()` · `backend/app/auth/permissions.py` (empty = everyone; admins always):
+
+1. Models: `list_models()` · `backend/app/api/v1/routes.py` hides models `MODEL_ROLES` doesn't allow; chat → `ChatService._check_model()` · `backend/app/services/chat_service.py` (403).
+2. Collections: `get_rag_service()` · `backend/app/api/deps.py` gives `RagService` the caller; `RagService._visible()` · `backend/app/rag/service.py` filters `RagService.list_collections()` · `backend/app/rag/service.py` and `RagService._require_collection()` · `backend/app/rag/service.py` (404 as if missing) — so search and chat with `rag` are covered too. `RagService._username()` · `backend/app/rag/service.py` fills `created_by` on new collections and documents.
+3. Who may use a collection: `PATCH /v1/collections/{name}` → `update_collection()` · `backend/app/api/v1/collections.py` → `RagService.update_collection()` · `backend/app/rag/service.py`.
+4. MCP servers: `MCPService._may_use()` · `backend/app/mcp/service.py` filters `MCPService.available_tools()` · `backend/app/mcp/service.py` and `MCPService.toolbox_for_chat()` · `backend/app/mcp/service.py` (404). `allowed_roles` set on create / `PATCH /v1/tools/servers/{name}`.
+5. Prompts: `created_by` of each new version = the signed-in user (`create_prompt` / `create_prompt_version` routes).
+6. Columns: `upgrade()` · `backend/migrations/versions/0004_add_access_control.py` adds `collections.allowed_roles`, `collections.created_by`, `documents.created_by`; `downgrade()` · `backend/migrations/versions/0004_add_access_control.py` removes them.
+
+### 16.5 Frontend permissions
+
+- Pages read `useAuth()` · `frontend/components/auth-provider.tsx` → `can()` · `frontend/components/auth-provider.tsx`: Prompts and Knowledge hide create/edit/archive without the write permission; the Tools page needs `tools:admin`.
+- Access editors: `RolePicker()` · `frontend/components/role-picker.tsx` (with `rolesLabel()` · `frontend/components/role-picker.tsx`) in the new-collection and add-server forms, `AccessRow()` · `frontend/components/knowledge/collection-panel.tsx` (→ `updateCollection()` · `frontend/lib/api.ts`) and `AccessLine()` · `frontend/components/tools/server-panel.tsx` (→ `updateMcpServer()` · `frontend/lib/api.ts`).
+
+### 16.6 Auth tests
+
+- `backend/tests/test_auth.py`: a fake Keycloak `FakeIdP.__init__()` · `backend/tests/test_auth.py`, `FakeIdP.handler()` · `backend/tests/test_auth.py`, `FakeIdP.jwk()` · `backend/tests/test_auth.py`, `FakeIdP.client()` · `backend/tests/test_auth.py`, `FakeIdP.token()` · `backend/tests/test_auth.py`; fixture `idp()` · `backend/tests/test_auth.py`; helpers `auth_app()` · `backend/tests/test_auth.py`, `bearer()` · `backend/tests/test_auth.py`, and a log collector `ListHandler.__init__()` · `backend/tests/test_auth.py` / `ListHandler.emit()` · `backend/tests/test_auth.py`;
+  `test_each_user_gets_their_roles_and_permissions()` · `backend/tests/test_auth.py`,
+  `test_missing_token_is_401_with_a_bearer_challenge()` · `backend/tests/test_auth.py`,
+  `test_bad_tokens_are_rejected()` · `backend/tests/test_auth.py`,
+  `test_keys_are_discovered_cached_and_refetched_after_rotation()` · `backend/tests/test_auth.py`,
+  `test_configured_jwks_url_skips_discovery()` · `backend/tests/test_auth.py`,
+  `test_provider_down()` · `backend/tests/test_auth.py`,
+  `test_request_log_names_the_user()` · `backend/tests/test_auth.py`,
+  `test_permission_matrix()` · `backend/tests/test_auth.py`,
+  `test_model_roles_limit_who_may_use_a_model()` · `backend/tests/test_auth.py`,
+  `test_mcp_server_roles_limit_who_may_use_its_tools()` · `backend/tests/test_auth.py`,
+  `test_collection_roles_hide_collections()` · `backend/tests/test_auth.py`,
+  `test_dev_mode_acts_as_the_dev_user()` · `backend/tests/test_auth.py`,
+  `test_dev_user_roles_can_be_lowered()` · `backend/tests/test_auth.py`,
+  `test_auth_needs_an_issuer()` · `backend/tests/test_auth.py`,
+  `test_permissions_and_resource_rules()` · `backend/tests/test_auth.py`
+- Route permissions elsewhere: `test_writes_need_the_editor_role()` · `backend/tests/test_prompts_api.py`, `test_server_management_needs_the_admin_role()` · `backend/tests/test_tools_api.py`.

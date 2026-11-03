@@ -1,7 +1,9 @@
 """Chat orchestration: the one place every chat request passes through.
 
-Steps today:  resolve model -> build system prompt (Layer 2) -> add knowledge-base sources (Layer 3)
-              -> load MCP tools (Layer 4) -> LLM call, with a model <-> tool loop -> log
+Steps today:  (route checked the caller's token and `chat:use`, Layer 5) -> resolve model + check
+              the caller may use it -> build system prompt (Layer 2) -> add knowledge-base sources the
+              caller may see (Layer 3) -> load MCP tools the caller may use (Layer 4) -> LLM call, with a
+              model <-> tool loop -> log
 Later layers plug in here, in this order:
     auth/RBAC -> input guardrails -> cache -> router -> MCP tools
     -> LLM call -> output guardrails -> observability / evals logging
@@ -13,8 +15,11 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 
+from app.auth.permissions import TOOLS_USE
+from app.auth.principal import Principal
 from app.core.errors import (
     AppError,
+    ForbiddenError,
     PromptStoreUnavailableError,
     ProviderError,
     RagUnavailableError,
@@ -60,6 +65,8 @@ class ChatService:
         *,
         max_tool_rounds: int = 5,
         release_db: Callable[[], Awaitable[None]] | None = None,
+        principal: Principal | None = None,
+        model_roles: dict[str, list[str]] | None = None,
     ) -> None:
         self._registry = registry
         self._prompts = prompts  # None when no database is configured
@@ -68,6 +75,8 @@ class ChatService:
         self._tools = tools  # None when no database is configured
         self._max_tool_rounds = max_tool_rounds
         self._release_db = release_db  # frees the request's database connection during LLM calls
+        self._principal = principal  # the caller (Layer 5); None = no per-model or per-tool checks
+        self._model_roles = model_roles or {}  # MODEL_ROLES: {"provider/model": [roles]}
 
     async def complete(self, request: ChatRequest) -> ChatResponse:
         prep = await self._prepare(request)
@@ -212,6 +221,7 @@ class ChatService:
     async def _prepare(self, request: ChatRequest) -> _Prepared:
         """Resolve the model, build the system prompt, add sources, load tools; then free the database."""
         provider, model = self._registry.resolve(request.model)
+        self._check_model(f"{provider.name}/{model}")
         system, prompt_used = await self._build_system(request)
         system, citations = await self._retrieve(request, system)
         toolbox = await self._toolbox(request)
@@ -260,9 +270,16 @@ class ChatService:
         """The enabled tools of the MCP servers the request names (`tools`), or None."""
         if request.tools is None:
             return None
+        if self._principal is not None and not self._principal.can(TOOLS_USE):
+            raise ForbiddenError("Your roles don't allow using tools (tools:use).")
         if self._tools is None:
             raise ToolsUnavailableError("MCP tools need a database (DATABASE_URL) for the server registry.")
         return await self._tools.toolbox_for_chat(request.tools)
+
+    def _check_model(self, model_id: str) -> None:
+        """403 unless the caller's roles may use this model (MODEL_ROLES; unlisted models are open)."""
+        if self._principal is not None and not self._principal.may_use(self._model_roles.get(model_id)):
+            raise ForbiddenError(f'Your roles can\'t use the model "{model_id}".')
 
     def _wants_tools(self, calls: list[ToolCall], toolbox: Toolbox | None, rounds: int) -> bool:
         """Run another tool round? Only if the model asked, tools were offered, and the limit isn't hit."""

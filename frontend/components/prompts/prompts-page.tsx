@@ -2,10 +2,10 @@
 
 import { type FormEvent, useCallback, useEffect, useState } from "react";
 
+import { useAuth } from "@/components/auth-provider";
 import { createPrompt, listPrompts, type PromptSummary } from "@/lib/api";
 import { extractVariables } from "@/lib/template";
 
-import { AdminKeyInput, useAdminKey } from "./admin-key";
 import { errorMessage } from "./messages";
 import PromptDetailPanel, { VariableChips } from "./prompt-detail";
 
@@ -14,7 +14,8 @@ const BUTTON = "rounded-md border border-line px-2.5 py-1.5 text-sm hover:bg-sur
 const PRIMARY = "rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-accent-fg disabled:opacity-40";
 
 export default function PromptsPage() {
-  const [adminKey, setAdminKey] = useAdminKey();
+  const { can } = useAuth();
+  const canWrite = can("prompts:write");
   const [prompts, setPrompts] = useState<PromptSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -55,17 +56,18 @@ export default function PromptsPage() {
             Versioned system prompts. Every change is a new version; activate any version to roll back.
           </p>
         </div>
-        <AdminKeyInput value={adminKey} onChange={setAdminKey} />
-        <button
-          type="button"
-          className={PRIMARY}
-          onClick={() => {
-            setCreating(true);
-            setSelected(null);
-          }}
-        >
-          New prompt
-        </button>
+        {canWrite && (
+          <button
+            type="button"
+            className={PRIMARY}
+            onClick={() => {
+              setCreating(true);
+              setSelected(null);
+            }}
+          >
+            New prompt
+          </button>
+        )}
       </header>
 
       {loadError && (
@@ -122,7 +124,6 @@ export default function PromptsPage() {
         <section aria-label="Prompt details" className="min-w-0">
           {creating ? (
             <NewPromptForm
-              adminKey={adminKey}
               onCancel={() => setCreating(false)}
               onCreated={(name) => {
                 setCreating(false);
@@ -131,7 +132,7 @@ export default function PromptsPage() {
               }}
             />
           ) : selected ? (
-            <PromptDetailPanel key={selected} name={selected} adminKey={adminKey} onChanged={reload} />
+            <PromptDetailPanel key={selected} name={selected} canWrite={canWrite} onChanged={reload} />
           ) : (
             <p className="text-sm text-muted">Select a prompt to see its versions.</p>
           )}
@@ -141,15 +142,7 @@ export default function PromptsPage() {
   );
 }
 
-function NewPromptForm({
-  adminKey,
-  onCreated,
-  onCancel,
-}: {
-  adminKey: string;
-  onCreated: (name: string) => void;
-  onCancel: () => void;
-}) {
+function NewPromptForm({ onCreated, onCancel }: { onCreated: (name: string) => void; onCancel: () => void }) {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [template, setTemplate] = useState("");
@@ -162,7 +155,7 @@ function NewPromptForm({
     setSaving(true);
     setError(null);
     try {
-      const created = await createPrompt({ name, description, template, note }, adminKey);
+      const created = await createPrompt({ name, description, template, note });
       onCreated(created.name);
     } catch (err) {
       setError(errorMessage(err));

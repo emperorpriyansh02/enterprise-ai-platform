@@ -1,6 +1,7 @@
 """Knowledge-base API (Layer 3): collections, documents, and a search tester.
 
-Reads are open. Writes need X-Admin-Key when ADMIN_API_KEY is set (until RBAC in Layer 5).
+Reading and searching need `knowledge:read` (every role); changes need `knowledge:write` (editors and
+admins). Collections with `allowed_roles` are hidden from other roles (404, as if they didn't exist).
 """
 
 import uuid
@@ -8,12 +9,14 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, Query, Response, UploadFile
 
-from app.api.deps import require_admin, require_rag_service
+from app.api.deps import require, require_rag_service
+from app.auth.permissions import KNOWLEDGE_READ, KNOWLEDGE_WRITE
 from app.core.errors import AppError
 from app.rag.schemas import (
     CollectionCreate,
     CollectionDetail,
     CollectionList,
+    CollectionUpdate,
     DocumentList,
     DocumentOut,
     DocumentTextCreate,
@@ -24,10 +27,12 @@ from app.rag.schemas import (
 )
 from app.rag.service import RagService
 
-router = APIRouter(prefix="/v1/collections", tags=["knowledge"])
+router = APIRouter(
+    prefix="/v1/collections", tags=["knowledge"], dependencies=[Depends(require(KNOWLEDGE_READ))]
+)
 
 Rag = Annotated[RagService, Depends(require_rag_service)]
-Admin = Depends(require_admin)
+Writer = Depends(require(KNOWLEDGE_WRITE))
 
 
 @router.get("", response_model=CollectionList)
@@ -37,7 +42,7 @@ async def list_collections(
     return await service.list_collections(include_archived=include_archived)
 
 
-@router.post("", response_model=CollectionDetail, status_code=201, dependencies=[Admin])
+@router.post("", response_model=CollectionDetail, status_code=201, dependencies=[Writer])
 async def create_collection(body: CollectionCreate, service: Rag) -> CollectionDetail:
     return await service.create_collection(body)
 
@@ -47,12 +52,18 @@ async def get_collection(name: str, service: Rag) -> CollectionDetail:
     return await service.get_collection(name)
 
 
-@router.delete("/{name}", response_model=CollectionDetail, dependencies=[Admin])
+@router.patch("/{name}", response_model=CollectionDetail, dependencies=[Writer])
+async def update_collection(name: str, body: CollectionUpdate, service: Rag) -> CollectionDetail:
+    """Change the description, or who may use it (`allowed_roles`; empty list = everyone)."""
+    return await service.update_collection(name, body)
+
+
+@router.delete("/{name}", response_model=CollectionDetail, dependencies=[Writer])
 async def archive_collection(name: str, service: Rag) -> CollectionDetail:
     return await service.archive_collection(name)
 
 
-@router.post("/{name}/reindex", response_model=CollectionDetail, status_code=202, dependencies=[Admin])
+@router.post("/{name}/reindex", response_model=CollectionDetail, status_code=202, dependencies=[Writer])
 async def reindex_collection(name: str, service: Rag) -> CollectionDetail:
     return await service.reindex_collection(name)
 
@@ -62,7 +73,7 @@ async def list_documents(name: str, service: Rag) -> DocumentList:
     return await service.list_documents(name)
 
 
-@router.post("/{name}/documents", response_model=UploadResult, status_code=202, dependencies=[Admin])
+@router.post("/{name}/documents", response_model=UploadResult, status_code=202, dependencies=[Writer])
 async def upload_documents(
     name: str, files: Annotated[list[UploadFile], File()], service: Rag
 ) -> UploadResult:
@@ -80,7 +91,7 @@ async def upload_documents(
     return UploadResult(data=accepted, errors=errors)
 
 
-@router.post("/{name}/documents/text", response_model=DocumentOut, status_code=202, dependencies=[Admin])
+@router.post("/{name}/documents/text", response_model=DocumentOut, status_code=202, dependencies=[Writer])
 async def add_text_document(name: str, body: DocumentTextCreate, service: Rag) -> DocumentOut:
     return await service.add_text(name, body)
 
@@ -90,7 +101,7 @@ async def get_document(name: str, document_id: uuid.UUID, service: Rag) -> Docum
     return await service.get_document(name, document_id)
 
 
-@router.delete("/{name}/documents/{document_id}", status_code=204, dependencies=[Admin])
+@router.delete("/{name}/documents/{document_id}", status_code=204, dependencies=[Writer])
 async def delete_document(name: str, document_id: uuid.UUID, service: Rag) -> Response:
     await service.delete_document(name, document_id)
     return Response(status_code=204)
@@ -100,7 +111,7 @@ async def delete_document(name: str, document_id: uuid.UUID, service: Rag) -> Re
     "/{name}/documents/{document_id}/reindex",
     response_model=DocumentOut,
     status_code=202,
-    dependencies=[Admin],
+    dependencies=[Writer],
 )
 async def reindex_document(name: str, document_id: uuid.UUID, service: Rag) -> DocumentOut:
     return await service.reindex_document(name, document_id)

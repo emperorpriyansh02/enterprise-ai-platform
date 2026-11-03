@@ -9,10 +9,13 @@ import {
   type McpServer,
   type McpTool,
   refreshMcpServer,
+  type RoleName,
   setMcpToolEnabled,
   type ToolCallOutcome,
   updateMcpServer,
 } from "@/lib/api";
+
+import RolePicker, { rolesLabel } from "@/components/role-picker";
 
 import { toolsError } from "./messages";
 
@@ -20,12 +23,10 @@ const BADGE = "rounded px-1.5 py-0.5 text-[11px] font-medium";
 
 export default function ServerPanel({
   server,
-  adminKey,
   onChanged,
   onDeleted,
 }: {
   server: McpServer;
-  adminKey: string;
   onChanged: () => void;
   onDeleted: () => void;
 }) {
@@ -62,7 +63,7 @@ export default function ServerPanel({
     setFlipped((f) => ({ ...f, [tool.name]: enabled }));
     void run(tool.name, async () => {
       try {
-        await setMcpToolEnabled(server.name, tool.name, enabled, adminKey);
+        await setMcpToolEnabled(server.name, tool.name, enabled);
       } catch (err) {
         setFlipped((f) => {
           const rest = { ...f };
@@ -79,7 +80,7 @@ export default function ServerPanel({
     setBusy("delete");
     setError(null);
     try {
-      await deleteMcpServer(server.name, adminKey);
+      await deleteMcpServer(server.name);
       onDeleted();
     } catch (err) {
       setError(toolsError(err));
@@ -104,6 +105,13 @@ export default function ServerPanel({
           <p className="mt-1 break-all font-mono text-xs text-muted">
             {server.transport === "stdio" ? [server.command, ...server.args].join(" ") : server.url}
           </p>
+          <AccessLine
+            key={server.allowed_roles.join(",")}
+            roles={server.allowed_roles}
+            createdBy={server.created_by}
+            busy={busy !== null}
+            onSave={(roles) => run("access", () => updateMcpServer(server.name, { allowed_roles: roles }))}
+          />
           {(server.env_names.length > 0 || server.header_names.length > 0) && (
             <p className="mt-1 text-xs text-muted">
               Secrets (encrypted): {[...server.env_names, ...server.header_names].join(", ")}
@@ -117,7 +125,7 @@ export default function ServerPanel({
             disabled={busy !== null}
             onClick={() => {
               setFlipped({}); // a refresh can switch tools off: show what the server says
-              void run("refresh", () => refreshMcpServer(server.name, adminKey));
+              void run("refresh", () => refreshMcpServer(server.name));
             }}
           >
             {busy === "refresh" ? "Connecting…" : "Refresh tools"}
@@ -127,7 +135,7 @@ export default function ServerPanel({
             className={BUTTON}
             disabled={busy !== null}
             onClick={() =>
-              void run("enable", () => updateMcpServer(server.name, { enabled: !server.enabled }, adminKey))
+              void run("enable", () => updateMcpServer(server.name, { enabled: !server.enabled }))
             }
           >
             {server.enabled ? "Disable server" : "Enable server"}
@@ -192,7 +200,7 @@ export default function ServerPanel({
                   Try
                 </button>
               </div>
-              {trying === tool.name && <TryTool server={server.name} tool={tool} adminKey={adminKey} />}
+              {trying === tool.name && <TryTool server={server.name} tool={tool} />}
             </li>
           ))}
         </ul>
@@ -202,7 +210,7 @@ export default function ServerPanel({
 }
 
 /** Run a tool directly with JSON arguments, to check it works before switching it on. */
-function TryTool({ server, tool, adminKey }: { server: string; tool: McpTool; adminKey: string }) {
+function TryTool({ server, tool }: { server: string; tool: McpTool }) {
   const [args, setArgs] = useState(() => exampleArguments(tool));
   const [running, setRunning] = useState(false);
   const [outcome, setOutcome] = useState<ToolCallOutcome | null>(null);
@@ -224,7 +232,7 @@ function TryTool({ server, tool, adminKey }: { server: string; tool: McpTool; ad
     }
     setRunning(true);
     try {
-      setOutcome(await callMcpTool(server, tool.name, parsed as Record<string, unknown>, adminKey));
+      setOutcome(await callMcpTool(server, tool.name, parsed as Record<string, unknown>));
     } catch (err) {
       setError(toolsError(err));
     } finally {
@@ -280,4 +288,57 @@ function exampleArguments(tool: McpTool): string {
     ]),
   );
   return JSON.stringify(example, null, 2);
+}
+
+/** Whose chats may use this server's tools, with an editor. */
+function AccessLine({
+  roles,
+  createdBy,
+  busy,
+  onSave,
+}: {
+  roles: RoleName[];
+  createdBy: string | null;
+  busy: boolean;
+  onSave: (roles: RoleName[]) => Promise<void>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState<RoleName[]>(roles);
+  if (editing) {
+    return (
+      <div className="mt-2 flex flex-wrap items-end gap-3 rounded-md border border-line p-3">
+        <RolePicker value={draft} onChange={setDraft} disabled={busy} label="Whose chats may use its tools" />
+        <button
+          type="button"
+          className={PRIMARY}
+          disabled={busy}
+          onClick={async () => {
+            await onSave(draft);
+            setEditing(false);
+          }}
+        >
+          Save access
+        </button>
+        <button type="button" className={BUTTON} onClick={() => setEditing(false)}>
+          Cancel
+        </button>
+      </div>
+    );
+  }
+  return (
+    <p className="mt-1 text-xs text-muted">
+      Access: <strong className="text-foreground">{rolesLabel(roles)}</strong>
+      {createdBy && ` · added by ${createdBy}`}{" "}
+      <button
+        type="button"
+        className="text-accent underline-offset-2 hover:underline"
+        onClick={() => {
+          setDraft(roles);
+          setEditing(true);
+        }}
+      >
+        Change
+      </button>
+    </p>
+  );
 }

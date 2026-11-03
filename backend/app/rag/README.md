@@ -76,7 +76,9 @@ got, use `"model": "mock/echo-system"`.
 | POST | `/v1/collections/{name}/search` | Test search: `{"query", "top_k"}` → ranked passages, no LLM |
 
 Uploads return **202**: documents start as `pending` and become `ready` (or `failed`, with `error`) a few
-seconds later. Writes need `X-Admin-Key` when `ADMIN_API_KEY` is set.
+seconds later. Reading and searching need `knowledge:read` (every role); changes need `knowledge:write`
+(editors and admins). A collection can be limited to roles with `allowed_roles` (set on create or with
+`PATCH /v1/collections/{name}`); other users don't see it, and get 404 if they name it in chat.
 
 ## Settings
 

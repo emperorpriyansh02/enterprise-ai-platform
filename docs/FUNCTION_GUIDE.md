@@ -35,7 +35,8 @@ learn the code and to debug it.
 13. [Prompts (Layer 2)](#13-prompts-layer-2)
 14. [Knowledge bases / RAG (Layer 3)](#14-knowledge-bases--rag-layer-3)
 15. [MCP tools (Layer 4)](#15-mcp-tools-layer-4)
-16. [Debugging cheat sheet](#16-debugging-cheat-sheet)
+16. [RBAC + OAuth (Layer 5)](#16-rbac--oauth-layer-5)
+17. [Debugging cheat sheet](#17-debugging-cheat-sheet)
 
 ---
 
@@ -184,7 +185,7 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 
 #### `Settings._empty_to_none()` · `backend/app/core/config.py`
 
-- **Where:** a validator on `Settings`. **Called by:** pydantic, for `ANTHROPIC_EFFORT`, `OPENAI_BASE_URL`, `OLLAMA_BASE_URL`, `DATABASE_URL`, `DEFAULT_PROMPT_NAME`, `ADMIN_API_KEY`.
+- **Where:** a validator on `Settings`. **Called by:** pydantic, for `ANTHROPIC_EFFORT`, `OPENAI_BASE_URL`, `OLLAMA_BASE_URL`, `DATABASE_URL`, `DEFAULT_PROMPT_NAME`, `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, `SECRET_KEY`, `OIDC_ISSUER`, `OIDC_JWKS_URL`.
 - **Takes in:** `value`, the raw value (e.g. `""` from a line like `OLLAMA_BASE_URL=` in `.env`).
 - **What it does:** a blank or whitespace-only string becomes `None` ("not set"). Anything else passes through.
 - **Gives back:** `""` → `None`; `"http://localhost:11434"` → unchanged.
@@ -297,7 +298,7 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
   1. Reads the `X-Request-ID` header. If there isn't one, makes a random 32-character hex id.
   2. Records the start time.
   3. Runs the rest of the app and waits for the response. Error responses come back here too, already turned into JSON.
-  4. Puts `X-Request-ID` on the response.
+  4. Puts `X-Request-ID` on the response. The log line also names the `user` when the route identified one (`get_principal`).
   5. Logs a `request` line with `request_id`, `method`, `path`, `status`, `latency_ms`.
 - **Gives back:** the response, unchanged apart from the extra header.
 - **Can fail with:** nothing of its own.
@@ -360,9 +361,9 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 
 #### `list_models()` · `backend/app/api/v1/routes.py`
 
-- **Where:** route `GET /v1/models`. **Called by:** FastAPI (the frontend calls it on page load). **Calls:** `ProviderRegistry.default_model`, `ProviderRegistry.catalog`.
-- **Takes in:** `registry`, from `get_registry`.
-- **What it does:** puts the default model and the full model list into a `ModelList`.
+- **Where:** route `GET /v1/models` (needs `chat:use`). **Called by:** FastAPI (the frontend calls it on page load). **Calls:** `ProviderRegistry.default_model`, `ProviderRegistry.catalog`, `Principal.may_use`.
+- **Takes in:** `request`, `registry` (from `get_registry`), and the caller.
+- **What it does:** lists the models the caller may use (`MODEL_ROLES`; unlisted models are open), and the default: the configured one if allowed, else the first allowed one.
 - **Gives back:** `{"default": "mock/echo", "data": [{"id": "mock/echo", "provider": "mock", "model": "echo"}]}`.
 - **Can fail with:** nothing.
 - **Debug tips:** the frontend's dropdown shows exactly this list. If a model is missing in the UI, check this endpoint first.
@@ -1023,6 +1024,10 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
 | `MCPConnectionError` | 502 | `mcp_connection_failed` | MCP server couldn't be started or reached, dropped the connection, or timed out |
 | `MCPStdioDisabledError` | 403 | `mcp_stdio_disabled` | Local (stdio) servers are switched off (`MCP_ALLOW_STDIO=false`) |
 | `SecretKeyMissingError` | 400 | `secret_key_missing` | An env value or header was given, but `SECRET_KEY` isn't set |
+| `AuthRequiredError` | 401 | `auth_required` | Sign-in on and no `Authorization: Bearer` header (Layer 5) |
+| `InvalidTokenError` | 401 | `invalid_token` | Token expired, for another audience/issuer, bad signature, unknown key |
+| `ForbiddenError` | 403 | `forbidden` | The user's roles don't give the permission, or `MODEL_ROLES` forbids the model |
+| `AuthUnavailableError` | 503 | `auth_unavailable` | The identity provider's signing keys can't be fetched |
 
 ---
 
@@ -1078,7 +1083,7 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
 
 - **Where:** Next.js root layout. **Called by:** Next.js, for every page.
 - **Takes in:** `children`, the page content (here, `Home`).
-- **What it does:** renders `<html>` and `<body>`, loads the Geist fonts as CSS variables, sets the page title "Enterprise AI Platform", and puts the `NavBar` above every page. The body fills the screen height; each page fills the space under the bar.
+- **What it does:** renders `<html>` and `<body>`, loads the Geist fonts as CSS variables, sets the page title "Enterprise AI Platform", wraps everything in `AuthProvider`, puts the `NavBar` above every page, and the page itself inside `AuthGate` (shown once the user is known). The body fills the screen height; each page fills the space under the bar.
 - **Gives back:** the page shell (JSX).
 - **Can fail with:** a build error if the fonts can't be downloaded at build time (no internet).
 - **Debug tips:** global colours live in `frontend/app/globals.css` (light and dark).
@@ -1272,7 +1277,7 @@ If one fails, the assertion message shows the expected vs actual value.
 #### `make_settings()` · `backend/tests/conftest.py`
 
 - **Takes in:** any settings to override, e.g. `make_settings(openai_api_key="x")`.
-- **What it does:** builds `Settings` that **ignore your real `.env` and keys**: all API keys off, Ollama off, no database, no default prompt, no admin key, no embedding provider or model choice, mock on with no delay, default model `mock/echo`. Then applies the overrides.
+- **What it does:** builds `Settings` that **ignore your real `.env` and keys**: all API keys off, Ollama off, no database, no default prompt, sign-in off with a dev admin (`DEV_USER_ROLES=eap-admin`), no `MODEL_ROLES`, no embedding provider or model choice, mock on with no delay, default model `mock/echo`. Then applies the overrides.
 - **Gives back:** a `Settings` object.
 - **Debug tips:** if tests behave differently on your machine, check that each test uses this helper rather than `get_settings()`.
 
@@ -1721,7 +1726,7 @@ How the pieces split up:
 
 #### `get_settings_from_app()` · `backend/app/api/deps.py`
 
-- **Where:** `backend/app/api/deps.py`. **Called by:** `get_prompt_service`, `require_admin`.
+- **Where:** `backend/app/api/deps.py`. **Called by:** `get_prompt_service`, `get_principal`, `get_mcp_service`, `get_chat_service`, `list_models`, `auth_config`, `me`.
 - **Takes in:** `request`. **What it does:** returns the `Settings` saved on the app by `create_app`. **Gives back:** a `Settings` object.
 - **Can fail with:** nothing.
 - **Debug tips:** tests that pass their own settings to `create_app` are read through here, not from `.env`.
@@ -1756,19 +1761,6 @@ How the pieces split up:
 - **Can fail with:** `PromptStoreUnavailableError` → **503** `prompt_store_unavailable` when `DATABASE_URL` isn't set.
 - **Debug tips:** chat routes use `get_prompt_service` instead, so chat keeps working without a database.
 
-#### `require_admin()` · `backend/app/api/deps.py`
-
-- **Where:** `backend/app/api/deps.py`. **Called by:** FastAPI, for the write routes: create, patch, archive, new version, activate. **Calls:** `get_settings_from_app`.
-- **Takes in:** `request`, and `x_admin_key` (the `X-Admin-Key` header, if sent).
-- **What it does:**
-  1. `ADMIN_API_KEY` not set → allows everything (development).
-  2. Otherwise the header must match exactly. The comparison takes the same time whether or not the key matches, so an attacker can't guess it character by character.
-- **Gives back:** nothing (lets the request through).
-- **Can fail with:** `AdminAuthError` → **401** `admin_auth_required`.
-- **Debug tips:**
-  - Reads (list, get, render) never need the key.
-  - This is a stand-in until real users and roles arrive in Layer 5.
-
 ### 13.4 Prompt routes
 
 Each route only passes the request to `PromptService`; the rules and errors are described there (13.5).
@@ -1785,7 +1777,7 @@ Each route only passes the request to `PromptService`; the rules and errors are 
 - **Route:** `POST /v1/prompts` (admin). **Calls:** `PromptService.create_prompt`.
 - **Takes in:** `body` (`PromptCreate`: name, description, template, note), `service`.
 - **Gives back:** **201** with the new `PromptDetail` (version 1, active).
-- **Can fail with:** 422 bad name format, 409 `prompt_conflict` name taken, 401 without admin key.
+- **Can fail with:** 422 bad name format, 409 `prompt_conflict` name taken, 403 `forbidden` without `prompts:write`. The new version's `created_by` is the signed-in user.
 
 #### `get_prompt()` · `backend/app/api/v1/prompts.py`
 
@@ -2135,7 +2127,7 @@ Each route only passes the request to `PromptService`; the rules and errors are 
 
 #### `PromptsPage()` · `frontend/components/prompts/prompts-page.tsx`
 
-- **Called by:** `Prompts`. **Calls:** `useAdminKey`, `listPrompts`, `errorMessage`, `NewPromptForm`, `PromptDetailPanel`.
+- **Called by:** `Prompts`. **Calls:** `useAuth`, `listPrompts`, `errorMessage`, `NewPromptForm`, `PromptDetailPanel`.
 - **Takes in:** nothing. State:
   - `prompts`, `loading`, `loadError`;
   - `showArchived`;
@@ -2145,7 +2137,7 @@ Each route only passes the request to `PromptService`; the rules and errors are 
 - **What it does:**
   1. **Load-list effect** (on first view, when "Show archived" changes, and after `reload`): `listPrompts()`. Results arriving after the page changed again are ignored.
   2. Renders:
-     - the header: title, `AdminKeyInput`, **New prompt**;
+     - the header: title and **New prompt** (only with `prompts:write`);
      - any error banner;
      - the list on the left: name, `vN of M` or "archived", description;
      - on the right: the new-prompt form, the selected prompt's detail, or a hint.
@@ -2160,7 +2152,7 @@ Each route only passes the request to `PromptService`; the rules and errors are 
 #### `NewPromptForm()` · `frontend/components/prompts/prompts-page.tsx`
 
 - **Called by:** `PromptsPage` when "New prompt" is clicked. **Calls:** `submit`, `extractVariables`, `VariableChips`.
-- **Takes in:** `adminKey`, `onCreated(name)`, `onCancel()`.
+- **Takes in:** `onCreated(name)`, `onCancel()`.
 - **What it does:** a form with name, description, template and version note. The browser checks the name format (lowercase words with hyphens). While you type the template, the detected variables are shown live.
 - **Debug tips:** the server checks the name again (422 if it's invalid).
 
@@ -2168,12 +2160,12 @@ Each route only passes the request to `PromptService`; the rules and errors are 
 
 - **Called by:** the New prompt form's submit. **Calls:** `createPrompt`, `errorMessage`.
 - **Takes in:** `e`, the form event.
-- **What it does:** stops the page from reloading, sends `createPrompt` with the admin key, then calls `onCreated(name)`, which opens the new prompt and refreshes the list. On failure, shows the error under the form (e.g. "A prompt named ... already exists.").
+- **What it does:** stops the page from reloading, sends `createPrompt`, then calls `onCreated(name)`, which opens the new prompt and refreshes the list. On failure, shows the error under the form (e.g. "A prompt named ... already exists.").
 
 #### `PromptDetailPanel()` · `frontend/components/prompts/prompt-detail.tsx`
 
-- **Called by:** `PromptsPage` for the selected prompt (rebuilt fresh when another prompt is selected). **Calls:** `getPrompt`, `run`, `saveVersion`, `VersionList`, `VariableChips`, `RenderPreview`, `VersionEditor`.
-- **Takes in:** `name`, `adminKey`, `onChanged` (the page's `reload`).
+- **Called by:** `PromptsPage` for the selected prompt (rebuilt fresh when another prompt is selected), with `canWrite` (the user has `prompts:write`; without it Archive, Edit, activate buttons and the version editor are hidden). **Calls:** `getPrompt`, `run`, `saveVersion`, `VersionList`, `VariableChips`, `RenderPreview`, `VersionEditor`.
+- **Takes in:** `name`, `canWrite` (the user may change it: `prompts:write` or `knowledge:write`), `onChanged` (the page's `reload`).
 - **What it does:**
   1. **Load-detail effect** (first view and after each successful change): `getPrompt(name)`. On first load it views the active version.
   2. Header: name, **Archive** (asks for confirmation), description with **Edit**, "Active vN · Latest vM", and the JSON snippet to use this prompt in chat.
@@ -2241,43 +2233,11 @@ Each route only passes the request to `PromptService`; the rules and errors are 
 - **Takes in:** `err`, anything thrown by an API call.
 - **What it does:** turns it into one clear sentence:
   - `prompt_store_unavailable` → "set DATABASE_URL in backend/.env";
-  - `admin_auth_required` → "enter the admin key at the top of the page";
+  - `forbidden` → "Your role can't do this." plus the server's reason;
+  - `auth_required` / `invalid_token` → "Your sign-in has expired. Reload the page to sign in again.";
   - any other server error → its message;
   - a network failure → "Can't reach the backend...".
 - **Gives back:** the message text.
-
-#### `useAdminKey()` · `frontend/components/prompts/admin-key.tsx`
-
-- **Called by:** `PromptsPage`. **Calls:** React's `useSyncExternalStore` with `subscribe` and `readKey`; returns `setKey`.
-- **Takes in:** nothing.
-- **What it does:** keeps the admin key in **sessionStorage**: it survives reloads but is forgotten when the tab closes. During server rendering the key is empty, which avoids a mismatch between server and browser.
-- **Gives back:** `[key, setKey]`.
-- **Debug tips:** the key is never sent for reads, only for changes (as `X-Admin-Key`).
-
-#### `subscribe()` · `frontend/components/prompts/admin-key.tsx`
-
-- **Called by:** React (through `useAdminKey`).
-- **Takes in:** `onChange`, a function React wants called when the key changes.
-- **What it does:** listens for storage changes and for this app's own "admin key changed" event.
-- **Gives back:** a function that stops listening.
-
-#### `readKey()` · `frontend/components/prompts/admin-key.tsx`
-
-- **Called by:** React (through `useAdminKey`), on every render.
-- **What it does:** reads the key from sessionStorage, or from an in-memory copy if storage is blocked (e.g. strict privacy settings).
-- **Gives back:** the key, or `""`.
-
-#### `setKey()` · `frontend/components/prompts/admin-key.tsx`
-
-- **Called by:** `AdminKeyInput` (through `useAdminKey`).
-- **Takes in:** `value`, the new key (empty = forget it).
-- **What it does:** saves it in memory and in sessionStorage (or removes it), then fires the change event so the page re-renders with it.
-
-#### `AdminKeyInput()` · `frontend/components/prompts/admin-key.tsx`
-
-- **Called by:** `PromptsPage`.
-- **Takes in:** `value`, `onChange`.
-- **What it does:** a password field labelled "Admin key", hinting it's only needed when the backend sets `ADMIN_API_KEY`.
 
 #### `extractVariables()` · `frontend/lib/template.ts`
 
@@ -2289,12 +2249,12 @@ Each route only passes the request to `PromptService`; the rules and errors are 
 
 #### `apiRequest()` · `frontend/lib/api.ts`
 
-- **Called by:** `getModels` and every prompt API function below. **Calls:** `toApiError` on failure.
+- **Called by:** `getModels` and every prompt API function below. **Calls:** `authHeaders`, `toApiError` on failure.
 - **Takes in:**
   - `path` (e.g. `/v1/prompts`);
-  - `options`: `method`, `body` (sent as JSON), `adminKey` (sent as `X-Admin-Key`), `signal`.
+  - `options`: `method`, `body` (sent as JSON), `form` (multipart), `signal`.
 - **What it does:**
-  1. Builds the request: JSON content type only when there's a `body`; a `form` (file upload) is sent as multipart, and the browser sets its content type; admin header only when a key is given.
+  1. Builds the request: the `Authorization: Bearer` header when someone is signed in (`authHeaders`); JSON content type only when there's a `body`; a `form` (file upload) is sent as multipart, and the browser sets its content type.
   2. Sends it.
   3. Not OK → throws `ApiError`.
   4. Otherwise parses the JSON reply.
@@ -2365,7 +2325,7 @@ Run them on SQLite (default) or real Postgres:
 #### `api_factory()` · `backend/tests/conftest.py`
 
 - **What it does:** a pytest fixture that gives the test a `factory` for building full apps on the test database.
-- **Used as:** `async with api_factory(admin_api_key="x") as api:` → `api` is an HTTP client.
+- **Used as:** `async with api_factory(dev_user_roles=["eap-user"]) as api:` → `api` is an HTTP client.
 
 #### `factory()` · `backend/tests/conftest.py`
 
@@ -2483,13 +2443,6 @@ Run them on SQLite (default) or real Postgres:
   - bad version → 404 `prompt_version_not_found`;
   - missing variable → 400 `prompt_variable_missing`;
   - bad name → 422.
-
-#### `test_admin_key_required_for_writes_when_configured()` · `backend/tests/test_prompts_api.py`
-
-- **Proves:** with `ADMIN_API_KEY` set:
-  - a write with a missing or wrong key → 401;
-  - the right key works;
-  - reads need no key.
 
 #### `test_without_database_prompts_return_503_and_chat_still_works()` · `backend/tests/test_prompts_api.py`
 
@@ -3184,8 +3137,8 @@ How the pieces split up:
 #### `get_rag_service()` · `backend/app/api/deps.py`
 
 - **Called by:** FastAPI, for `require_rag_service` and `get_chat_service`.
-- **Takes in:** `request`, `session` (from `get_db_session`).
-- **Gives back:** a `RagService` on this request's session, or `None` when there's no database or no embedder.
+- **Takes in:** `request`, `session` (from `get_db_session`), `principal` (from `get_principal`).
+- **Gives back:** a `RagService` on this request's session that sees only the collections the caller's roles allow, or `None` when there's no database or no embedder.
 - **Debug tips:** it shares the session with the prompt service in the same request.
 
 #### `require_rag_service()` · `backend/app/api/deps.py`
@@ -3293,9 +3246,9 @@ How the pieces split up:
 
 #### `KnowledgePage()` · `frontend/components/knowledge/knowledge-page.tsx`
 
-- **Calls:** `useAdminKey`, `listCollections`, `NewCollectionForm`, `CollectionPanel`.
+- **Calls:** `useAuth`, `listCollections`, `NewCollectionForm`, `CollectionPanel`.
 - **What it does:** the same layout as the Prompts page:
-  - the header: title, admin key, **New collection**;
+  - the header: title and **New collection** (only with `knowledge:write`);
   - an error banner;
   - the list on the left: name, `ready/total`, or "archived", description; plus "Show archived";
   - the selected collection's panel on the right.
@@ -3309,8 +3262,8 @@ How the pieces split up:
 
 #### `NewCollectionForm()` · `frontend/components/knowledge/knowledge-page.tsx`
 
-- **Takes in:** `adminKey`, `onCreated(name)`, `onCancel()`.
-- **What it does:** name (format checked by the browser) and description fields.
+- **Takes in:** `onCreated(name)`, `onCancel()`.
+- **What it does:** name (format checked by the browser), description, and **Who can use it** (`RolePicker`; none ticked = everyone).
 
 #### `submit()` · `frontend/components/knowledge/knowledge-page.tsx`
 
@@ -3318,15 +3271,16 @@ How the pieces split up:
 
 #### `CollectionPanel()` · `frontend/components/knowledge/collection-panel.tsx`
 
-- **Takes in:** `name`, `adminKey`, `onChanged` (the page's `reload`).
+- **Takes in:** `name`, `canWrite` (the user may change it: `prompts:write` or `knowledge:write`), `onChanged` (the page's `reload`).
 - **What it does:**
   1. **Load effect:** `getCollection` + `listDocuments` together, on first view and after every change.
   2. **Polling effect:** while any document is `pending`/`processing`, reloads every 2 seconds and refreshes the list. It stops by itself when everything is `ready`/`failed`.
   3. Header:
-     - name and **Archive**;
+     - name and **Archive** (writers only);
+     - the access line (`AccessRow`): who may use it, who created it, **Change**;
      - counts, the embedding model, and the JSON snippet for chat;
      - a yellow **Re-index collection** banner when `needs_reindex`.
-  4. Then `UploadBox`, `PasteTextForm` (hidden for archived collections), `DocumentTable`, `SearchTester`.
+  4. Then `UploadBox`, `PasteTextForm` (hidden for archived collections and for users without `knowledge:write`), `DocumentTable` (re-index/delete only for writers), `SearchTester`.
 
 #### `run()` · `frontend/components/knowledge/collection-panel.tsx`
 
@@ -3944,7 +3898,7 @@ One `MCPService` per request, on that request's database session. It holds the r
 #### `MCPService.create_server()` · `backend/app/mcp/service.py`
 
 - **Called by:** `create_server` (route). **Calls:** `MCPService._find_server`, `encrypt_secrets`, `MCPService._commit`, `MCPService._refresh`, `MCPService._out`.
-- **Takes in:** `body` (`ServerCreate`, already checked by `ServerCreate._check_transport`) and `created_by` (filled from Layer 5 on).
+- **Takes in:** `body` (`ServerCreate`, already checked by `ServerCreate._check_transport`, including `allowed_roles`). `created_by` = the caller's username.
 - **What it does:**
   1. stdio while `MCP_ALLOW_STDIO=false` → refuses.
   2. Name taken → refuses.
@@ -3957,7 +3911,7 @@ One `MCPService` per request, on that request's database session. It holds the r
 #### `MCPService.update_server()` · `backend/app/mcp/service.py`
 
 - **Called by:** `update_server` (route). **Takes in:** `name`, `body` (`ServerUpdate`).
-- **What it does:** changes `description` and/or `enabled`. Disabling also closes the connection (`MCPManager.disconnect`). A disabled server's tools are never offered to a model, and chats naming it get 404.
+- **What it does:** changes `description`, `enabled` and/or `allowed_roles`. Disabling also closes the connection (`MCPManager.disconnect`). A disabled server's tools are never offered to a model, and chats naming it get 404.
 - **Gives back:** the updated `ServerOut`. **Can fail with:** 404.
 
 #### `MCPService.delete_server()` · `backend/app/mcp/service.py`
@@ -3990,7 +3944,7 @@ One `MCPService` per request, on that request's database session. It holds the r
 #### `MCPService.available_tools()` · `backend/app/mcp/service.py`
 
 - **Called by:** `list_available_tools` (route). **Calls:** `MCPService._tools_by_server` (enabled only).
-- **What it does:** enabled servers that have at least one enabled tool, with those tools.
+- **What it does:** enabled servers that the caller may use (`MCPService._may_use`) and that have at least one enabled tool, with those tools.
 - **Gives back:** `AvailableTools`. Servers with nothing switched on are left out.
 
 #### `MCPService.toolbox_for_chat()` · `backend/app/mcp/service.py`
@@ -3998,7 +3952,7 @@ One `MCPService` per request, on that request's database session. It holds the r
 - **Called by:** `ChatService._toolbox`. **Calls:** `MCPService._tools_by_server`, `MCPService._target`, `model_tool_name`, `tool_schema`, `Toolbox.__init__`.
 - **Takes in:** `ref`, the request's `ToolsRef` (`{"servers": ["demo"]}`).
 - **What it does:**
-  1. Loads the named servers (duplicates ignored). Any that doesn't exist or is disabled → 404.
+  1. Loads the named servers (duplicates ignored). Any that doesn't exist, is disabled, or isn't allowed for the caller's roles → 404.
   2. For each server, its **enabled** tools only, each as a `ToolEntry`: a `ToolSpec` with the namespaced name (`demo__get_time`), the description (or the name if empty) and an object schema; plus where to run it (decrypted target) and whether it's destructive.
 - **Gives back:** a `Toolbox` (plain data, no database session).
 - **Can fail with:** 404 `mcp_server_not_found`; 403 when the server is stdio and stdio is off; 502 when secrets can't be decrypted.
@@ -4244,11 +4198,11 @@ streamed in pieces), and replays earlier rounds from `request.turns`. The model'
 ### 15.8 Routes, dependencies and migration
 
 Every `/v1/tools` route first runs `get_db_session` → `get_mcp_service` → `require_mcp_service`. Routes
-under `/servers` and `/presets` also run `require_admin` (they show how servers are started).
+under `/servers` and `/presets` also need `tools:admin` via `require` (they show how servers are started); `GET /v1/tools` needs `tools:use`.
 
 #### `get_mcp_service()` · `backend/app/api/deps.py`
 
-- **Called by:** FastAPI, for the tools routes and `get_chat_service`. **Gives back:** an `MCPService` on this request's session and the app's `MCPManager`, or `None` without a database.
+- **Called by:** FastAPI, for the tools routes and `get_chat_service`. **Gives back:** an `MCPService` on this request's session and the app's `MCPManager`, for the caller (`get_principal`: only servers their roles allow), or `None` without a database.
 
 #### `require_mcp_service()` · `backend/app/api/deps.py`
 
@@ -4342,9 +4296,9 @@ Tools raise `ToolError` for expected failures, so the message reaches the model.
 
 #### `ToolsPage()` · `frontend/components/tools/tools-page.tsx`
 
-- **Calls:** `listMcpServers`, `useAdminKey`, `AdminKeyInput`, `ServerForm`, `ServerPanel`, `toolsError`.
-- **What it does:** loads the server list (needs the admin key when `ADMIN_API_KEY` is set; it reloads when you type the key). Left: one button per server with "local command"/"remote URL" and "N/M tools on", "error" or "disabled". Right: the **Add server** form or the selected server's panel.
-- **Debug tips:** "Managing tools needs the admin key" → enter it at the top. "MCP tools need a database" → set `DATABASE_URL`.
+- **Calls:** `useAuth`, `listMcpServers`, `ServerForm`, `ServerPanel`, `toolsError`.
+- **What it does:** only for users with `tools:admin` (others see "Managing MCP servers needs the Admin role"). Loads the server list. Left: one button per server with "local command"/"remote URL" and "N/M tools on", "error" or "disabled". Right: the **Add server** form or the selected server's panel.
+- **Debug tips:** "MCP tools need a database" → set `DATABASE_URL`.
 
 #### `reload()` · `frontend/components/tools/tools-page.tsx`
 
@@ -4353,7 +4307,7 @@ Tools raise `ToolError` for expected failures, so the message reaches the model.
 #### `ServerForm()` · `frontend/components/tools/server-form.tsx`
 
 - **Calls:** `fillDemo`, `submit`.
-- **What it does:** the **Add MCP server** form: name, description, and either *Local command (stdio)* (command, arguments one per line, `KEY=value` env lines) or *Remote URL (HTTP)* (URL, `Name: value` header lines). Secret fields say "stored encrypted, never shown again".
+- **What it does:** the **Add MCP server** form: name, description, **Whose chats may use its tools** (`RolePicker`), and either *Local command (stdio)* (command, arguments one per line, `KEY=value` env lines) or *Remote URL (HTTP)* (URL, `Name: value` header lines). Secret fields say "stored encrypted, never shown again".
 
 #### `fillDemo()` · `frontend/components/tools/server-form.tsx`
 
@@ -4366,7 +4320,7 @@ Tools raise `ToolError` for expected failures, so the message reaches the model.
 #### `ServerPanel()` · `frontend/components/tools/server-panel.tsx`
 
 - **Calls:** `run`, `toggleTool`, `remove`, `refreshMcpServer`, `updateMcpServer`, `TryTool`.
-- **What it does:** shows the server (transport, command or URL, secret names), its connection state ("Last connection failed: ..." or "Tools last read ... · N of M switched on"), buttons **Refresh tools**, **Disable/Enable server**, **Delete**, and the tool list: an **Allow** checkbox per tool, badges *read-only* / *changes data*, and **Try**.
+- **What it does:** shows the server (transport, command or URL, access line `AccessLine`, secret names), its connection state ("Last connection failed: ..." or "Tools last read ... · N of M switched on"), buttons **Refresh tools**, **Disable/Enable server**, **Delete**, and the tool list: an **Allow** checkbox per tool, badges *read-only* / *changes data*, and **Try**.
 - **Debug tips:** switches show your click at once and roll back if the save fails (with the error shown).
 
 #### `run()` · `frontend/components/tools/server-panel.tsx`
@@ -4395,7 +4349,7 @@ Tools raise `ToolError` for expected failures, so the message reaches the model.
 
 #### `toolsError()` · `frontend/components/tools/messages.ts`
 
-- **What it does:** a short, actionable message for tools API errors (admin key, no database), otherwise the shared `errorMessage`.
+- **What it does:** a short, actionable message for tools API errors (needs the Admin role, no database), otherwise the shared `errorMessage`.
 
 #### `parsePairs()` · `frontend/components/tools/messages.ts`
 
@@ -4415,19 +4369,19 @@ Tools raise `ToolError` for expected failures, so the message reaches the model.
 
 #### `listMcpPresets()` · `frontend/lib/api.ts`
 
-- `GET /v1/tools/presets` (admin key). Called by `fillDemo`.
+- `GET /v1/tools/presets` (Admin role). Called by `fillDemo`.
 
 #### `listMcpServers()` · `frontend/lib/api.ts`
 
-- `GET /v1/tools/servers` (admin key). Called by `ToolsPage`.
+- `GET /v1/tools/servers` (Admin role). Called by `ToolsPage`.
 
 #### `getMcpServer()` · `frontend/lib/api.ts`
 
-- `GET /v1/tools/servers/{name}` (admin key). Available for callers that need one server.
+- `GET /v1/tools/servers/{name}` (Admin role). Available for callers that need one server.
 
 #### `createMcpServer()` · `frontend/lib/api.ts`
 
-- `POST /v1/tools/servers` (admin key). Called by `submit` in the server form.
+- `POST /v1/tools/servers` (Admin role). Called by `submit` in the server form.
 
 #### `updateMcpServer()` · `frontend/lib/api.ts`
 
@@ -4706,10 +4660,6 @@ stdio (the demo server and `backend/tests/mcp_test_server.py`), and one over HTT
 
 - **Proves:** stdio without a command, a non-HTTP URL and a bad name → 422.
 
-#### `test_admin_key_protects_server_management()` · `backend/tests/test_tools_api.py`
-
-- **Proves:** with `ADMIN_API_KEY`, server routes need `X-Admin-Key`; `GET /v1/tools` stays open.
-
 #### `test_demo_preset_can_be_registered_as_is()` · `backend/tests/test_tools_api.py`
 
 - **Proves:** the demo preset uses the backend's Python and registers with four tools.
@@ -4760,7 +4710,425 @@ stdio (the demo server and `backend/tests/mcp_test_server.py`), and one over HTT
 
 ---
 
-## 16. Debugging cheat sheet
+## 16. RBAC + OAuth (Layer 5)
+
+Users sign in with Keycloak (or any OpenID Connect provider). The browser gets an **access token**
+(a JWT signed by the provider) and sends it on every request as `Authorization: Bearer <token>`. The
+backend checks the signature and claims, reads the user's **roles**, and allows or refuses each action.
+
+```
+browser ──► /prompts ──► "Sign in" ──► Keycloak login (code + PKCE) ──► /auth/callback ──► tokens
+browser ──► API + Bearer token ──► get_principal: TokenVerifier.verify (JWKS, iss, aud, exp) ──► Principal(roles)
+route ──► require(permission) ──► service filters what the roles may see (collections, MCP servers, models)
+```
+
+| Role | Permissions | Can |
+|---|---|---|
+| `eap-user` | `chat:use`, `prompts:read`, `knowledge:read`, `tools:use` | chat (with prompts, knowledge bases, tools), read prompts and collections |
+| `eap-editor` | user + `prompts:write`, `knowledge:write` | also change prompts and knowledge bases |
+| `eap-admin` | editor + `tools:admin` | also manage MCP servers; passes every per-resource rule |
+
+Per-resource rules: a collection or MCP server may list `allowed_roles` (empty = everyone). Models may
+be limited with `MODEL_ROLES` (unlisted models are open). Resources a user may not use look like they
+don't exist (404), except models (403, since model names aren't secret).
+
+**Sign-in off** (`AUTH_ENABLED=false`, the default for local development): every request acts as a
+built-in dev user with `DEV_USER_ROLES` (default `eap-admin`). The startup log warns about it.
+
+Shapes (`backend/app/auth/schemas.py`): `AuthConfig` (`enabled`, `issuer`, `client_id`, `scope`) and `Me`
+(`subject`, `username`, `name`, `email`, `roles`, `permissions`, `auth_enabled`, `is_dev`).
+Settings: `AUTH_ENABLED`, `OIDC_ISSUER`, `OIDC_AUDIENCE`, `OIDC_CLIENT_ID`, `OIDC_SCOPE`, `OIDC_JWKS_URL`,
+`OIDC_JWKS_CACHE_S`, `DEV_USER_ROLES`, `MODEL_ROLES`. Keycloak setup: `infra/keycloak/` (realm `eap`).
+
+### 16.1 Roles and permissions — `backend/app/auth/permissions.py`
+
+#### `permissions_for()` · `backend/app/auth/permissions.py`
+
+- **Called by:** `Principal.permissions`; tests. **Takes in:** a list of role names.
+- **What it does:** joins the permissions of every known role (table above). Unknown roles (e.g. Keycloak's `offline_access`) add nothing.
+- **Gives back:** e.g. `{"chat:use", "prompts:read", "knowledge:read", "tools:use"}` for `["eap-user"]`.
+- **Debug tips:** permissions live in code, not in Keycloak, so what a role can do is reviewed like any other change.
+
+#### `roles_allow()` · `backend/app/auth/permissions.py`
+
+- **Called by:** `Principal.may_use`; tests. **Takes in:** the user's roles and a resource's `allowed_roles`.
+- **What it does:** empty or missing list → yes (everyone); user is `eap-admin` → yes; otherwise yes only if they share a role.
+- **Gives back:** `True` / `False`.
+
+### 16.2 The caller — `backend/app/auth/principal.py`
+
+`Principal` = who is making the request: `subject` (the provider's stable id), `username`
+(`preferred_username`, stored as `created_by`), `name`, `email`, `roles`, `is_dev`.
+
+#### `Principal.permissions()` · `backend/app/auth/principal.py`
+
+- **Where:** a read-only property. **Gives back:** `permissions_for(roles)`.
+
+#### `Principal.is_admin()` · `backend/app/auth/principal.py`
+
+- **Where:** a read-only property. **Gives back:** `True` if the roles include `eap-admin`.
+
+#### `Principal.can()` · `backend/app/auth/principal.py`
+
+- **Called by:** `require` (`check`), `ChatService._toolbox`. **Takes in:** a permission like `"prompts:write"`. **Gives back:** `True` / `False`.
+
+#### `Principal.may_use()` · `backend/app/auth/principal.py`
+
+- **Called by:** `RagService._visible`, `MCPService._may_use`, `ChatService._check_model`, `list_models`. **Takes in:** a resource's `allowed_roles` (or `None`). **Gives back:** `roles_allow(...)`.
+
+#### `dev_principal()` · `backend/app/auth/principal.py`
+
+- **Called by:** `get_principal` when `AUTH_ENABLED=false`. **Takes in:** `DEV_USER_ROLES`.
+- **Gives back:** `Principal(subject="dev", username="dev", name="Developer", roles=..., is_dev=True)`.
+- **Debug tips:** set `DEV_USER_ROLES=eap-user` to see the app as a normal user without Keycloak.
+
+### 16.3 Checking tokens — `backend/app/auth/tokens.py`
+
+#### `TokenVerifier.__init__()` · `backend/app/auth/tokens.py`
+
+- **Called by:** `lifespan` (when `AUTH_ENABLED=true`); tests (with a fake HTTP client). **Takes in:** `settings`, optional `http_client`.
+- **What it does:** keeps the issuer, an empty key cache, the times of the last fetch and last attempt, and a lock.
+
+#### `TokenVerifier.verify()` · `backend/app/auth/tokens.py`
+
+- **Called by:** `get_principal`. **Calls:** `TokenVerifier._key`, PyJWT's `decode`, `principal_from_claims`.
+- **Takes in:** `token`, the text after `Bearer `.
+- **What it does:**
+  1. Reads the token's header without trusting it. Not a JWT → refused.
+  2. The algorithm must be asymmetric (`RS*`, `PS*`, `ES*`). `none` and shared-secret `HS*` are refused, so nobody can forge a token with a made-up key.
+  3. Gets the provider's public key for the token's `kid`.
+  4. Checks the signature, `iss` = `OIDC_ISSUER`, `aud` includes `OIDC_AUDIENCE`, `exp` (with 30 s leeway for clock differences), and that `exp`, `iat`, `iss`, `sub`, `aud` are present.
+- **Gives back:** a `Principal` from the claims.
+- **Can fail with:** `InvalidTokenError` → **401** `invalid_token` with a specific reason: "has expired", "not meant for this API", "issued by someone else", "signature is wrong", "unknown key", "algorithm ... is not accepted", "not a valid JWT". `AuthUnavailableError` → **503** when the keys can't be fetched.
+- **Debug tips:** paste a token into a JWT decoder (locally) and compare `iss` and `aud` with `OIDC_ISSUER` / `OIDC_AUDIENCE`. In Docker, `iss` is the address the **browser** used (`http://localhost:8080/...`).
+
+#### `TokenVerifier._key()` · `backend/app/auth/tokens.py`
+
+- **Called by:** `TokenVerifier.verify`. **Calls:** `TokenVerifier._needs_fetch`, `TokenVerifier._fetch_keys`.
+- **What it does:** returns the cached key for `kid`, reading the key set first when `_needs_fetch` says so (one fetch at a time). If a refresh fails but the key is already cached, it keeps using the cached key (logged as a warning).
+- **Can fail with:** 401 (no `kid`, or unknown even after a fresh read); 503 (can't read keys and none cached).
+
+#### `TokenVerifier._needs_fetch()` · `backend/app/auth/tokens.py`
+
+- **What it does:** yes when the cache is older than `OIDC_JWKS_CACHE_S` or the `kid` is unknown (the provider rotated keys) — but, while some keys are cached, at most once every 30 s, so a flood of bad tokens or a provider outage doesn't make every request a slow network call.
+
+#### `TokenVerifier._fetch_keys()` · `backend/app/auth/tokens.py`
+
+- **Calls:** `TokenVerifier._discover_jwks_url` (when `OIDC_JWKS_URL` is blank).
+- **What it does:** downloads the key set (JWKS) and keeps every signing key by `kid`. Logs `auth: loaded N signing keys`.
+- **Can fail with:** `AuthUnavailableError` (503) with the URL and reason.
+
+#### `TokenVerifier._discover_jwks_url()` · `backend/app/auth/tokens.py`
+
+- **What it does:** reads `{OIDC_ISSUER}/.well-known/openid-configuration` and returns its `jwks_uri`.
+- **Can fail with:** 503 when the provider can't be reached at the issuer address. In Docker, set `OIDC_JWKS_URL` to the internal address instead.
+
+#### `TokenVerifier.aclose()` · `backend/app/auth/tokens.py`
+
+- **Called by:** `lifespan` at shutdown. Closes the HTTP client.
+
+#### `principal_from_claims()` · `backend/app/auth/tokens.py`
+
+- **Called by:** `TokenVerifier.verify`. **Takes in:** the checked claims and the audience.
+- **What it does:** roles = Keycloak realm roles (`realm_access.roles`) plus this API's client roles (`resource_access["eap-api"].roles`); username = `preferred_username` (or `sub`).
+- **Gives back:** a `Principal`.
+
+### 16.4 Request dependencies — `backend/app/api/deps.py`
+
+#### `get_principal()` · `backend/app/api/deps.py`
+
+- **Called by:** FastAPI, for every route that needs a user (directly as `CurrentUser`, or through `require`, `get_rag_service`, `get_mcp_service`). FastAPI runs it once per request.
+- **Takes in:** `request` and the `Authorization` header.
+- **What it does:** sign-in off → `dev_principal(DEV_USER_ROLES)`. On → the header must be `Bearer <token>`, checked by `TokenVerifier.verify`. Saves the username on `request.state.user` for the request log.
+- **Gives back:** a `Principal`.
+- **Can fail with:** **401** `auth_required` (no or non-Bearer header, with `WWW-Authenticate: Bearer`), 401 `invalid_token`, 503 `auth_unavailable`.
+
+#### `require()` · `backend/app/api/deps.py`
+
+- **Used as:** `Depends(require("prompts:write"))`, on routers (`/v1/prompts` needs `prompts:read`) and on single routes.
+- **Takes in:** a permission. **Gives back:** a dependency (`check`) that gives the `Principal` back.
+
+#### `check()` · `backend/app/api/deps.py`
+
+- **Where:** the dependency made by `require`. **Calls:** `get_principal`, `Principal.can`, `_roles`.
+- **Can fail with:** **403** `forbidden`: "Your roles (eap-user) don't allow this (prompts:write)."
+
+#### `_roles()` · `backend/app/api/deps.py`
+
+- **Gives back:** the principal's roles as `"eap-editor, eap-user"`, or `"none"`, for error messages.
+
+### 16.5 Routes — `backend/app/api/v1/auth.py`, and what changed elsewhere
+
+#### `auth_config()` · `backend/app/api/v1/auth.py`
+
+- **Route:** `GET /v1/auth/config` (public). **Gives back:** `{"enabled": true, "issuer": "http://localhost:8080/realms/eap", "client_id": "eap-web", "scope": "openid profile email"}`. The frontend reads it at start, so one build works with and without sign-in.
+
+#### `me()` · `backend/app/api/v1/auth.py`
+
+- **Route:** `GET /v1/me`. **Gives back:** a `Me`: who is signed in, their roles and permissions (the frontend shows or hides pages and buttons by these).
+
+| Route group | Needs |
+|---|---|
+| `/health`, `/v1/auth/config` | nothing |
+| `/v1/me` | a signed-in user |
+| `/v1/models`, `/v1/chat`, `/v1/chat/stream` | `chat:use` (+ `MODEL_ROLES`; `tools:use` when `tools` is sent) |
+| `GET /v1/prompts...`, `POST .../render` | `prompts:read` |
+| prompt changes | `prompts:write` |
+| `GET /v1/collections...`, search | `knowledge:read` (+ the collection's `allowed_roles`) |
+| collection and document changes | `knowledge:write` |
+| `GET /v1/tools` | `tools:use` (lists only servers the roles may use) |
+| `/v1/tools/servers...`, `/v1/tools/presets` | `tools:admin` |
+
+#### `update_collection()` · `backend/app/api/v1/collections.py`
+
+- **Route:** `PATCH /v1/collections/{name}` (`knowledge:write`), body `{"description"?, "allowed_roles"?}`. **Calls:** `RagService.update_collection`.
+
+#### `upgrade()` · `backend/migrations/versions/0004_add_access_control.py`
+
+- **What it does:** adds `collections.allowed_roles` (existing collections get `[]` = everyone), `collections.created_by`, `documents.created_by`.
+
+#### `downgrade()` · `backend/migrations/versions/0004_add_access_control.py`
+
+- **What it does:** drops those three columns.
+
+### 16.6 Rules inside the services
+
+#### `ChatService._check_model()` · `backend/app/services/chat_service.py`
+
+- **Called by:** `ChatService._prepare`, right after the model is resolved. **Takes in:** `"provider/model"`.
+- **What it does:** looks the model up in `MODEL_ROLES`; not listed → allowed; listed → the user needs one of its roles (admins always pass).
+- **Can fail with:** **403** `forbidden` "Your roles can't use the model ...". `list_models` hides those models, and picks the first allowed one as the default if the configured default isn't allowed.
+
+#### `RagService.update_collection()` · `backend/app/rag/service.py`
+
+- **Called by:** `update_collection` (route). **What it does:** changes `description` and/or `allowed_roles` (duplicates removed). **Can fail with:** 404, 409 archived.
+
+#### `RagService._username()` · `backend/app/rag/service.py`
+
+- **Where:** a read-only property. **Gives back:** the caller's username for `created_by`, or `None` (background worker).
+
+#### `RagService._visible()` · `backend/app/rag/service.py`
+
+- **Called by:** `RagService.list_collections`, `RagService._require_collection`. **Gives back:** whether the caller may see and use a collection. `None` principal (the worker) sees everything.
+- **Debug tips:** a 404 for a collection that exists means the user's roles aren't in its `allowed_roles`.
+
+#### `MCPService._may_use()` · `backend/app/mcp/service.py`
+
+- **Called by:** `MCPService.available_tools`, `MCPService.toolbox_for_chat`. **Gives back:** whether the caller's chats may use a server (its `allowed_roles`; admins always).
+
+#### `Settings._check_auth()` · `backend/app/core/config.py`
+
+- **Where:** a validator on `Settings`. **What it does:** `AUTH_ENABLED=true` needs `OIDC_ISSUER` (else startup fails with that message); removes a trailing `/` from the issuer so it matches the tokens' `iss`.
+
+### 16.7 Frontend: sign-in and permissions
+
+#### `getAuthConfig()` · `frontend/lib/auth.ts`
+
+- **Called by:** `getUserManager`, `AuthProvider`. **What it does:** `GET /v1/auth/config`, once per page load (retried after a failure). **Gives back:** `AuthConfig`.
+
+#### `getUserManager()` · `frontend/lib/auth.ts`
+
+- **What it does:** sign-in off → `null`. On → one oidc-client-ts `UserManager` for this tab: authority = the issuer, `client_id`, redirect `/auth/callback`, code flow (PKCE S256 is always on), automatic silent renew, tokens in **sessionStorage** (kept across reloads, gone when the tab closes).
+
+#### `currentAccessToken()` · `frontend/lib/auth.ts`
+
+- **Called by:** `authHeaders` (through `setAccessTokenProvider`), `AuthProvider`. **Gives back:** the stored access token if it hasn't expired, else `null`.
+
+#### `signIn()` · `frontend/lib/auth.ts`
+
+- **Takes in:** `returnTo` (the current path). **What it does:** redirects to Keycloak's login page with a PKCE challenge; the path travels in the OIDC `state`.
+
+#### `completeSignIn()` · `frontend/lib/auth.ts`
+
+- **Called by:** `AuthCallback`. **What it does:** swaps the one-time code (plus the PKCE verifier) for tokens and stores them. **Gives back:** where to go next (the saved path, only if it starts with `/`, so it can't send you to another site).
+- **Can fail with:** an error message (e.g. the code was already used, or the state doesn't match).
+
+#### `signOut()` · `frontend/lib/auth.ts`
+
+- **What it does:** ends the Keycloak session and comes back to `/`.
+
+#### `setAccessTokenProvider()` · `frontend/lib/api.ts`
+
+- **Called by:** `AuthProvider`. **Takes in:** a function that gives the current token, or `null` (sign-in off). Keeps `lib/api.ts` free of sign-in code.
+
+#### `authHeaders()` · `frontend/lib/api.ts`
+
+- **Called by:** `apiRequest`, `streamChat`. **Gives back:** `{Authorization: "Bearer …"}` when there's a token, else `{}`.
+
+#### `getMe()` · `frontend/lib/api.ts`
+
+- `GET /v1/me`. Called by `AuthProvider`.
+
+#### `updateCollection()` · `frontend/lib/api.ts`
+
+- `PATCH /v1/collections/{name}` with `{description?, allowed_roles?}`. Called by the collection panel's `AccessRow`.
+
+#### `AuthProvider()` · `frontend/components/auth-provider.tsx`
+
+- **Where:** wraps the whole app in `RootLayout`. **Calls:** `load`, `getUserManager`.
+- **What it does:** works out who is using the app and shares `status` (`loading`, `signed-out`, `ready`, `error`), `me`, `can`, `signIn`, `signOut` through `useAuth`. Skips the work on `/auth/*` (the callback finishes first) and runs again afterwards. Listens for "silent renew failed" and "signed out" from the provider → `signed-out`.
+
+#### `load()` · `frontend/components/auth-provider.tsx`
+
+- **Where:** inside `AuthProvider`'s effect. **Calls:** `getAuthConfig`, `setAccessTokenProvider`, `currentAccessToken`, `getMe`.
+- **What it does:** sign-in on and no valid token → `signed-out`. Otherwise `GET /v1/me` → `ready`. A 401 (token rejected) → `signed-out`; other failures → `error` with the message.
+
+#### `signedOut()` · `frontend/components/auth-provider.tsx`
+
+- **What it does:** the event handler that marks the user signed out (so the sign-in screen shows).
+
+#### `can()` · `frontend/components/auth-provider.tsx`
+
+- **Takes in:** a permission. **Gives back:** whether `me.permissions` includes it (false until `me` is loaded). Used by `NavBar` and every page to show or hide actions. The backend still checks every request.
+
+#### `useAuth()` · `frontend/components/auth-provider.tsx`
+
+- **Gives back:** the shared auth state. Used by `NavBar`, `AuthGate`, `PromptsPage`, `KnowledgePage`, `ToolsPage`.
+
+#### `AuthGate()` · `frontend/components/auth-provider.tsx`
+
+- **Where:** around the page content in `RootLayout`. **What it does:** shows the page only when `ready` (or on `/auth/*`); otherwise "Loading…", the error, or **Sign in to continue** with a **Sign in** button.
+
+#### `AuthCallbackPage()` · `frontend/app/auth/callback/page.tsx`
+
+- **Route:** `/auth/callback`, where Keycloak sends the browser back. Renders `AuthCallback`.
+
+#### `AuthCallback()` · `frontend/components/auth-callback.tsx`
+
+- **Calls:** `completeSignIn`. **What it does:** finishes sign-in once (guarded, because a code can be used only once), then goes back to the page you started from. On failure: the reason and a **Start again** link.
+
+#### `RolePicker()` · `frontend/components/role-picker.tsx`
+
+- **Called by:** `NewCollectionForm`, `AccessRow`, `ServerForm`, `AccessLine`. **Takes in:** `value` (roles), `onChange`, `disabled`, `label`. **What it does:** one checkbox per role; none ticked = everyone; notes that admins always have access.
+
+#### `rolesLabel()` · `frontend/components/role-picker.tsx`
+
+- **Gives back:** `"Everyone"` or `"Editor, User"`.
+
+#### `AccessRow()` · `frontend/components/knowledge/collection-panel.tsx`
+
+- **What it does:** "Access: Everyone · created by alice · Change" under a collection's description; **Change** (editors and admins) opens a `RolePicker` and saves with `updateCollection`.
+
+#### `AccessLine()` · `frontend/components/tools/server-panel.tsx`
+
+- **What it does:** the same for an MCP server ("Access: Editor · added by alice · Change"), saved with `updateMcpServer({allowed_roles})`.
+
+### 16.8 Auth tests — `backend/tests/test_auth.py`
+
+`FakeIdP` signs tokens with real RSA keys like Keycloak and serves its discovery document and key
+set through a mock HTTP transport; `auth_app` builds the app with sign-in on and that fake provider.
+
+#### `FakeIdP.__init__()` · `backend/tests/test_auth.py`
+
+- Creates one RSA key (`key-1`), an empty request log, and an "up" switch.
+
+#### `FakeIdP.handler()` · `backend/tests/test_auth.py`
+
+- Answers discovery and JWKS requests (or 503 when `down`), and records every path.
+
+#### `FakeIdP.jwk()` · `backend/tests/test_auth.py`
+
+- One public key as a JWK with its `kid`.
+
+#### `FakeIdP.client()` · `backend/tests/test_auth.py`
+
+- An `httpx.AsyncClient` that talks to `handler`.
+
+#### `FakeIdP.token()` · `backend/tests/test_auth.py`
+
+- A Keycloak-like access token for a user (roles from `USERS`), with any claim overridable (`exp`, `aud`, `iss`...), a chosen `kid`, or a different signing key.
+
+#### `idp()` · `backend/tests/test_auth.py`
+
+- Fixture: a fresh `FakeIdP`.
+
+#### `auth_app()` · `backend/tests/test_auth.py`
+
+- Helper: an `AppClient` with `AUTH_ENABLED=true`, the test issuer, and a `TokenVerifier` using the fake provider.
+
+#### `bearer()` · `backend/tests/test_auth.py`
+
+- Helper: `{"Authorization": "Bearer <token>"}`.
+
+#### `test_each_user_gets_their_roles_and_permissions()` · `backend/tests/test_auth.py`
+
+- **Proves:** `/v1/me` gives alice admin permissions (incl. `tools:admin`), bob editor ones, carol exactly the four user permissions, with name and email.
+
+#### `test_missing_token_is_401_with_a_bearer_challenge()` · `backend/tests/test_auth.py`
+
+- **Proves:** no token or a Basic header → 401 `auth_required` with `WWW-Authenticate: Bearer`; `/health` and `/v1/auth/config` stay public.
+
+#### `test_bad_tokens_are_rejected()` · `backend/tests/test_auth.py`
+
+- **Proves:** expired, wrong audience, wrong issuer, bad signature, unknown key, `alg: none`, HS256 and garbage tokens → 401 `invalid_token` with the right reason.
+
+#### `test_keys_are_discovered_cached_and_refetched_after_rotation()` · `backend/tests/test_auth.py`
+
+- **Proves:** keys are discovered and fetched once for several requests; a token from a newly rotated key triggers one more fetch and is accepted.
+
+#### `test_configured_jwks_url_skips_discovery()` · `backend/tests/test_auth.py`
+
+- **Proves:** with `OIDC_JWKS_URL` set, only the key set is fetched.
+
+#### `test_provider_down()` · `backend/tests/test_auth.py`
+
+- **Proves:** no reachable provider and no cached keys → 503 `auth_unavailable`; with keys cached, a provider outage during a refresh keeps working.
+
+#### `ListHandler.__init__()` · `backend/tests/test_auth.py`
+
+- A logging handler that keeps records in a list (the app replaces the root log handlers, so pytest's capture misses them).
+
+#### `ListHandler.emit()` · `backend/tests/test_auth.py`
+
+- Saves one record.
+
+#### `test_request_log_names_the_user()` · `backend/tests/test_auth.py`
+
+- **Proves:** the `request` log line carries `user: "carol"`.
+
+#### `test_permission_matrix()` · `backend/tests/test_auth.py`
+
+- **Proves:** carol reads prompts but can't create them (403); bob creates one (`created_by: "bob"`) but can't manage MCP servers; alice can; chat needs a token (401) and `chat:use` (403 for a user with no platform role).
+
+#### `test_model_roles_limit_who_may_use_a_model()` · `backend/tests/test_auth.py`
+
+- **Proves:** with `MODEL_ROLES`, carol's model list hides the limited model and gets another default; her chat (blocking and stream) with it → 403; alice's works.
+
+#### `test_mcp_server_roles_limit_who_may_use_its_tools()` · `backend/tests/test_auth.py`
+
+- **Proves:** a server limited to editors is listed for bob and alice, not carol; carol's chat naming it → 404; bob's chat runs its tool; opening it to everyone makes it visible to carol.
+
+#### `test_collection_roles_hide_collections()` · `backend/tests/test_auth.py`
+
+- **Proves:** (Postgres) a collection limited to editors is hidden from carol's list, 404 on get and in chat; carol can't create collections; bob uploads (`created_by: "bob"`) and opens it to everyone with `PATCH`.
+
+#### `test_dev_mode_acts_as_the_dev_user()` · `backend/tests/test_auth.py`
+
+- **Proves:** with sign-in off, `/v1/me` is the dev admin (`is_dev`) and the config says `enabled: false`.
+
+#### `test_dev_user_roles_can_be_lowered()` · `backend/tests/test_auth.py`
+
+- **Proves:** `DEV_USER_ROLES=eap-user` gives the dev user only user permissions.
+
+#### `test_auth_needs_an_issuer()` · `backend/tests/test_auth.py`
+
+- **Proves:** `AUTH_ENABLED=true` without `OIDC_ISSUER` fails at startup.
+
+#### `test_permissions_and_resource_rules()` · `backend/tests/test_auth.py`
+
+- **Proves:** unknown roles give nothing, permissions combine, and `allowed_roles` rules (empty = everyone, admins always) hold.
+
+#### `test_writes_need_the_editor_role()` · `backend/tests/test_prompts_api.py`
+
+- **Proves:** a dev user with `eap-user` gets 403 (message names `prompts:write`) for creating a prompt but can read; with `eap-editor` it's created, `created_by: "dev"`.
+
+#### `test_server_management_needs_the_admin_role()` · `backend/tests/test_tools_api.py`
+
+- **Proves:** an editor gets 403 on `/v1/tools/servers` and `/v1/tools/presets` but can read `/v1/tools`; the default dev admin creates a server (`created_by: "dev"`).
+
+---
+
+## 17. Debugging cheat sheet
 
 | Symptom | Most likely cause | Where to look |
 |---|---|---|
@@ -4783,7 +5151,6 @@ stdio (the demo server and `backend/tests/mcp_test_server.py`), and one over HTT
 | 409 `prompt_archived` | Prompt was archived | `GET /v1/prompts?include_archived=true` |
 | 409 `prompt_conflict` | Name already taken, or two saves at once | Retry; pick another name |
 | 400 `prompt_variable_missing` | A `{{ variable }}` has no value | The message lists the missing names; `render` |
-| 401 `admin_auth_required` | `ADMIN_API_KEY` set, header missing or wrong | Admin key field on the Prompts page |
 | Model ignores the prompt | Prompt not applied, or `system` overrides it | Send the same request to `mock/echo-system` to see the final system prompt |
 | Tables missing (`relation "prompts" does not exist`) | Migrations not run | `uv run alembic upgrade head` |
 | 503 `rag_unavailable` | No database, not Postgres, no embedder, or pgvector missing | The error message names which; `/health` → `rag`; `RagRuntime.check` |
@@ -4803,3 +5170,12 @@ stdio (the demo server and `backend/tests/mcp_test_server.py`), and one over HTT
 | Tool marked "changes data" but it's harmless | Its server sends no annotations (the MCP default is destructive) | Label only; switch it on if you trust it |
 | `finish_reason: "tool_calls"` | Round limit hit while the model still wanted tools | Raise `MCP_MAX_TOOL_ROUNDS`; check the trace for repeated failing calls |
 | Tool call "failed" in the trace | The tool's own error, a timeout, or a dropped connection | The trace's result text; the `tool call` log line |
+| 401 `auth_required` | No `Authorization: Bearer` header (sign-in on) | Sign in; check the frontend sends the token (`authHeaders`) |
+| 401 `invalid_token` "expired" | Token older than its lifetime and not renewed | Reload; check silent renew (Keycloak session still valid?) |
+| 401 "not meant for this API" | Token `aud` lacks `OIDC_AUDIENCE` | Keycloak: the audience mapper on the `eap-web` client |
+| 401 "issued by someone else" | `iss` ≠ `OIDC_ISSUER` (e.g. `localhost` vs `127.0.0.1`, or a trailing path) | Decode the token; set `OIDC_ISSUER` to its exact `iss` |
+| 503 `auth_unavailable` | The backend can't read the provider's keys | `OIDC_JWKS_URL` (Docker: the internal `keycloak:8080` address); is Keycloak up? |
+| 403 `forbidden` | The user's roles lack the permission (named in the message), or `MODEL_ROLES` | `/v1/me` → `permissions`; roles in Keycloak |
+| 404 for a collection or MCP server that exists | Its `allowed_roles` don't include the user's roles | Its access line on the Knowledge / Tools page |
+| Nav shows "sign-in off" | `AUTH_ENABLED=false`: everyone is the dev user | Set `AUTH_ENABLED=true` and `OIDC_ISSUER` |
+| Sign-in loops back to the sign-in screen | Redirect URI or web origin not allowed in Keycloak, or the token is rejected | Browser console; Keycloak client `eap-web` redirect URIs; backend log |

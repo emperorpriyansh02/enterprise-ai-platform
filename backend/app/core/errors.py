@@ -4,6 +4,8 @@ Provider adapters translate their SDK's exceptions into the `Provider*Error` cla
 so the API returns the same error shape no matter which LLM vendor failed.
 """
 
+from typing import ClassVar
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -11,6 +13,7 @@ from fastapi.responses import JSONResponse
 class AppError(Exception):
     status_code = 500
     code = "internal_error"
+    headers: ClassVar[dict[str, str] | None] = None  # extra response headers (e.g. WWW-Authenticate)
 
     def __init__(self, message: str, *, provider: str | None = None) -> None:
         super().__init__(message)
@@ -106,13 +109,6 @@ class PromptStoreUnavailableError(AppError):
 
     status_code = 503
     code = "prompt_store_unavailable"
-
-
-class AdminAuthError(AppError):
-    """Missing or wrong X-Admin-Key header. Temporary until RBAC (Layer 5)."""
-
-    status_code = 401
-    code = "admin_auth_required"
 
 
 # --- Knowledge bases / RAG (Layer 3) ---
@@ -219,7 +215,41 @@ class SecretKeyMissingError(AppError):
     code = "secret_key_missing"
 
 
+# --- Auth: RBAC + OAuth (Layer 5) ---
+
+
+class AuthRequiredError(AppError):
+    """No `Authorization: Bearer <token>` header."""
+
+    status_code = 401
+    code = "auth_required"
+    headers: ClassVar[dict[str, str] | None] = {"WWW-Authenticate": "Bearer"}
+
+
+class InvalidTokenError(AppError):
+    """The token is malformed, expired, for another audience or issuer, or its signature is wrong."""
+
+    status_code = 401
+    code = "invalid_token"
+    headers: ClassVar[dict[str, str] | None] = {"WWW-Authenticate": 'Bearer error="invalid_token"'}
+
+
+class ForbiddenError(AppError):
+    """Signed in, but the user's roles don't allow this."""
+
+    status_code = 403
+    code = "forbidden"
+
+
+class AuthUnavailableError(AppError):
+    """The identity provider's signing keys can't be fetched, so no token can be checked."""
+
+    status_code = 503
+    code = "auth_unavailable"
+
+
 def register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def _handle_app_error(_: Request, exc: AppError) -> JSONResponse:
-        return JSONResponse(status_code=exc.status_code, content={"error": exc.to_dict()})
+        body = {"error": exc.to_dict()}
+        return JSONResponse(status_code=exc.status_code, content=body, headers=exc.headers)

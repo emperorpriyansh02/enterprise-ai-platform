@@ -5,9 +5,9 @@ List settings (e.g. `OPENAI_MODELS`) accept a comma-separated string:
 """
 
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Self
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 CsvList = Annotated[list[str], NoDecode]
@@ -66,9 +66,6 @@ class Settings(BaseSettings):
     # --- Prompts (Layer 2) ---
     # Prompt used when a chat request has neither `prompt` nor `system`. Blank = none.
     default_prompt_name: str | None = None
-    # Required in the X-Admin-Key header for prompt changes. Blank = no check (dev only).
-    # Temporary until RBAC (Layer 5).
-    admin_api_key: SecretStr | None = None
 
     # --- Knowledge bases / RAG (Layer 3). Needs DATABASE_URL on Postgres with pgvector. ---
     # openai | gemini | ollama | mock. Blank = first available, in that order.
@@ -94,6 +91,27 @@ class Settings(BaseSettings):
     mcp_connect_timeout_s: float = Field(default=20, gt=0)
     mcp_max_result_chars: int = Field(default=20_000, ge=500, description="Longer tool results are cut.")
 
+    # --- Auth: RBAC + OAuth (Layer 5) ---
+    # Off = every request acts as a built-in dev user with DEV_USER_ROLES (local development only).
+    auth_enabled: bool = False
+    # The identity provider's issuer, exactly as in the tokens' `iss`, e.g. http://localhost:8080/realms/eap
+    oidc_issuer: str | None = None
+    # Tokens must list this in `aud` (Keycloak: an audience mapper on the web client).
+    oidc_audience: str = "eap-api"
+    # The public client the frontend signs in with (authorization code + PKCE).
+    oidc_client_id: str = "eap-web"
+    oidc_scope: str = "openid profile email"
+    # Where to fetch signing keys. Blank = discover from {OIDC_ISSUER}/.well-known/openid-configuration.
+    # Set it when the backend reaches the provider at another address
+    # (in Docker: http://keycloak:8080/realms/eap/protocol/openid-connect/certs).
+    oidc_jwks_url: str | None = None
+    oidc_jwks_cache_s: float = Field(default=600, gt=0, description="Re-read signing keys after this long.")
+    # Roles of the dev user when AUTH_ENABLED=false.
+    dev_user_roles: CsvList = ["eap-admin"]
+    # Limit models to roles, as JSON. Unlisted models are open to every role. Example:
+    #   MODEL_ROLES={"anthropic/claude-opus-5-5": ["eap-admin", "eap-editor"]}
+    model_roles: dict[str, list[str]] = Field(default_factory=dict)
+
     @field_validator(
         "cors_origins",
         "anthropic_models",
@@ -101,6 +119,7 @@ class Settings(BaseSettings):
         "openai_models",
         "gemini_models",
         "ollama_models",
+        "dev_user_roles",
         mode="before",
     )
     @classmethod
@@ -115,10 +134,11 @@ class Settings(BaseSettings):
         "ollama_base_url",
         "database_url",
         "default_prompt_name",
-        "admin_api_key",
         "embedding_provider",
         "embedding_model",
         "secret_key",
+        "oidc_issuer",
+        "oidc_jwks_url",
         mode="before",
     )
     @classmethod
@@ -126,6 +146,14 @@ class Settings(BaseSettings):
         if isinstance(value, str) and not value.strip():
             return None
         return value
+
+    @model_validator(mode="after")
+    def _check_auth(self) -> Self:
+        if self.auth_enabled and not self.oidc_issuer:
+            raise ValueError("AUTH_ENABLED=true needs OIDC_ISSUER (e.g. http://localhost:8080/realms/eap)")
+        if self.oidc_issuer:
+            self.oidc_issuer = self.oidc_issuer.rstrip("/")
+        return self
 
 
 @lru_cache

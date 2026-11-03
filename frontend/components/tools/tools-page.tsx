@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { ALERT, PRIMARY } from "@/components/knowledge/styles";
-import { AdminKeyInput, useAdminKey } from "@/components/prompts/admin-key";
+import { useAuth } from "@/components/auth-provider";
 import { listMcpServers, type McpServer } from "@/lib/api";
 
 import { toolsError } from "./messages";
@@ -11,7 +11,8 @@ import ServerForm from "./server-form";
 import ServerPanel from "./server-panel";
 
 export default function ToolsPage() {
-  const [adminKey, setAdminKey] = useAdminKey();
+  const { can } = useAuth();
+  const isAdmin = can("tools:admin");
   const [servers, setServers] = useState<McpServer[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -19,10 +20,11 @@ export default function ToolsPage() {
   const [creating, setCreating] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
 
-  // Load on first view, when the admin key changes (the list needs it), and after each change.
+  // Load on first view and after each change. Only admins may manage servers.
   useEffect(() => {
+    if (!isAdmin) return;
     let cancelled = false;
-    listMcpServers(adminKey)
+    listMcpServers()
       .then((list) => {
         if (cancelled) return;
         setServers(list.data);
@@ -39,10 +41,19 @@ export default function ToolsPage() {
     return () => {
       cancelled = true;
     };
-  }, [adminKey, refreshKey]);
+  }, [isAdmin, refreshKey]);
 
   const reload = useCallback(() => setRefreshKey((k) => k + 1), []);
   const current = servers.find((s) => s.name === selected);
+
+  if (!isAdmin) {
+    return (
+      <p role="alert" className={`m-auto max-w-md ${ALERT}`}>
+        Managing MCP servers needs the Admin role. You can still use the tools an admin switched on from the
+        chat&apos;s <strong>Tools</strong> menu.
+      </p>
+    );
+  }
 
   return (
     <div className="mx-auto flex min-h-0 w-full max-w-6xl flex-1 flex-col px-4">
@@ -54,7 +65,6 @@ export default function ToolsPage() {
             off.
           </p>
         </div>
-        <AdminKeyInput value={adminKey} onChange={setAdminKey} />
         <button
           type="button"
           className={PRIMARY}
@@ -121,7 +131,6 @@ export default function ToolsPage() {
         <section aria-label="Server details" className="min-w-0">
           {creating ? (
             <ServerForm
-              adminKey={adminKey}
               onCancel={() => setCreating(false)}
               onCreated={(name) => {
                 setCreating(false);
@@ -133,7 +142,6 @@ export default function ToolsPage() {
             <ServerPanel
               key={current.name}
               server={current}
-              adminKey={adminKey}
               onChanged={reload}
               onDeleted={() => {
                 setSelected(null);

@@ -5,6 +5,7 @@ from typing import Any, Literal, Self
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.auth.permissions import RoleName
 from app.prompts.schemas import NAME_PATTERN
 
 # --- Requests ---
@@ -19,6 +20,9 @@ class ServerCreate(BaseModel):
     env: dict[str, str] = Field(default_factory=dict, description="stdio only. Stored encrypted.")
     url: str | None = Field(default=None, max_length=2000, examples=["https://mcp.example.com/mcp"])
     headers: dict[str, str] = Field(default_factory=dict, description="http only. Stored encrypted.")
+    allowed_roles: list[RoleName] = Field(
+        default_factory=list, description="Roles whose chats may use its tools. Empty = everyone."
+    )
 
     @model_validator(mode="after")
     def _check_transport(self) -> Self:
@@ -32,6 +36,7 @@ class ServerCreate(BaseModel):
 class ServerUpdate(BaseModel):
     description: str | None = Field(default=None, max_length=500)
     enabled: bool | None = None
+    allowed_roles: list[RoleName] | None = Field(default=None, description="Empty list = everyone.")
 
 
 class ToolUpdate(BaseModel):
@@ -70,7 +75,8 @@ class ServerOut(BaseModel):
     url: str | None
     header_names: list[str] = Field(description="Names only; values are never returned.")
     enabled: bool
-    allowed_roles: list[str]
+    allowed_roles: list[str] = Field(description="Roles whose chats may use its tools. Empty = everyone.")
+    created_by: str | None = None
     last_error: str | None
     last_connected_at: datetime | None
     tools: list[ToolOut]

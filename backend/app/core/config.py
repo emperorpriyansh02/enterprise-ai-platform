@@ -106,6 +106,19 @@ class Settings(BaseSettings):
     # (in Docker: http://keycloak:8080/realms/eap/protocol/openid-connect/certs).
     oidc_jwks_url: str | None = None
     oidc_jwks_cache_s: float = Field(default=600, gt=0, description="Re-read signing keys after this long.")
+    # --- Guardrails (Layer 6). Policies live in the database; without one, the built-in defaults apply. ---
+    guardrails_enabled: bool = True
+    # A cheap model as a second opinion for injection, harmful content and topics, e.g.
+    # anthropic/claude-haiku-5-5. Blank = rules only (no extra model call).
+    guardrail_judge_model: str | None = None
+    guardrail_judge_timeout_s: float = Field(default=10, gt=0)
+    # If the judge fails (timeout, bad answer): true = treat as flagged (safer), false = rules decide.
+    guardrail_fail_closed: bool = False
+    guardrail_cache_s: float = Field(default=30, ge=0, description="Re-read policies after this long.")
+    guardrail_max_scan_chars: int = Field(
+        default=100_000, ge=1000, description="Longer texts: only the start."
+    )
+
     # Roles of the dev user when AUTH_ENABLED=false.
     dev_user_roles: CsvList = ["eap-admin"]
     # Limit models to roles, as JSON. Unlisted models are open to every role. Example:
@@ -139,6 +152,7 @@ class Settings(BaseSettings):
         "secret_key",
         "oidc_issuer",
         "oidc_jwks_url",
+        "guardrail_judge_model",
         mode="before",
     )
     @classmethod

@@ -30,6 +30,13 @@ _EXTRA_FIELDS = (
     "tool_rounds",
     # Layer 5: who made the request
     "user",
+    # Layer 6: guardrails
+    "guardrails",
+    "policy",
+    "stage",
+    "action",
+    "detector",
+    "findings",
 )
 
 

@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1.auth import router as auth_router
 from app.api.v1.collections import router as collections_router
+from app.api.v1.guardrails import router as guardrails_router
 from app.api.v1.prompts import router as prompts_router
 from app.api.v1.routes import health_router, router
 from app.api.v1.tools import router as tools_router
@@ -19,6 +20,7 @@ from app.core.config import Settings, get_settings
 from app.core.errors import register_error_handlers
 from app.core.logging import configure_logging
 from app.db.session import Database
+from app.guardrails.runtime import GuardrailRuntime
 from app.llm.registry import ProviderRegistry
 from app.mcp.manager import MCPManager
 from app.rag.embeddings import build_embedder
@@ -45,6 +47,8 @@ def create_app(
         app.state.rag = RagRuntime(app.state.database, embedder, settings)
         await app.state.rag.start()
         app.state.mcp = MCPManager(settings)  # connects to MCP servers on first use
+        app.state.guardrails = GuardrailRuntime(app.state.database, app.state.registry, settings)
+        await app.state.guardrails.start()  # adds built-in policies, starts the event writer
         app.state.auth = auth or (TokenVerifier(settings) if settings.auth_enabled else None)
         if settings.auth_enabled:
             logger.info(
@@ -60,6 +64,7 @@ def create_app(
         if app.state.auth is not None and auth is None:
             await app.state.auth.aclose()
         await app.state.mcp.aclose()  # also stops stdio server processes
+        await app.state.guardrails.stop()  # saves queued events
         await app.state.rag.stop()
         await app.state.registry.aclose()
         if app.state.database is not None and database is None:  # close only what we opened
@@ -102,6 +107,7 @@ def create_app(
     app.include_router(prompts_router)
     app.include_router(collections_router)
     app.include_router(tools_router)
+    app.include_router(guardrails_router)
     return app
 
 

@@ -51,6 +51,7 @@ class Database:
 
     def _tables(self) -> list:
         """Every table, except the Postgres-only ones (pgvector) when this isn't Postgres."""
+        import app.guardrails.models
         import app.mcp.models
         import app.prompts.models
         import app.rag.models  # noqa: F401

@@ -4,6 +4,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.guardrails.schemas import GuardrailTrace
 from app.mcp.schemas import ToolCallTrace, ToolsRef
 from app.prompts.schemas import PromptRef, PromptUsed
 from app.rag.schemas import Citation, RagRef
@@ -82,16 +83,25 @@ class ChatResponse(BaseModel):
             "`tool_calls`, the model still wanted tools when the round limit (MCP_MAX_TOOL_ROUNDS) was hit."
         ),
     )
+    guardrails: list[GuardrailTrace] | None = Field(
+        default=None,
+        description=(
+            "Guardrail policies that fired (Layer 6; [] = none). A block gives finish_reason "
+            "`content_filter` "
+            "and the policy's message as `content`."
+        ),
+    )
 
 
 class StreamEvent(BaseModel):
     """One server-sent event on /v1/chat/stream.
 
-    Order: one `start`, then `delta` text and (when tools are used) `tool_call` / `tool_result` pairs,
-    then exactly one `done` or `error`.
+    Order: one `start`, then `delta` text, `tool_call` / `tool_result` pairs (when tools are used) and
+    `guardrail` events (when a policy fires), then exactly one `done` or `error`. A `guardrail` event
+    with action `blocked` at stage `output` means: replace what was shown with its `message`.
     """
 
-    type: Literal["start", "delta", "tool_call", "tool_result", "done", "error"]
+    type: Literal["start", "delta", "tool_call", "tool_result", "guardrail", "done", "error"]
     id: str
     provider: str | None = None
     model: str | None = None
@@ -102,6 +112,7 @@ class StreamEvent(BaseModel):
     prompt: PromptUsed | None = None
     citations: list[Citation] | None = None  # on `start`, when `rag` was used
     tool: ToolCallTrace | None = None  # on `tool_call` (no result yet) and `tool_result`
+    guardrail: GuardrailTrace | None = None  # on `guardrail`
     error: dict | None = None
 
 

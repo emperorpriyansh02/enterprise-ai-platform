@@ -64,11 +64,14 @@ def parse_sse(text: str) -> list[dict]:
     return [json.loads(line[len("data: ") :]) for line in text.splitlines() if line.startswith("data: ")]
 
 
-def test_stream(client: TestClient):
-    with client.stream("POST", "/v1/chat/stream", json=HELLO) as response:
-        assert response.status_code == 200
-        assert response.headers["content-type"].startswith("text/event-stream")
-        events = parse_sse(response.read().decode())
+def test_stream():
+    # Guardrails off: they hold back the last few dozen characters (to mask PII split across chunks),
+    # which would merge this short reply into one delta. Guarded streaming: tests/test_guardrails_chat.py.
+    with TestClient(create_app(make_settings(guardrails_enabled=False))) as client:
+        with client.stream("POST", "/v1/chat/stream", json=HELLO) as response:
+            assert response.status_code == 200
+            assert response.headers["content-type"].startswith("text/event-stream")
+            events = parse_sse(response.read().decode())
 
     assert [e["type"] for e in events] == ["start", "delta", "delta", "delta", "done"]
     assert "".join(e["delta"] for e in events if e["type"] == "delta") == "Echo: hello world"

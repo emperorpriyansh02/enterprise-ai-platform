@@ -18,10 +18,14 @@ from app.core.config import Settings
 from app.core.errors import (
     AuthRequiredError,
     ForbiddenError,
+    GuardrailsUnavailableError,
     PromptStoreUnavailableError,
     ToolsUnavailableError,
 )
 from app.db.session import Database
+from app.guardrails.engine import GuardrailEngine
+from app.guardrails.runtime import GuardrailRuntime
+from app.guardrails.service import GuardrailService
 from app.llm.registry import ProviderRegistry
 from app.mcp.manager import MCPManager
 from app.mcp.service import MCPService
@@ -137,6 +141,23 @@ def require_mcp_service(service: Annotated[MCPService | None, Depends(get_mcp_se
     return service
 
 
+def get_guardrail_service(
+    request: Request,
+    session: Annotated[AsyncSession | None, Depends(get_db_session)],
+    principal: CurrentUser,
+) -> GuardrailService:
+    """Policy management (Layer 6). 503 without a database: chats then use the built-in defaults."""
+    if session is None:
+        raise GuardrailsUnavailableError("Managing guardrail policies needs a database. Set DATABASE_URL.")
+    return GuardrailService(session, request.app.state.guardrails, principal=principal)
+
+
+async def get_guardrail_engine(request: Request, principal: CurrentUser) -> GuardrailEngine | None:
+    """The guardrail policies in force for this request, or None when GUARDRAILS_ENABLED=false."""
+    runtime: GuardrailRuntime = request.app.state.guardrails
+    return await runtime.engine(principal.username)
+
+
 def get_chat_service(
     request: Request,
     session: Annotated[AsyncSession | None, Depends(get_db_session)],
@@ -144,6 +165,7 @@ def get_chat_service(
     rag: Annotated[RagService | None, Depends(get_rag_service)],
     tools: Annotated[MCPService | None, Depends(get_mcp_service)],
     principal: Annotated[Principal, Depends(require(CHAT))],
+    guardrails: Annotated[GuardrailEngine | None, Depends(get_guardrail_engine)],
 ) -> ChatService:
     settings = get_settings_from_app(request)
     return ChatService(
@@ -156,4 +178,5 @@ def get_chat_service(
         release_db=session.close if session is not None else None,
         principal=principal,
         model_roles=settings.model_roles,
+        guardrails=guardrails,
     )

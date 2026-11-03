@@ -215,6 +215,35 @@ class SecretKeyMissingError(AppError):
     code = "secret_key_missing"
 
 
+# --- Guardrails (Layer 6) ---
+
+
+class GuardrailPolicyNotFoundError(AppError):
+    status_code = 404
+    code = "guardrail_policy_not_found"
+
+
+class GuardrailsUnavailableError(AppError):
+    """Managing policies needs the database (chats still get the built-in defaults without one)."""
+
+    status_code = 503
+    code = "guardrails_unavailable"
+
+
+class GuardrailConfigError(AppError):
+    """A policy's config doesn't fit its kind (e.g. a bad regex)."""
+
+    status_code = 422
+    code = "guardrail_config_invalid"
+
+
+class GuardrailPolicyConflictError(AppError):
+    """The name is taken, or a built-in policy was asked to be deleted (disable it instead)."""
+
+    status_code = 409
+    code = "guardrail_policy_conflict"
+
+
 # --- Auth: RBAC + OAuth (Layer 5) ---
 
 

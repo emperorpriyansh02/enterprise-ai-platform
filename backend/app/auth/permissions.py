@@ -5,7 +5,7 @@ what a role can do is reviewed like any other code change.
 
     eap-user    chat, read prompts and knowledge bases, use tools
     eap-editor  everything a user can, plus change prompts and knowledge bases
-    eap-admin   everything, including MCP server management; passes every per-resource rule
+    eap-admin   everything, including MCP servers and guardrail policies; passes every per-resource rule
 
 Per-resource rules: a collection or MCP server may list `allowed_roles`; empty means everyone.
 Models may be limited with the MODEL_ROLES setting; models not listed are open to every role.
@@ -27,10 +27,11 @@ KNOWLEDGE_READ = "knowledge:read"
 KNOWLEDGE_WRITE = "knowledge:write"
 TOOLS_USE = "tools:use"
 TOOLS_ADMIN = "tools:admin"
+GUARDRAILS_ADMIN = "guardrails:admin"
 
 _USER = frozenset({CHAT, PROMPTS_READ, KNOWLEDGE_READ, TOOLS_USE})
 _EDITOR = _USER | {PROMPTS_WRITE, KNOWLEDGE_WRITE}
-_ADMIN = _EDITOR | {TOOLS_ADMIN}
+_ADMIN = _EDITOR | {TOOLS_ADMIN, GUARDRAILS_ADMIN}
 ROLE_PERMISSIONS: dict[str, frozenset[str]] = {USER: _USER, EDITOR: _EDITOR, ADMIN: _ADMIN}
 
 

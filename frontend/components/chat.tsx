@@ -4,10 +4,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   ApiError,
+  type AvailableServer,
   type Citation,
   type CollectionSummary,
   type FinishReason,
   getModels,
+  listAvailableTools,
   listCollections,
   listPrompts,
   type Message,
@@ -15,6 +17,7 @@ import {
   type PromptSummary,
   type PromptUsed,
   streamChat,
+  type ToolCallTrace,
   type Usage,
   type VariableValues,
 } from "@/lib/api";
@@ -27,6 +30,7 @@ interface Turn {
   stopped?: boolean;
   error?: string;
   citations?: Citation[]; // knowledge-base sources given to the model (from the `start` event)
+  tools?: ToolCallTrace[]; // tools the model called while answering (no `result` yet = still running)
   meta?: {
     provider?: string;
     model?: string;
@@ -41,6 +45,7 @@ const FINISH_NOTES: Partial<Record<FinishReason, string>> = {
   length: "Stopped early: reached the max token limit.",
   refusal: "The model declined this request.",
   content_filter: "Blocked by the provider's safety filter.",
+  tool_calls: "Stopped: the model still wanted tools when the tool-round limit was reached.",
 };
 
 let keyCounter = 0;
@@ -62,6 +67,9 @@ export default function Chat() {
   const [collections, setCollections] = useState<CollectionSummary[]>([]);
   const [ragNames, setRagNames] = useState<string[]>([]);
   const [showKnowledge, setShowKnowledge] = useState(false);
+  const [toolServers, setToolServers] = useState<AvailableServer[]>([]);
+  const [toolNames, setToolNames] = useState<string[]>([]);
+  const [showTools, setShowTools] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -110,6 +118,17 @@ export default function Chat() {
     return () => controller.abort();
   }, []);
 
+  useEffect(() => {
+    const controller = new AbortController();
+    listAvailableTools(controller.signal)
+      .then((list) => {
+        setToolServers(list.data);
+        setToolNames((current) => current.filter((n) => list.data.some((s) => s.name === n)));
+      })
+      .catch(() => setToolServers([])); // tools not configured: chat works without them
+    return () => controller.abort();
+  }, []);
+
   const selectedPrompt = prompts.find((p) => p.name === promptName);
   const missingVars = (selectedPrompt?.active_variables ?? []).filter((v) => !promptVars[v]?.trim());
 
@@ -154,18 +173,38 @@ export default function Chat() {
               }
             : undefined,
           rag: ragNames.length > 0 ? { collections: ragNames } : undefined,
+          tools: toolNames.length > 0 ? { servers: toolNames } : undefined,
         },
         (event) => {
           switch (event.type) {
             case "start":
               updateTurn(assistantKey, (t) => ({
                 ...t,
-                meta: { provider: event.provider, model: event.model, prompt: event.prompt },
+                meta: {
+                  provider: event.provider,
+                  model: event.model,
+                  prompt: event.prompt,
+                },
                 citations: event.citations,
               }));
               break;
             case "delta":
-              updateTurn(assistantKey, (t) => ({ ...t, content: t.content + event.delta }));
+              updateTurn(assistantKey, (t) => ({
+                ...t,
+                content: t.content + event.delta,
+              }));
+              break;
+            case "tool_call":
+              updateTurn(assistantKey, (t) => ({
+                ...t,
+                tools: [...(t.tools ?? []), event.tool],
+              }));
+              break;
+            case "tool_result":
+              updateTurn(assistantKey, (t) => ({
+                ...t,
+                tools: (t.tools ?? []).map((call) => (call.id === event.tool.id ? event.tool : call)),
+              }));
               break;
             case "done":
               updateTurn(assistantKey, (t) => ({
@@ -182,7 +221,11 @@ export default function Chat() {
               }));
               break;
             case "error":
-              updateTurn(assistantKey, (t) => ({ ...t, streaming: false, error: event.error.message }));
+              updateTurn(assistantKey, (t) => ({
+                ...t,
+                streaming: false,
+                error: event.error.message,
+              }));
               break;
           }
         },
@@ -201,7 +244,19 @@ export default function Chat() {
       abortRef.current = null;
       setBusy(false);
     }
-  }, [busy, input, missingVars.length, model, promptVars, ragNames, selectedPrompt, system, turns, updateTurn]);
+  }, [
+    busy,
+    input,
+    missingVars.length,
+    model,
+    promptVars,
+    ragNames,
+    selectedPrompt,
+    system,
+    toolNames,
+    turns,
+    updateTurn,
+  ]);
 
   const stop = () => abortRef.current?.abort();
   const newChat = () => {
@@ -276,6 +331,18 @@ export default function Chat() {
             Knowledge{ragNames.length > 0 ? ` (${ragNames.length})` : ""}
           </button>
         )}
+        {toolServers.length > 0 && (
+          <button
+            type="button"
+            onClick={() => setShowTools((s) => !s)}
+            aria-expanded={showTools}
+            className={`rounded-md border px-2.5 py-1.5 text-sm hover:bg-surface ${
+              toolNames.length > 0 ? "border-accent text-accent" : "border-line"
+            }`}
+          >
+            Tools{toolNames.length > 0 ? ` (${toolNames.length})` : ""}
+          </button>
+        )}
         <button
           type="button"
           onClick={newChat}
@@ -303,6 +370,35 @@ export default function Chat() {
               />
               <span className="font-mono text-xs">{c.name}</span>
               <span className="text-xs text-muted">({c.documents.ready})</span>
+            </label>
+          ))}
+        </fieldset>
+      )}
+
+      {showTools && toolServers.length > 0 && (
+        <fieldset className="flex flex-col gap-2 border-b border-line py-3 text-sm">
+          <legend className="sr-only">Tools the model may use</legend>
+          <span className="text-xs text-muted">Let the model use tools from these servers:</span>
+          {toolServers.map((server) => (
+            <label key={server.name} className="flex items-start gap-1.5">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={toolNames.includes(server.name)}
+                disabled={busy}
+                onChange={(e) =>
+                  setToolNames((current) =>
+                    e.target.checked ? [...current, server.name] : current.filter((n) => n !== server.name),
+                  )
+                }
+              />
+              <span>
+                <span className="font-mono text-xs">{server.name}</span>
+                <span className="text-xs text-muted">
+                  {" "}
+                  · {server.tools.map((t) => t.name + (t.destructive ? " (changes data)" : "")).join(", ")}
+                </span>
+              </span>
             </label>
           ))}
         </fieldset>
@@ -380,13 +476,21 @@ export default function Chat() {
                       : "max-w-[85%] text-sm"
                   }
                 >
+                  {turn.tools && turn.tools.length > 0 && <ToolTrace calls={turn.tools} />}
                   {turn.content && <p className="whitespace-pre-wrap leading-relaxed">{turn.content}</p>}
-                  {turn.streaming && !turn.content && <p className="animate-pulse text-muted">Thinking…</p>}
+                  {turn.streaming && !turn.content && (
+                    <p className="animate-pulse text-muted">
+                      {turn.tools?.some((c) => c.result === undefined) ? "Running tools…" : "Thinking…"}
+                    </p>
+                  )}
                   {turn.streaming && turn.content && (
                     <span className="ml-0.5 inline-block h-4 w-1.5 animate-pulse bg-muted align-middle" />
                   )}
                   {turn.error && (
-                    <p role="alert" className="mt-1 rounded-md border border-danger/40 bg-danger/10 px-3 py-2">
+                    <p
+                      role="alert"
+                      className="mt-1 rounded-md border border-danger/40 bg-danger/10 px-3 py-2"
+                    >
                       {turn.error}
                     </p>
                   )}
@@ -409,7 +513,9 @@ export default function Chat() {
                                     · {c.collection} · part {c.position + 1}
                                   </span>
                                 </p>
-                                <p className="mt-0.5 line-clamp-3 whitespace-pre-wrap text-muted">{c.snippet}</p>
+                                <p className="mt-0.5 line-clamp-3 whitespace-pre-wrap text-muted">
+                                  {c.snippet}
+                                </p>
                               </li>
                             ))}
                           </ol>
@@ -485,5 +591,54 @@ export default function Chat() {
         </p>
       </form>
     </div>
+  );
+}
+
+/** The tools a reply used: one line each, with arguments and result behind a click. */
+function ToolTrace({ calls }: { calls: ToolCallTrace[] }) {
+  return (
+    <ol className="mb-2 flex flex-col gap-1 text-xs" aria-label="Tools used">
+      {calls.map((call) => {
+        const running = call.result === undefined;
+        return (
+          <li key={call.id} className="rounded-md border border-line">
+            <details>
+              <summary className="flex cursor-pointer items-center gap-2 px-2.5 py-1.5">
+                <span
+                  aria-hidden
+                  className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                    running ? "animate-pulse bg-muted" : call.is_error ? "bg-danger" : "bg-accent"
+                  }`}
+                />
+                <span className="font-mono">
+                  {call.server} · {call.tool}
+                </span>
+                <span className="ml-auto text-muted">
+                  {running
+                    ? "running…"
+                    : `${call.is_error ? "failed" : "done"}${call.duration_ms !== undefined ? ` · ${call.duration_ms} ms` : ""}`}
+                </span>
+              </summary>
+              <div className="border-t border-line px-2.5 py-1.5">
+                <p className="text-muted">Arguments</p>
+                <pre className="whitespace-pre-wrap break-all font-mono">
+                  {JSON.stringify(call.arguments, null, 2)}
+                </pre>
+                {!running && (
+                  <>
+                    <p className={`mt-1 ${call.is_error ? "text-danger" : "text-muted"}`}>
+                      {call.is_error ? "Error" : "Result"}
+                    </p>
+                    <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono">
+                      {call.result}
+                    </pre>
+                  </>
+                )}
+              </div>
+            </details>
+          </li>
+        );
+      })}
+    </ol>
   );
 }

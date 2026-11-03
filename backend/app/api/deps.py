@@ -8,9 +8,11 @@ from fastapi import Depends, Header, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
-from app.core.errors import AdminAuthError, PromptStoreUnavailableError
+from app.core.errors import AdminAuthError, PromptStoreUnavailableError, ToolsUnavailableError
 from app.db.session import Database
 from app.llm.registry import ProviderRegistry
+from app.mcp.manager import MCPManager
+from app.mcp.service import MCPService
 from app.prompts.service import PromptService
 from app.rag.runtime import RagRuntime
 from app.rag.service import RagService
@@ -70,12 +72,38 @@ async def require_rag_service(
     return service
 
 
+def get_mcp_service(
+    request: Request, session: Annotated[AsyncSession | None, Depends(get_db_session)]
+) -> MCPService | None:
+    """An MCPService for this request, or None when there's no database (no server registry)."""
+    if session is None:
+        return None
+    manager: MCPManager = request.app.state.mcp
+    return MCPService(session, manager, get_settings_from_app(request))
+
+
+def require_mcp_service(service: Annotated[MCPService | None, Depends(get_mcp_service)]) -> MCPService:
+    if service is None:
+        raise ToolsUnavailableError("MCP tools need a database for the server registry. Set DATABASE_URL.")
+    return service
+
+
 def get_chat_service(
     request: Request,
+    session: Annotated[AsyncSession | None, Depends(get_db_session)],
     prompts: Annotated[PromptService | None, Depends(get_prompt_service)],
     rag: Annotated[RagService | None, Depends(get_rag_service)],
+    tools: Annotated[MCPService | None, Depends(get_mcp_service)],
 ) -> ChatService:
-    return ChatService(get_registry(request), prompts, rag, request.app.state.rag)
+    return ChatService(
+        get_registry(request),
+        prompts,
+        rag,
+        request.app.state.rag,
+        tools,
+        max_tool_rounds=get_settings_from_app(request).mcp_max_tool_rounds,
+        release_db=session.close if session is not None else None,
+    )
 
 
 def require_admin(request: Request, x_admin_key: Annotated[str | None, Header()] = None) -> None:

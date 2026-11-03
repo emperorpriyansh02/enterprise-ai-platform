@@ -74,10 +74,14 @@ export default function PromptsPage() {
         </div>
       )}
 
-      <div className="grid flex-1 gap-6 overflow-y-auto py-4 md:grid-cols-[17rem_1fr]">
+      <div className="grid flex-1 grid-cols-[minmax(0,1fr)] gap-6 overflow-y-auto py-4 md:grid-cols-[17rem_minmax(0,1fr)]">
         <aside aria-label="Prompt list">
           <label className="mb-2 flex items-center gap-2 text-xs text-muted">
-            <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} />
+            <input
+              type="checkbox"
+              checked={showArchived}
+              onChange={(e) => setShowArchived(e.target.checked)}
+            />
             Show archived
           </label>
           {loading ? (
@@ -105,7 +109,9 @@ export default function PromptsPage() {
                         {p.archived ? "archived" : `v${p.active_version} of ${p.latest_version}`}
                       </span>
                     </span>
-                    {p.description && <span className="block truncate text-xs text-muted">{p.description}</span>}
+                    {p.description && (
+                      <span className="block truncate text-xs text-muted">{p.description}</span>
+                    )}
                   </button>
                 </li>
               ))}

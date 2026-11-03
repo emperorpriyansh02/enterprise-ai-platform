@@ -34,7 +34,8 @@ learn the code and to debug it.
 12. [Tests](#12-tests)
 13. [Prompts (Layer 2)](#13-prompts-layer-2)
 14. [Knowledge bases / RAG (Layer 3)](#14-knowledge-bases--rag-layer-3)
-15. [Debugging cheat sheet](#15-debugging-cheat-sheet)
+15. [MCP tools (Layer 4)](#15-mcp-tools-layer-4)
+16. [Debugging cheat sheet](#16-debugging-cheat-sheet)
 
 ---
 
@@ -49,15 +50,16 @@ What callers send and receive over HTTP.
 | Shape | What it holds | Example |
 |---|---|---|
 | `Message` | One chat message: `role` (`"user"` or `"assistant"`) and `content` (non-empty text). | `{"role": "user", "content": "Hi"}` |
-| `ChatRequest` | What the caller sends: `model` (optional `"provider/model"`), `messages` (at least one, first must be from the user), `prompt` (optional managed prompt: `{name, version?, variables}`, Layer 2), `system` (optional system prompt, or extra instructions added after `prompt`), `rag` (optional `{collections, top_k?}`: knowledge bases to search, Layer 3), `temperature` (0–2, optional), `max_tokens` (1–128,000, optional), `provider_options` (extra vendor settings, passed through). | `{"model": "openai/gpt-5", "prompt": {"name": "support-agent", "variables": {"company_name": "Acme"}}, "messages": [...]}` |
+| `ChatRequest` | What the caller sends: `model` (optional `"provider/model"`), `messages` (at least one, first must be from the user), `prompt` (optional managed prompt: `{name, version?, variables}`, Layer 2), `system` (optional system prompt, or extra instructions added after `prompt`), `rag` (optional `{collections, top_k?}`: knowledge bases to search, Layer 3), `tools` (optional `{servers}`: MCP servers whose enabled tools the model may call, Layer 4), `temperature` (0–2, optional), `max_tokens` (1–128,000, optional), `provider_options` (extra vendor settings, passed through). | `{"model": "openai/gpt-5", "prompt": {"name": "support-agent", "variables": {"company_name": "Acme"}}, "messages": [...]}` |
 | `Usage` | Token counts: `input_tokens`, `output_tokens`. | `{"input_tokens": 12, "output_tokens": 40}` |
-| `ChatResponse` | The full reply: `id`, `provider`, `model` (the one that actually answered), `content`, `finish_reason`, `usage`, `latency_ms`, `prompt` (`{name, version}` of the managed prompt used, or absent), `citations` (sources given to the model when `rag` was used; `[]` = none found). | see section 5 |
-| `StreamEvent` | One streaming event: `type` (`start`/`delta`/`done`/`error`), `id`, and depending on type: `provider`, `model`, `delta` (text piece), `finish_reason`, `usage`, `latency_ms`, `prompt` (on `start`/`done`), `citations` (on `start`), `error`. | `{"type": "delta", "id": "chat_…", "delta": "Hel"}` |
+| `ChatResponse` | The full reply: `id`, `provider`, `model` (the one that actually answered), `content`, `finish_reason`, `usage`, `latency_ms`, `prompt` (`{name, version}` of the managed prompt used, or absent), `citations` (sources given to the model when `rag` was used; `[]` = none found), `tool_calls` (tools the model called, when `tools` was used; `[]` = none; section 15). | see section 5 |
+| `StreamEvent` | One streaming event: `type` (`start`/`delta`/`tool_call`/`tool_result`/`done`/`error`), `id`, and depending on type: `provider`, `model`, `delta` (text piece), `finish_reason`, `usage`, `latency_ms`, `prompt` (on `start`/`done`), `citations` (on `start`), `tool` (on `tool_call`/`tool_result`: a `ToolCallTrace`), `error`. | `{"type": "delta", "id": "chat_…", "delta": "Hel"}` |
 | `ModelInfo` | One model you may call: `id` (`"provider/model"`), `provider`, `model`. | `{"id": "mock/echo", "provider": "mock", "model": "echo"}` |
 | `ModelList` | `default` (model id or null) + `data` (list of `ModelInfo`). | see section 4 |
 
 `finish_reason` is always one of: `stop` (finished normally), `length` (hit the token limit),
-`refusal` (model declined), `content_filter` (blocked by a safety filter), `other`.
+`refusal` (model declined), `content_filter` (blocked by a safety filter), `tool_calls` (the model
+asked for tools: inside the tool loop, or at the end when the round limit stopped it), `other`.
 
 ### Prompt shapes (`backend/app/prompts/schemas.py`, Layer 2)
 
@@ -102,9 +104,11 @@ What `ChatService` and the adapters pass between each other. Callers never see t
 
 | Shape | What it holds |
 |---|---|
-| `LLMRequest` | `model` (bare model name, **no** `provider/` prefix), `messages`, `system`, `temperature`, `max_tokens`, `provider_options`. |
-| `LLMResult` | `content` (reply text), `finish_reason`, `usage`, `model` (model that actually answered). |
-| `StreamChunk` | Either a text piece (`delta="Hel"`) or, when `done=True`, the final info: `finish_reason`, `usage`, `model`. |
+| `LLMRequest` | `model` (bare model name, **no** `provider/` prefix), `messages`, `system`, `temperature`, `max_tokens`, `provider_options`, `tools` (`ToolSpec`s offered, Layer 4), `turns` (tool rounds so far, as `ToolTurn`s). |
+| `LLMResult` | `content` (reply text), `finish_reason`, `usage`, `model` (model that actually answered), `tool_calls` (what the model wants run) and `provider_state` (its turn in the vendor's format, to replay). |
+| `StreamChunk` | Either a text piece (`delta="Hel"`) or, when `done=True`, the final info: `finish_reason`, `usage`, `model`, and `tool_calls` / `provider_state` as in `LLMResult`. |
+
+The tool shapes (`ToolSpec`, `ToolCall`, `ToolResult`, `ToolTurn`) are described in [section 15.1](#151-tool-shapes).
 
 ### Settings (`backend/app/core/config.py`)
 
@@ -143,14 +147,15 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 
 #### `lifespan()` · `backend/app/main.py`
 
-- **Where:** defined inside `create_app`. **Called by:** FastAPI, once at server start and once at shutdown. **Calls:** `ProviderRegistry.from_settings`, `Database.__init__`, `ProviderRegistry.aclose`, `Database.aclose`.
+- **Where:** defined inside `create_app`. **Called by:** FastAPI, once at server start and once at shutdown. **Calls:** `ProviderRegistry.from_settings`, `Database.__init__`, `build_embedder`, `RagRuntime.start`, `MCPManager.__init__`, `MCPManager.aclose`, `RagRuntime.stop`, `ProviderRegistry.aclose`, `Database.aclose`.
 - **Takes in:** `app`, the FastAPI app (given by FastAPI). Also uses `settings`, `registry` and `database` from `create_app`.
 - **What it does:**
   1. **Startup:** uses the given registry, or builds one from settings with `ProviderRegistry.from_settings()`, and stores it on `app.state.registry`.
   2. Uses the given database, or creates `Database(DATABASE_URL)` if that's set, or `None`. Stores it on `app.state.database` and logs `prompt store: enabled` / `disabled (no DATABASE_URL)`. No connection is opened yet, so a database that's down doesn't stop startup.
   3. Pauses (`yield`) while the server handles requests.
   3. With a database: picks the embedding provider (`build_embedder`), builds `RagRuntime` on `app.state.rag`, and starts its indexing worker (section 14). Without one, the runtime exists but reports RAG as disabled.
-  4. **Shutdown:** stops the RAG worker and embedder (`RagRuntime.stop`), calls `app.state.registry.aclose()` to close all network clients, then closes the database pool, but only if `lifespan` created it (a test's database is left for the test to close).
+  4. Creates the `MCPManager` on `app.state.mcp` (section 15). It connects to MCP servers only when a request first needs one.
+  5. **Shutdown:** closes every MCP connection (`MCPManager.aclose`, which also stops stdio server processes), stops the RAG worker and embedder (`RagRuntime.stop`), calls `app.state.registry.aclose()` to close all network clients, then closes the database pool, but only if `lifespan` created it (a test's database is left for the test to close).
 - **Gives back:** nothing. It's a startup/shutdown hook.
 - **Can fail with:** if building a provider fails (for example, an SDK rejects a setting), the server fails to start and the error is printed.
 - **Debug tips:** if any request fails with `AttributeError: 'State' object has no attribute 'registry'`, startup didn't run. In tests, use `with TestClient(app)` (the `with` triggers startup).
@@ -335,8 +340,8 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 
 - **Where:** route `GET /health`. **Called by:** FastAPI. **Calls:** `ProviderRegistry.provider_names`, `Database.ping`.
 - **Takes in:** `request` (to reach `app.state.database`) and `registry`, from `get_registry`.
-- **What it does:** reports that the server is up, which providers are enabled, the database status (`disabled` without `DATABASE_URL`, `ok` if it answered `SELECT 1`, `unavailable` if it didn't), and the knowledge-base status from `RagRuntime.status` (`ok`, `unavailable`, or `disabled`).
-- **Gives back:** `{"status": "ok", "providers": ["anthropic", "mock"], "database": "ok", "rag": "ok"}`.
+- **What it does:** reports that the server is up, which providers are enabled, the database status (`disabled` without `DATABASE_URL`, `ok` if it answered `SELECT 1`, `unavailable` if it didn't), the knowledge-base status from `RagRuntime.status` (`ok`, `unavailable`, or `disabled`), and `tools` (the MCP server registry lives in the database, so it's the same as `database`).
+- **Gives back:** `{"status": "ok", "providers": ["anthropic", "mock"], "database": "ok", "rag": "ok", "tools": "ok"}`.
 - **Can fail with:** nothing in normal operation; a database problem shows as `"unavailable"`, not an error.
 - **Debug tips:** used by Docker's health check. It does **not** contact any LLM vendor, so "ok" doesn't prove your API keys work.
 
@@ -400,7 +405,7 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 
 - **Where:** `backend/app/api/deps.py`. **Called by:** FastAPI, for the `chat` and `chat_stream` routes (via the `Service` dependency). **Calls:** `get_registry`, `ChatService.__init__`; FastAPI first runs `get_prompt_service` for it.
 - **Takes in:** `request`, the current HTTP request, and `prompts`, the `PromptService` (or `None` without a database) from `get_prompt_service`.
-- **What it does:** creates a new `ChatService` with the shared registry, this request's prompt service, its RAG service (from `get_rag_service`, or `None`), and the app's `RagRuntime`.
+- **What it does:** creates a new `ChatService` with the shared registry, this request's prompt service, its RAG service (from `get_rag_service`, or `None`), the app's `RagRuntime`, its MCP service (from `get_mcp_service`, or `None`), `MCP_MAX_TOOL_ROUNDS`, and `release_db` = the session's `close`, so the service can free the database connection before the (slow) model and tool calls.
 - **Gives back:** a `ChatService` object (cheap; one per request).
 - **Can fail with:** same as `get_registry`.
 - **Debug tips:** this is where request-scoped wiring lives; later layers (auth) will add their services here too.
@@ -409,7 +414,7 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 
 - **Where:** `ChatService` constructor. **Called by:** `get_chat_service`.
 - **Takes in:** `registry`, the `ProviderRegistry`, and `prompts`, a `PromptService` or `None` (no database).
-- **What it does:** keeps them for `complete`, `stream`, `_build_system` and `_retrieve`. Also takes `rag` (a `RagService` or `None`) and `rag_runtime` (for the "is RAG usable?" check).
+- **What it does:** keeps them for `complete`, `stream`, `_build_system` and `_retrieve`. Also takes `rag` (a `RagService` or `None`), `rag_runtime` (for the "is RAG usable?" check), `tools` (an `MCPService` or `None`), `max_tool_rounds`, and `release_db` (a callback that closes the request's database session).
 - **Gives back:** the service object.
 - **Can fail with:** nothing.
 - **Debug tips:** `prompts` is `None` exactly when `DATABASE_URL` isn't set.
@@ -427,24 +432,22 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 
 #### `ChatService.complete()` · `backend/app/services/chat_service.py`
 
-- **Where:** `ChatService`. **Called by:** the `chat` route. **Calls:** `ProviderRegistry.resolve`, `ChatService._build_system`, `_new_id`, `_to_llm_request`, the chosen adapter's `complete`, `_ms_since`, `_prompt_label`.
+- **Where:** `ChatService`. **Called by:** the `chat` route. **Calls:** `ChatService._prepare`, `_new_id`, the chosen adapter's `complete`, `_add_usage`, `ChatService._wants_tools`, `Toolbox.run`, `_turn`, `LLMRequest.with_turn`, `_ms_since`, `ChatService._log`.
 - **Takes in:** `request`, the validated `ChatRequest` from the caller.
 - **What it does:**
-  1. **Picks the provider:** `registry.resolve(request.model)` turns `"openai/gpt-5"` into (OpenAI adapter, `"gpt-5"`). A missing model means the default.
-  2. **Builds the system prompt** with `_build_system()`: managed prompt (rendered) + the request's own `system` text. Also gives back which prompt version was used. Then `_retrieve()` appends knowledge-base sources when the request has `rag` (section 14.8), and gives back the citations.
-  3. **Makes an id** like `chat_3f2a…` with `_new_id()`.
-  4. **Starts a timer.**
-  5. **Converts** the public request into an internal `LLMRequest` (`_to_llm_request`) and calls `provider.complete(...)`. This is where the vendor is contacted.
-  6. **Measures** how long it took (`_ms_since`).
-  7. **Logs** `chat completed` with request id, provider, model, prompt (e.g. `support-agent@v3`), latency, tokens and finish reason.
-  8. **Builds** the `ChatResponse`. `model` comes from the vendor's answer, so after a Claude refusal fallback it shows the fallback model. `prompt` is `{name, version}` when a managed prompt was used; `citations` is set when `rag` was used. The log line also records `sources` (how many passages were added).
+  1. **Prepares** with `_prepare()`: picks the provider (`registry.resolve` turns `"openai/gpt-5"` into (OpenAI adapter, `"gpt-5"`); a missing model means the default), builds the system prompt (`_build_system`: managed prompt + the request's own `system` text), appends knowledge-base sources when the request has `rag` (`_retrieve`, section 14.8), loads the MCP tools when it has `tools` (`_toolbox`, section 15), converts to an `LLMRequest`, and frees the database connection.
+  2. **Makes an id** like `chat_3f2a…` with `_new_id()` and **starts a timer.**
+  3. **Calls the model** with `provider.complete(...)`. This is where the vendor is contacted. Adds its tokens to the running total (`_add_usage`) and keeps its text.
+  4. **Tool loop:** if the model asked for tools and `_wants_tools()` allows another round, runs them all (`Toolbox.run`), adds the round to the request (`_turn` → `with_turn`) and goes back to step 3. Without `tools` in the request, no tools are offered, so this never happens.
+  5. **Measures** how long it took (`_ms_since`) and **logs** `chat completed` (`_log`) with request id, provider, model, prompt (e.g. `support-agent@v3`), sources, tool calls and rounds, latency, summed tokens and finish reason.
+  6. **Builds** the `ChatResponse`. `content` is the text of every round, joined by a blank line. `model` comes from the vendor's last answer, so after a Claude refusal fallback it shows the fallback model. `usage` is the total over all rounds. `prompt` is `{name, version}` when a managed prompt was used; `citations` is set when `rag` was used; `tool_calls` (the trace) when `tools` was used.
 - **Gives back:**
   ```json
   {"id": "chat_3f2a…", "provider": "openai", "model": "gpt-5-2026-01-01",
    "content": "Hello!", "finish_reason": "stop",
    "usage": {"input_tokens": 9, "output_tokens": 3}, "latency_ms": 812}
   ```
-- **Can fail with:** `ModelNotFoundError` (404) from `resolve`; prompt errors from `_build_system` (404/409/400/503, section 13); any `Provider*Error` from the adapter (see section 8). Nothing is logged as `chat completed` when it fails.
+- **Can fail with:** `ModelNotFoundError` (404) from `resolve`; prompt errors from `_build_system` (404/409/400/503, section 13); knowledge-base and tool errors from `_prepare` (sections 14, 15); any `Provider*Error` from the adapter (see section 8). A failing **tool** doesn't fail the request: its error goes back to the model. Nothing is logged as `chat completed` when it fails.
 - **Debug tips:**
   - `finish_reason: "length"` → raise `max_tokens`.
   - `"refusal"` / `"content_filter"` → the vendor declined; `content` may be empty.
@@ -452,7 +455,7 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 
 #### `ProviderRegistry.resolve()` · `backend/app/llm/registry.py`
 
-- **Where:** `ProviderRegistry`. **Called by:** `ChatService.complete`, `ChatService.stream`. **Calls:** `ProviderRegistry.default_model` (when no model is given).
+- **Where:** `ProviderRegistry`. **Called by:** `ChatService._prepare` (for `complete` and `stream`). **Calls:** `ProviderRegistry.default_model` (when no model is given).
 - **Takes in:** `model_ref`, the `model` field from the request (e.g. `"anthropic/claude-opus-5-5"`), or `None`.
 - **What it does:**
   1. If `model_ref` is empty, uses the default model. If there isn't one → error "No LLM providers are configured".
@@ -475,13 +478,14 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 
 #### `_to_llm_request()` · `backend/app/services/chat_service.py`
 
-- **Where:** module-level helper. **Called by:** `ChatService.complete`, `ChatService.stream`.
+- **Where:** module-level helper. **Called by:** `ChatService._prepare`.
 - **Takes in:**
   - `request`: the public `ChatRequest`.
   - `model`: the bare model name from `resolve` (e.g. `"gpt-5"`).
   - `system`: the final system prompt from `_build_system` (managed prompt + extra instructions), or `None`.
-- **What it does:** copies the fields into an internal `LLMRequest`, replacing `"openai/gpt-5"` with just `"gpt-5"` (the name the vendor understands) and the request's `system` with the final one.
-- **Gives back:** `LLMRequest(model="gpt-5", messages=[...], system=..., temperature=..., max_tokens=..., provider_options={...})`.
+  - `toolbox`: the tools for this message, or `None`.
+- **What it does:** copies the fields into an internal `LLMRequest`, replacing `"openai/gpt-5"` with just `"gpt-5"` (the name the vendor understands), the request's `system` with the final one, and setting `tools` to the toolbox's `ToolSpec`s (none without a toolbox).
+- **Gives back:** `LLMRequest(model="gpt-5", messages=[...], system=..., temperature=..., max_tokens=..., provider_options={...}, tools=[...])`.
 - **Can fail with:** nothing.
 - **Debug tips:** to see the exact system prompt a model receives, send the same request with `"model": "mock/echo-system"`.
 
@@ -519,17 +523,18 @@ All share `AppError`. Each class has a fixed HTTP `status_code` and `code`. See 
 
 #### `ChatService.stream()` · `backend/app/services/chat_service.py`
 
-- **Where:** `ChatService`. **Called by:** `chat_stream`. **Calls:** `ProviderRegistry.resolve`, `ChatService._build_system`, `_new_id`, `_to_llm_request`, the adapter's `stream`, `_ms_since`, `_prompt_label`, `AppError.to_dict`.
+- **Where:** `ChatService`. **Called by:** `chat_stream`. **Calls:** `ChatService._prepare`, `_new_id`, the adapter's `stream`, `_add_usage`, `ChatService._wants_tools`, `Toolbox.trace_for`, `Toolbox.run`, `_turn`, `LLMRequest.with_turn`, `_ms_since`, `ChatService._log`, `AppError.to_dict`.
 - **Takes in:** `request`, the validated `ChatRequest`.
 - **What it does:**
-  1. Picks the provider (`resolve`), builds the system prompt (`_build_system`), adds knowledge-base sources (`_retrieve`), makes an id, starts a timer, converts the request.
+  1. Prepares (`_prepare`: provider, system prompt, knowledge-base sources, tools, then frees the database), makes an id, starts a timer.
   2. Starts the adapter's stream and **waits for its first chunk**. Errors here are *raised* (not turned into events), so the route can still return an HTTP error. An adapter that yields nothing at all raises `ProviderError("Provider returned an empty stream")`.
   3. Yields `start` (id, provider, model, `prompt` if a managed prompt was used, and `citations` if `rag` was used).
   4. Loops over the adapter's chunks:
-     - a text chunk → yields `delta` with the text;
-     - the final chunk (`done=True`) → measures latency, logs `chat stream completed`, yields `done` with finish reason, usage, latency and `prompt`, then stops.
+     - a text chunk → yields `delta` with the text (the first text after a tool round starts with a blank line, so the streamed text equals the blocking reply's `content`);
+     - the final chunk with tool calls, when `_wants_tools()` allows another round → yields one `tool_call` event per call (no result yet), runs them (`Toolbox.run`), yields one `tool_result` event per call, adds the round to the request, and starts the adapter's stream again;
+     - the final chunk otherwise (`done=True`) → measures latency, logs `chat stream completed` (`_log`), yields `done` with finish reason, usage summed over all rounds, latency and `prompt`, then stops.
   5. If the adapter raises an `AppError` mid-stream, or ends without a final chunk → logs `chat stream failed` (with `error_code`), yields one `error` event with `{code, message, provider}`, and stops.
-- **Gives back:** a sequence of `StreamEvent`s: `start`, `delta`…, then exactly one `done` **or** `error`. All share the same `id`.
+- **Gives back:** a sequence of `StreamEvent`s: `start`, `delta`… (with `tool_call`/`tool_result` pairs when tools run), then exactly one `done` **or** `error`. All share the same `id`.
 - **Can fail with:** before `start`: `ModelNotFoundError`, prompt errors, or any `Provider*Error` (raised). After `start`: never raises; problems become the `error` event.
 - **Debug tips:**
   - A stream that stops without `done` or `error` usually means the client disconnected.
@@ -594,7 +599,8 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
   5. `output_config: {"effort": ...}`: only if `ANTHROPIC_EFFORT` is set. This controls how hard the model thinks.
   6. Refusal fallback: if on, and the model is in `ANTHROPIC_FALLBACK_MODELS`, adds `fallbacks: "default"` and the beta flag `server-side-fallback-2026-07-01`. If Claude's safety system declines, Anthropic retries on its recommended fallback model in the same call.
   7. `temperature` is **dropped**, because current Claude models reject it (a debug log notes this).
-  8. `provider_options` are merged in last, so they can add or override anything.
+  8. Tools (Layer 4): `tools` as `{name, description, input_schema}`, plus `eager_input_streaming` when streaming. `tool_choice` is left automatic. Each earlier round in `turns` adds the assistant's content (via `_replayable`) and one user message of `tool_result` blocks.
+  9. `provider_options` are merged in last, so they can add or override anything.
 - **Gives back:** a dictionary, e.g. `{"model": "claude-opus-5-5", "max_tokens": 16000, "messages": [...], "system": "...", "output_config": {"effort": "medium"}, "betas": [...], "fallbacks": "default"}`.
 - **Can fail with:** nothing here; a bad value is rejected by the API later (400).
 - **Debug tips:** a 400 after adding `provider_options` usually means a misspelled or unsupported field.
@@ -609,6 +615,7 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
   3. Converts Claude's `stop_reason` into our `finish_reason`: `end_turn`/`stop_sequence` → `stop`, `max_tokens`/`model_context_window_exceeded` → `length`, `refusal` → `refusal`, anything else → `other`.
   4. Copies `input_tokens`/`output_tokens` into `Usage`.
   5. Uses `message.model` (after a fallback, this is the model that actually answered).
+  6. `stop_reason: "tool_use"` → `finish_reason="tool_calls"`, `tool_calls` from `_tool_calls`, and `provider_state` = the message's content blocks (replayed next round).
 - **Gives back:** `LLMResult(content="Hi there", finish_reason="stop", usage=Usage(12, 4), model="claude-opus-5-5")`.
 - **Can fail with:** any SDK error → `_map_error` → our error class.
 - **Debug tips:** empty `content` with `finish_reason="refusal"` means Claude (and any fallback) declined. Thinking tokens are counted in `output_tokens` even though thinking text isn't returned.
@@ -620,7 +627,7 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
 - **What it does:**
   1. Opens a stream with `_params(stream=True)`.
   2. For each piece of reply text the SDK gives (`text_stream`), yields `StreamChunk(delta=text)`. Thinking is not streamed.
-  3. When the stream ends, asks the SDK for the final message, then yields the final chunk: stop reason (mapped as in `complete`), token usage, model.
+  3. When the stream ends, asks the SDK for the final message, then yields the final chunk: stop reason (mapped as in `complete`), token usage, model, and any tool calls with the content to replay (the SDK has already put streamed tool inputs together).
 - **Gives back:** text chunks, then one `StreamChunk(done=True, finish_reason=..., usage=..., model=...)`.
 - **Can fail with:** SDK errors → `_map_error`. Errors when opening the stream reach `ChatService` before the first chunk, and become HTTP errors.
 - **Debug tips:** a long pause before the first text is normal: the model may think first.
@@ -662,7 +669,8 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
   2. Sets `model`.
   3. Converts `max_tokens` → `max_completion_tokens` (the field newer OpenAI models require), only if set.
   4. Adds `temperature` only if set. Some OpenAI reasoning models reject it; leave it unset for those.
-  5. Merges `provider_options` (e.g. `{"reasoning_effort": "low"}`).
+  5. Tools (Layer 4): `tools` as `{"type": "function", "function": {name, description, parameters}}`. Each earlier round adds the stored assistant message (with its `tool_calls`), then one `{"role": "tool", "tool_call_id", "content"}` per result.
+  6. Merges `provider_options` (e.g. `{"reasoning_effort": "low"}`).
 - **Gives back:** e.g. `{"model": "gpt-5", "messages": [{"role": "system", ...}, {"role": "user", ...}], "max_completion_tokens": 50}`.
 - **Can fail with:** nothing here.
 - **Debug tips:** 400 "Unsupported parameter: temperature" → don't send `temperature` to that model.
@@ -675,7 +683,7 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
   1. Calls the Chat Completions API.
   2. Takes the first choice.
   3. If the model refused (`message.refusal` is set): `finish_reason = "refusal"` and `content` = the refusal text.
-  4. Otherwise `content` = the message text; `finish_reason` mapping: `stop` → `stop`, `length` → `length`, `content_filter` → `content_filter`, others (e.g. `tool_calls`) → `other`.
+  4. Otherwise `content` = the message text; `finish_reason` mapping: `stop` → `stop`, `length` → `length`, `content_filter` → `content_filter`, others → `other`. If the message has tool calls: `finish_reason="tool_calls"`, `tool_calls` from `_tool_calls`, `provider_state` from `_assistant_message`.
   5. Token usage via `_usage`; `model` = the exact model version OpenAI reports (e.g. `gpt-5-2026-01-01`).
 - **Gives back:** `LLMResult(content="Hi there", finish_reason="stop", usage=Usage(7, 3), model="gpt-5-2026-01-01")`.
 - **Can fail with:** SDK errors → `_map_error`.
@@ -692,8 +700,9 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
      2. If the chunk has usage, saves it with `_usage`.
      3. For each choice: yields any text as `StreamChunk(delta=...)`.
      4. Refusal text is yielded too, and marks the finish reason `refusal`.
-     5. Remembers the finish reason.
-  3. After the last chunk, yields the final chunk with finish reason, usage, model.
+     5. Tool-call pieces are collected by `index` (id, name, and the argument text arriving bit by bit).
+     6. Remembers the finish reason.
+  3. After the last chunk, yields the final chunk with finish reason, usage, model, and the collected tool calls (`_tool_calls`; then `finish_reason="tool_calls"`, even if the server said `stop`, as some compatible servers do).
 - **Gives back:** text chunks, then one final `StreamChunk(done=True, ...)`.
 - **Can fail with:** SDK errors → `_map_error`.
 - **Debug tips:** usage `0/0` in `done` means the server didn't send the usage chunk. Some OpenAI-compatible servers ignore `include_usage`.
@@ -742,7 +751,8 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
      - `temperature` ← temperature;
      - `max_output_tokens` ← `max_tokens`.
      Each is set only when given.
-  3. Merges `provider_options` **into the config** (e.g. `{"top_p": 0.9}`). Unlike the other adapters, they don't go at the top level.
+  3. Tools (Layer 4): one `Tool` with a `FunctionDeclaration(name, description, parameters_json_schema)` per tool, and automatic function calling **off** (we run tools ourselves). Each earlier round adds the model's stored `Content` (unchanged, so thought signatures survive), then a user `Content` of `function_response` parts (`{"result": ...}` or `{"error": ...}`; made-up ids aren't sent).
+  4. Merges `provider_options` **into the config** (e.g. `{"top_p": 0.9}`). Unlike the other adapters, they don't go at the top level.
 - **Gives back:** `{"model": "gemini-flash-latest", "contents": [Content(role="user", ...)], "config": GenerateContentConfig(...)}`.
 - **Can fail with:** a pydantic error if `provider_options` contains a field `GenerateContentConfig` doesn't know.
 - **Debug tips:** Gemini needs turns to alternate. Two user messages in a row are allowed but may behave oddly.
@@ -755,6 +765,7 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
   1. Calls Gemini.
   2. Extracts the reply text (`_text`), the finish reason (`_finish_reason`, or `other` if none) and usage (`_usage`).
   3. Uses `model_version` from the reply as the model name (falls back to the requested name).
+  4. Function calls in the reply (`_tool_calls`) → `finish_reason="tool_calls"` and `provider_state` = the model's `Content`.
 - **Gives back:** `LLMResult(content="Hi there", finish_reason="stop", usage=Usage(5, 5), model="gemini-flash-latest")`.
 - **Can fail with:** any exception → `_map_error`.
 - **Debug tips:** an empty reply with `content_filter` means Gemini's safety filter blocked the prompt or the answer.
@@ -770,7 +781,8 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
      2. Remembers the latest finish reason (`_finish_reason`).
      3. Remembers the latest usage (`_usage`, if present).
      4. Remembers the latest model version.
-  3. Yields the final chunk with those values.
+     5. Keeps every part of the model's turn (to replay it if it calls tools).
+  3. Yields the final chunk with those values, plus any function calls and the collected turn as `provider_state`.
 - **Gives back:** text chunks, then one final `StreamChunk(done=True, ...)`.
 - **Can fail with:** any exception → `_map_error`.
 - **Debug tips:** Gemini often sends usage only on the last chunk; earlier chunks don't overwrite it with zeros.
@@ -850,7 +862,8 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
   1. Builds the message list with the system prompt as the first message (role `system`).
   2. Options: `temperature` → `options.temperature`; `max_tokens` → `options.num_predict` (Ollama's name).
   3. Sets `model` and `stream`.
-  4. Merges `provider_options` at the top level (e.g. `{"keep_alive": "10m"}`).
+  4. Tools (Layer 4): `tools` in the OpenAI-style function format. Each earlier round adds the stored assistant message, then one `{"role": "tool", "tool_name", "content"}` per result.
+  5. Merges `provider_options` at the top level (e.g. `{"keep_alive": "10m"}`).
 - **Gives back:** e.g. `{"model": "llama3.2", "messages": [...], "stream": false, "options": {"num_predict": 20}}`.
 - **Can fail with:** nothing.
 - **Debug tips:** start the Ollama server with `OLLAMA_DEBUG=1` for more detailed logs on its side.
@@ -863,6 +876,7 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
   1. Sends `POST /api/chat` with the payload.
   2. Checks the status with `_raise_for_status`.
   3. Reads the JSON reply: `content` from `message.content`; `done_reason` mapped (`stop` → `stop`, `length` → `length`, else `other`); usage via `_usage`; `model` from the reply.
+  4. `message.tool_calls` → `finish_reason="tool_calls"`, `tool_calls` from `_tool_calls`, `provider_state` from `_assistant_message`.
 - **Gives back:** `LLMResult(content="Hi there", finish_reason="stop", usage=Usage(8, 2), model="llama3.2")`.
 - **Can fail with:**
   - HTTP status problems → raised by `_raise_for_status`.
@@ -878,8 +892,8 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
   2. Reads the reply **line by line**. Ollama sends one JSON object per line (NDJSON):
      1. Blank line → skipped.
      2. A line with `"error"` → `ProviderError`.
-     3. A line with text in `message.content` → yields it as a delta.
-     4. A line with `"done": true` → yields the final chunk (finish reason, usage via `_usage`, model) and stops.
+     3. A line with text in `message.content` → yields it as a delta; any `message.tool_calls` are collected.
+     4. A line with `"done": true` → yields the final chunk (finish reason, usage via `_usage`, model, collected tool calls) and stops.
   3. If the connection ends without a `done` line → `ProviderUnavailableError("Ollama stream ended unexpectedly")`.
 - **Gives back:** text chunks, then one final `StreamChunk(done=True, ...)`.
 - **Can fail with:** as above, plus network errors → `_map_error`.
@@ -932,7 +946,8 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
 - **Takes in:** `request`, an `LLMRequest`.
 - **What it does:**
   - model `echo`: finds the **last** user message and puts `"Echo: "` in front of it;
-  - model `echo-system`: returns the system prompt it received, or `"(no system prompt)"`.
+  - model `echo-system`: returns the system prompt it received, or `"(no system prompt)"`;
+  - after a tool round (either model): `"Tool results:"` and one line `- name: result` per tool.
 - **Gives back:** e.g. `"Echo: hello world"`, or the full system prompt.
 - **Can fail with:** nothing (validation guarantees there's at least one user message).
 - **Debug tips:** use `mock/echo-system` to see exactly what system prompt (managed prompt + extra instructions) reaches a model.
@@ -948,21 +963,22 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
 
 #### `MockProvider.complete()` · `backend/app/llm/providers/mock_provider.py`
 
-- **Where:** Mock adapter. **Called by:** `ChatService.complete`. **Calls:** `_reply`, `_usage`.
+- **Where:** Mock adapter. **Called by:** `ChatService.complete`. **Calls:** `_tool_call`, `_reply`, `_usage`.
 - **Takes in:** `request`, an `LLMRequest`.
-- **What it does:** builds the echo reply and fake usage, with `finish_reason="stop"`.
+- **What it does:** if `_tool_call` finds a `/tool name {json}` request, answers with that tool call (`finish_reason="tool_calls"`). Otherwise builds the echo reply and fake usage, with `finish_reason="stop"`.
 - **Gives back:** `LLMResult(content="Echo: hello world", finish_reason="stop", usage=..., model="echo")`.
 - **Can fail with:** nothing.
 - **Debug tips:** use `mock/echo` to tell "my app is broken" apart from "the vendor is broken".
 
 #### `MockProvider.stream()` · `backend/app/llm/providers/mock_provider.py`
 
-- **Where:** Mock adapter. **Called by:** `ChatService.stream`. **Calls:** `_reply`, `_usage`.
+- **Where:** Mock adapter. **Called by:** `ChatService.stream`. **Calls:** `_tool_call`, `_reply`, `_usage`.
 - **Takes in:** `request`, an `LLMRequest`.
 - **What it does:**
-  1. Splits the echo reply into words.
-  2. Yields them one at a time, with a space before each word after the first, waiting `MOCK_STREAM_DELAY_S` between words.
-  3. Yields the final chunk (`stop`, fake usage).
+  1. A `/tool` request (see `_tool_call`) → yields only the final chunk, carrying the tool call. Otherwise:
+  2. Splits the echo reply into words.
+  3. Yields them one at a time, with a space before each word after the first, waiting `MOCK_STREAM_DELAY_S` between words.
+  4. Yields the final chunk (`stop`, fake usage).
 - **Gives back:** `"Echo:"`, `" hello"`, `" world"`, then the final chunk.
 - **Can fail with:** nothing.
 - **Debug tips:** raise `MOCK_STREAM_DELAY_S` to test the UI's streaming and Stop button by eye.
@@ -1000,6 +1016,13 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
 | `ProviderError` | 502 | `provider_error` | Anything else from the vendor |
 | `ProviderUnavailableError` | 503 | `provider_unavailable` | Network down, vendor 5xx or overloaded, Ollama not running |
 | `ProviderTimeoutError` | 504 | `provider_timeout` | No answer within `REQUEST_TIMEOUT_S` (after retries) |
+| `ToolsUnavailableError` | 503 | `tools_unavailable` | `tools` used, or tools API called, without a database (Layer 4) |
+| `MCPServerNotFoundError` | 404 | `mcp_server_not_found` | Unknown MCP server, or a disabled one named in a chat |
+| `MCPToolNotFoundError` | 404 | `mcp_tool_not_found` | That server has no such tool (try a refresh) |
+| `MCPServerConflictError` | 409 | `mcp_server_conflict` | Server name already taken |
+| `MCPConnectionError` | 502 | `mcp_connection_failed` | MCP server couldn't be started or reached, dropped the connection, or timed out |
+| `MCPStdioDisabledError` | 403 | `mcp_stdio_disabled` | Local (stdio) servers are switched off (`MCP_ALLOW_STDIO=false`) |
+| `SecretKeyMissingError` | 400 | `secret_key_missing` | An env value or header was given, but `SECRET_KEY` isn't set |
 
 ---
 
@@ -1082,6 +1105,7 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
   - `busy`: a reply is in progress;
   - `prompts`, `promptsAvailable`, `promptName`, `promptVars`: the Prompt dropdown's options, whether the prompt store is reachable, the chosen prompt, and the values typed for its variables.
   - `collections`, `ragNames`, `showKnowledge`: the knowledge bases you can search, the ones ticked for this chat, and whether the picker row is open.
+  - `toolServers`, `toolNames`, `showTools`: the MCP servers with enabled tools, the ones ticked for this chat, and whether the Tools row is open.
 - **What it does:**
   1. **Load-models effect** (runs once, after the first render):
      1. Calls `getModels()`.
@@ -1090,10 +1114,11 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
      4. If the page closes mid-request, the request is cancelled and the cancel error is ignored.
   2. **Load-prompts effect** (runs once): calls `listPrompts()`. Success → fills the Prompt dropdown. Failure (e.g. no database) → the dropdown shows "Unavailable"; chat works without it.
   3. **Load-collections effect** (runs once): calls `listCollections()`. If there are any, a **Knowledge** button appears; it opens a row of checkboxes, one per collection, with its ready-document count. Ticked names are kept in `ragNames` (names that no longer exist are dropped). Failure → no button; chat works without it.
-  4. Works out `selectedPrompt` and `missingVars` (variables of the chosen prompt that are still empty) on every render.
-  5. **Auto-scroll effect** (runs whenever `turns` changes): scrolls the newest message into view.
-  6. Renders the header (Prompt dropdown, Model dropdown, "System prompt"/"Extra instructions", "Knowledge", "New chat"), a row of variable inputs when the chosen prompt has variables, the optional instructions box, an error banner, the message list (user bubbles on the right, assistant replies on the left), and the composer. When variables are missing, Send is disabled and the hint under the box names them.
-  7. Under each finished reply: `provider/model · prompt name vN · N in / N out · 1.23s`, plus a note for `length`, `refusal`, `content_filter` or "Stopped."
+  4. **Load-tools effect** (runs once): calls `listAvailableTools()`. If any server has enabled tools, a **Tools** button appears; it opens one checkbox per server, listing its tools (destructive ones marked "changes data"). Failure → no button.
+  5. Works out `selectedPrompt` and `missingVars` (variables of the chosen prompt that are still empty) on every render.
+  6. **Auto-scroll effect** (runs whenever `turns` changes): scrolls the newest message into view.
+  7. Renders the header (Prompt dropdown, Model dropdown, "System prompt"/"Extra instructions", "Knowledge", "Tools", "New chat"), a row of variable inputs when the chosen prompt has variables, the optional instructions box, an error banner, the message list (user bubbles on the right, assistant replies on the left), and the composer. When variables are missing, Send is disabled and the hint under the box names them.
+  8. Above a reply that used tools: the `ToolTrace` list. Under each finished reply: `provider/model · prompt name vN · N in / N out · 1.23s`, plus a note for `length`, `refusal`, `content_filter`, `tool_calls` (round limit) or "Stopped."
 - **Gives back:** the chat screen (JSX).
 - **Can fail with:** nothing thrown; errors are shown on screen.
 - **Debug tips:**
@@ -1145,9 +1170,11 @@ All adapters turn our `LLMRequest` into a vendor call, and the vendor's answer b
   3. Adds two turns to the screen: the user's message and an empty assistant turn marked "streaming" (shows "Thinking…").
   4. Clears the input and marks the chat busy (the Send button becomes Stop).
   5. Creates an `AbortController` so Stop can cancel.
-  6. Calls `streamChat` with `{model, messages, system, prompt, rag}`. `system` is sent only if the box isn't blank. `prompt` is `{name, variables}` (only the chosen prompt's variables) when a prompt is selected. `rag` is `{collections: ragNames}` when any knowledge base is ticked. For each event:
+  6. Calls `streamChat` with `{model, messages, system, prompt, rag, tools}`. `tools` is `{servers: toolNames}` when any Tools server is ticked. `system` is sent only if the box isn't blank. `prompt` is `{name, variables}` (only the chosen prompt's variables) when a prompt is selected. `rag` is `{collections: ragNames}` when any knowledge base is ticked. For each event:
      - `start` → saves provider, model and prompt on the assistant turn, plus its `citations`, which render under the reply as a collapsible "Sources (n)" list, or "No matching sources found";
      - `delta` → appends the text, so the reply grows on screen;
+     - `tool_call` → adds a running line to the reply's tool list ("Running tools…" shows while one is running);
+     - `tool_result` → replaces that line with the finished call (done/failed, duration, result);
      - `done` → saves usage, latency, finish reason, prompt, and marks it finished;
      - `error` → shows the error message under the reply.
   7. If `streamChat` throws:
@@ -1436,7 +1463,7 @@ If one fails, the assertion message shows the expected vs actual value.
 
 #### `test_health()` · `backend/tests/test_api.py`
 
-- **Proves:** `/health` returns `ok` with `["mock"]`, `database: "disabled"`, `rag: "disabled"` and an `X-Request-ID` header.
+- **Proves:** `/health` returns `ok` with `["mock"]`, `database: "disabled"`, `rag: "disabled"`, `tools: "disabled"` and an `X-Request-ID` header.
 
 #### `test_models()` · `backend/tests/test_api.py`
 
@@ -2069,7 +2096,7 @@ Each route only passes the request to `PromptService`; the rules and errors are 
 
 #### `ChatService._build_system()` · `backend/app/services/chat_service.py`
 
-- **Called by:** `ChatService.complete`, `ChatService.stream` (before the provider is called). **Calls:** `PromptService.resolve_for_chat`.
+- **Called by:** `ChatService._prepare` (before the provider is called). **Calls:** `PromptService.resolve_for_chat`.
 - **Takes in:** `request`, the `ChatRequest`.
 - **What it does:**
   1. No prompt service (no database):
@@ -2087,7 +2114,7 @@ Each route only passes the request to `PromptService`; the rules and errors are 
 
 #### `_prompt_label()` · `backend/app/services/chat_service.py`
 
-- **Called by:** `ChatService.complete`, `ChatService.stream` (for logs).
+- **Called by:** `ChatService._log` (for logs).
 - **Takes in:** `prompt`, a `PromptUsed` or `None`.
 - **Gives back:** `"support-agent@v3"` or `None`.
 - **Debug tips:** search logs for `"prompt": "support-agent@v3"` to find every reply that used that version.
@@ -2103,7 +2130,7 @@ Each route only passes the request to `PromptService`; the rules and errors are 
 
 - **Where:** top bar (client component). **Called by:** `RootLayout`, on every page.
 - **Takes in:** nothing; reads the current path with `usePathname()`.
-- **What it does:** shows the app name and the **Chat**, **Prompts** and **Knowledge** links. The current page's link is highlighted and marked `aria-current="page"`.
+- **What it does:** shows the app name and the **Chat**, **Prompts**, **Knowledge** and **Tools** links. The current page's link is highlighted and marked `aria-current="page"`.
 - **Debug tips:** Next.js keeps a page you left mounted (hidden). That's why Chat keeps your draft and selections when you come back.
 
 #### `PromptsPage()` · `frontend/components/prompts/prompts-page.tsx`
@@ -2618,7 +2645,7 @@ How the pieces split up:
 #### `Database._tables()` · `backend/app/db/session.py`
 
 - **Called by:** `create_all`, `drop_all` (tests).
-- **What it does:** loads both model modules, so every table is known. On Postgres it returns every table; otherwise it leaves out tables marked `postgres_only` (the three knowledge-base tables, which need pgvector types).
+- **What it does:** loads the model modules (prompts, knowledge bases, MCP tools), so every table is known. On Postgres it returns every table; otherwise it leaves out tables marked `postgres_only` (the three knowledge-base tables, which need pgvector types).
 - **Gives back:** a list of tables in dependency order.
 
 ### 14.2 Embedders
@@ -3169,7 +3196,7 @@ How the pieces split up:
 
 #### `ChatService._retrieve()` · `backend/app/services/chat_service.py`
 
-- **Called by:** `ChatService.complete`, `ChatService.stream`, right after `_build_system` and before the provider is called. **Calls:** `RagRuntime.check`, `RagService.retrieve_for_chat`.
+- **Called by:** `ChatService._prepare`, right after `_build_system` and before the provider is called. **Calls:** `RagRuntime.check`, `RagService.retrieve_for_chat`.
 - **Takes in:** the `ChatRequest`, and the `system` text built so far.
 - **What it does:**
   1. No `rag` in the request → returns `system` unchanged and no citations.
@@ -3650,7 +3677,1090 @@ Database tests are marked `requires_pgvector` (`backend/tests/conftest.py`): the
 
 ---
 
-## 15. Debugging cheat sheet
+## 15. MCP tools (Layer 4)
+
+MCP (Model Context Protocol) is a standard way for programs to offer **tools** (functions) to an AI
+model. An MCP server lists its tools (name, description, a JSON Schema for the arguments) and runs
+them when asked. This layer connects to MCP servers, lets an admin choose which tools models may use,
+and runs the model ↔ tool loop during a chat.
+
+```
+admin registers a server ──► connect ──► list tools ──► mcp_tools rows (all switched OFF)
+admin switches tools on ──► chat with tools: {servers: [...]}
+chat ──► model asks for a tool ──► Toolbox ──► MCPManager ──► MCP server ──► result back to the model ──► ... ──► answer
+```
+
+Code: `backend/app/mcp/` (manager, service, toolbox, secrets, models, schemas, demo server), routes in
+`backend/app/api/v1/tools.py`, the loop in `backend/app/services/chat_service.py`, UI in `frontend/components/tools/`.
+
+Safety rules, and where they're enforced:
+
+| Rule | Where |
+|---|---|
+| New tools start switched off; only switched-on tools are ever offered to a model | `MCPService._upsert_tools`, `MCPService.toolbox_for_chat` |
+| A tool that starts calling itself destructive on a refresh is switched off again | `MCPService._upsert_tools` |
+| Secret values (stdio env, HTTP headers) are encrypted in the database and never returned | `encrypt_secrets`, `_server_out` |
+| Local (stdio) servers can be switched off for the whole platform | `MCP_ALLOW_STDIO`; checked in `MCPService.create_server`, `MCPService._target`, `MCPManager._client` |
+| A destructive tool is never re-sent automatically after a dropped connection | `MCPManager.call_tool` (`retry_safe`) |
+| At most `MCP_MAX_TOOL_ROUNDS` model ↔ tool rounds per message | `ChatService._wants_tools` |
+| Long tool results are cut to `MCP_MAX_RESULT_CHARS` | `format_result` |
+| Each call has a time limit (`MCP_CALL_TIMEOUT_S`) | `MCPManager.call_tool` |
+
+### 15.1 Tool shapes
+
+Public shapes (`backend/app/mcp/schemas.py`):
+
+| Shape | What it holds | Example |
+|---|---|---|
+| `ToolsRef` | The `tools` field of a chat request: `servers` (1–10 MCP server names). | `{"servers": ["demo"]}` |
+| `ToolCallTrace` | One tool call made while answering: `id`, `server`, `tool`, `arguments`, `result` (first 500 characters; absent while running), `is_error`, `duration_ms`. In `ChatResponse.tool_calls` and the stream's `tool_call`/`tool_result` events. | `{"server": "demo", "tool": "calculate", "arguments": {"expression": "6*7"}, "result": "6*7 = 42", "is_error": false, "duration_ms": 4}` |
+| `ServerCreate` | A new server: `name`, `description`, `transport` (`stdio` or `http`); stdio: `command`, `args`, `env`; http: `url`, `headers`. | `{"name": "demo", "transport": "stdio", "command": "/app/.venv/bin/python", "args": ["-m", "app.mcp.demo_server"]}` |
+| `ServerUpdate` | `description` and/or `enabled`. | `{"enabled": false}` |
+| `ServerOut` | A server as the API shows it: everything above **except secret values** (only `env_names` / `header_names`), plus `enabled`, `allowed_roles`, `last_error`, `last_connected_at`, `tools`. | see `GET /v1/tools/servers` |
+| `ToolOut` | One tool: `name`, `description`, `input_schema`, `read_only`, `destructive`, `enabled`. | `{"name": "cancel_order", "destructive": true, "enabled": false, ...}` |
+| `ToolUpdate` / `ToolCallRequest` | `{"enabled": true}` / `{"arguments": {...}}`. | |
+| `ToolCallOutcome` | Result of an admin "try it" call: `content`, `is_error`, `duration_ms`. | `{"content": "2+2 = 4", "is_error": false, "duration_ms": 3}` |
+| `AvailableTools` | What chats may use: enabled servers with their enabled tools (`name`, `description`, `destructive`). | `{"data": [{"name": "demo", "tools": [{"name": "get_time", ...}]}]}` |
+| `PresetList` | Ready-made `ServerCreate` definitions (the demo server). | |
+
+Internal shapes (`backend/app/llm/base.py`), passed between `ChatService` and the adapters:
+
+| Shape | What it holds |
+|---|---|
+| `ToolSpec` | A tool offered to the model: `name` (namespaced, e.g. `demo__get_time`), `description`, `input_schema`. |
+| `ToolCall` | What the model asked for: `id`, `name`, `arguments` (a dict). |
+| `ToolResult` | What the tool answered: `call_id`, `name`, `content` (text), `is_error`. |
+| `ToolTurn` | One finished round: the model's `text`, its `calls`, its `provider_state` (the model's turn in the vendor's own format, replayed unchanged), and the `results`. |
+
+Database tables (`backend/app/mcp/models.py`): `mcp_servers` (one row per server; `env_secret` and
+`header_secret` hold encrypted JSON) and `mcp_tools` (one row per tool per server, with `enabled`).
+
+Settings: `SECRET_KEY`, `MCP_ALLOW_STDIO`, `MCP_MAX_TOOL_ROUNDS`, `MCP_CALL_TIMEOUT_S`,
+`MCP_CONNECT_TIMEOUT_S`, `MCP_MAX_RESULT_CHARS` (see `backend/.env.example`).
+
+### 15.2 Connections — `backend/app/mcp/manager.py`
+
+One `MCPManager` lives for the whole app (`app.state.mcp`). It keeps one open connection per server
+and shares it between requests. Each connection runs in its own background task, because the MCP
+client must be opened and closed by the same task.
+
+#### `ServerTarget.fingerprint()` · `backend/app/mcp/manager.py`
+
+- **Where:** `ServerTarget`, the "how to reach one server" object (name, transport, command, args, env, url, headers; secrets already decrypted). **Called by:** `MCPManager._client`, `_Connection.__init__`.
+- **Takes in:** nothing; uses the target's own fields.
+- **What it does:** writes transport, command, args, env, url and headers as JSON (keys sorted) and hashes it with SHA-256.
+- **Gives back:** a 64-character hex string. It changes whenever any setting changes.
+- **Can fail with:** nothing.
+- **Debug tips:** this is how an edited server gets a fresh connection: the stored connection's fingerprint no longer matches. `ServerTarget` hides `env` and `headers` from its `repr`, so it's safe in tracebacks; still, never log it on purpose.
+
+#### `MCPManager.__init__()` · `backend/app/mcp/manager.py`
+
+- **Where:** `MCPManager`. **Called by:** `lifespan` (one per app); tests.
+- **Takes in:** `settings` (timeouts, `MCP_ALLOW_STDIO`).
+- **What it does:** keeps the settings, an empty `{server name: _Connection}` map and one lock per server name.
+- **Gives back:** the manager. No connection is opened yet: servers are connected on first use.
+- **Can fail with:** nothing.
+- **Debug tips:** a server that's down never slows startup, because nothing connects until a request needs it.
+
+#### `MCPManager.list_tools()` · `backend/app/mcp/manager.py`
+
+- **Where:** `MCPManager`. **Called by:** `MCPService._refresh`. **Calls:** `MCPManager._client`, `_all_tools`, `MCPManager.disconnect`, `_is_lost`, `_describe`.
+- **Takes in:** `target`, a `ServerTarget`.
+- **What it does:**
+  1. Gets the open client (connecting if needed).
+  2. Reads every page of `tools/list` (`_all_tools`), within `MCP_CALL_TIMEOUT_S`.
+  3. Timeout → closes the connection and fails.
+  4. Dropped connection → closes it and tries **once more** on a fresh one (listing is safe to repeat).
+  5. Any other error → fails with the reason.
+- **Gives back:** a list of MCP `Tool` objects (`name`, `description`, `input_schema`, `annotations`).
+- **Can fail with:** `MCPConnectionError` (**502** `mcp_connection_failed`) with a readable reason, e.g. `Couldn't connect to MCP server 'x': FileNotFoundError: [Errno 2] No such file or directory: 'npx'`; `MCPStdioDisabledError` (403).
+- **Debug tips:** the reason is saved in the server's `last_error` and shown on the Tools page. Try the server's command by hand on the backend machine.
+
+#### `MCPManager.call_tool()` · `backend/app/mcp/manager.py`
+
+- **Where:** `MCPManager`. **Called by:** `Toolbox._run_one` (chat), `MCPService.call_tool` (admin "try it"). **Calls:** `MCPManager._client`, the MCP client's `call_tool`, `MCPManager.disconnect`, `_is_lost`, `_describe`.
+- **Takes in:**
+  - `target`: the `ServerTarget`;
+  - `tool`: the tool's name **on the server** (e.g. `get_time`, not `demo__get_time`);
+  - `arguments`: a dict from the model or the admin;
+  - `retry_safe`: `True` unless the tool is destructive.
+- **What it does:**
+  1. Gets the open client and calls the tool, with a time limit of `MCP_CALL_TIMEOUT_S`.
+  2. The tool's own failure (it raised, bad arguments) → the server sends a result with `is_error=True`; it's returned as is.
+  3. A protocol error from the server (unknown tool...) → turned into an error result `MCP error: <message>`.
+  4. Timeout → fails ("didn't finish within 30s").
+  5. Dropped connection (server crashed, network gone) → closes the connection. If `retry_safe`, sends the call **once more** on a fresh connection. Otherwise fails, saying "The tool may or may not have run."
+- **Gives back:** an MCP `CallToolResult` (`content` blocks, `structured_content`, `is_error`).
+- **Can fail with:** `MCPConnectionError` (502) for connection problems and timeouts; `MCPStdioDisabledError` (403).
+- **Debug tips:** in a chat, these errors don't stop the reply: `Toolbox._run_one` passes the message to the model as a tool error. Look for the `tool call` log line (`server`, `tool`, `is_error`, `latency_ms`).
+
+#### `MCPManager.disconnect()` · `backend/app/mcp/manager.py`
+
+- **Where:** `MCPManager`. **Called by:** `MCPService.update_server` (disabled), `MCPService.delete_server`, `MCPManager.aclose`, and the manager itself after errors.
+- **Takes in:** `name`, a server name.
+- **What it does:** removes that server's connection from the map and closes it (`_Connection.close`), which stops a stdio server's process.
+- **Gives back:** nothing. Unknown name → does nothing.
+- **Can fail with:** nothing.
+- **Debug tips:** the next use connects again from scratch.
+
+#### `MCPManager.is_connected()` · `backend/app/mcp/manager.py`
+
+- **Where:** `MCPManager`. **Called by:** tests.
+- **Takes in:** `name`. **Gives back:** `True` if that server has a live connection right now.
+
+#### `MCPManager.aclose()` · `backend/app/mcp/manager.py`
+
+- **Where:** `MCPManager`. **Called by:** `lifespan` at shutdown; tests.
+- **What it does:** closes every connection at once (stops all stdio server processes).
+- **Debug tips:** stdio servers left running after the backend stops mean shutdown didn't run (the process was killed).
+
+#### `MCPManager._client()` · `backend/app/mcp/manager.py`
+
+- **Where:** `MCPManager`. **Called by:** `MCPManager.list_tools`, `MCPManager.call_tool`. **Calls:** `ServerTarget.fingerprint`, `MCPManager.disconnect`, `_Connection.__init__`, `_Connection.open`.
+- **Takes in:** `target`.
+- **What it does:**
+  1. stdio target while `MCP_ALLOW_STDIO=false` → refuses.
+  2. Takes the server's lock, so two requests never connect to the same server at once.
+  3. Reuses the stored connection if it's alive and its fingerprint matches; otherwise closes it and opens a new one.
+- **Gives back:** an open MCP `Client`.
+- **Can fail with:** `MCPStdioDisabledError` (403), `MCPConnectionError` (502) from `_Connection.open`.
+- **Debug tips:** the first call to a server takes longer (process start + handshake, ~1 s for the demo server); later calls reuse the connection.
+
+#### `_Connection.__init__()` · `backend/app/mcp/manager.py`
+
+- **Where:** `_Connection`, one open MCP client owned by a background task. **Called by:** `MCPManager._client`.
+- **Takes in:** `target`, `settings`.
+- **What it does:** keeps the target and its fingerprint; prepares an empty client slot, the task slot, a "ready" signal and a "stop" event.
+
+#### `_Connection.alive()` · `backend/app/mcp/manager.py`
+
+- **Where:** a read-only property (`connection.alive`). **Gives back:** `True` while the client is open and its task is still running.
+
+#### `_Connection.client()` · `backend/app/mcp/manager.py`
+
+- **Where:** a read-only property (`connection.client`). **Gives back:** the open MCP `Client`. Using it before `open` finished is a programming error (assertion).
+
+#### `_Connection.open()` · `backend/app/mcp/manager.py`
+
+- **Where:** `_Connection`. **Called by:** `MCPManager._client`. **Calls:** `_Connection._run` (as a task), `_Connection.close`, `_describe`.
+- **What it does:** starts the background task and waits until it reports "ready" (handshake done), at most `MCP_CONNECT_TIMEOUT_S`. On timeout or error it closes the half-open connection.
+- **Gives back:** nothing; logs `mcp: connected to <name> (stdio|http)`.
+- **Can fail with:** `MCPConnectionError`: "didn't answer within 20s", or "Couldn't connect to MCP server 'x': <reason>".
+- **Debug tips:** "Connection closed" as the reason usually means the stdio process started and exited at once (wrong arguments, missing package). Run the command by hand to see its error output; the server's stderr also goes to the backend's console.
+
+#### `_Connection._run()` · `backend/app/mcp/manager.py`
+
+- **Where:** `_Connection`, the body of the background task. **Calls:** `_Connection._transport`, the MCP `Client`, `_leaf`, `_describe`.
+- **What it does:**
+  1. Builds the transport and opens the MCP `Client` (with our client name and `MCP_CALL_TIMEOUT_S` as its read timeout). The client does the handshake.
+  2. Signals "ready" and then just waits for the stop event, keeping the connection open.
+  3. A failure before "ready" is handed to `open` (unwrapped from anyio's exception groups by `_leaf`). A failure later is logged as `mcp: connection to <name> ended`.
+  4. When it ends, the client slot is cleared, so `alive` becomes false and the next use reconnects.
+- **Gives back:** nothing.
+
+#### `_Connection._transport()` · `backend/app/mcp/manager.py`
+
+- **Where:** `_Connection`. **Called by:** `_Connection._run`.
+- **Takes in:** `stack`, the exit stack that owns everything the connection opens.
+- **What it does:**
+  - stdio → `StdioServerParameters(command, args, env)`. The MCP SDK starts the process with a minimal environment (`HOME`, `PATH`, `USER`...) **plus** the server's own env values, not the backend's whole environment, so your API keys don't leak into tool servers.
+  - http → an HTTP client with the server's headers (connect timeout `MCP_CONNECT_TIMEOUT_S`, read timeout 300 s for long streams), wrapped in a streamable-HTTP transport for the URL.
+- **Gives back:** what the MCP `Client` connects through.
+- **Debug tips:** a stdio command must be found on `PATH` (or be a full path). The demo preset uses the backend's own Python (`sys.executable`) for that reason.
+
+#### `_Connection.close()` · `backend/app/mcp/manager.py`
+
+- **Where:** `_Connection`. **Called by:** `MCPManager.disconnect`, `_Connection.open` (after a failure).
+- **What it does:** sets the stop event so the task closes the client cleanly (which stops a stdio process); if the task hasn't finished after 5 s, cancels it.
+
+#### `_all_tools()` · `backend/app/mcp/manager.py`
+
+- **Called by:** `MCPManager.list_tools`. **Takes in:** an open `client`.
+- **What it does:** reads `tools/list` page by page (always fresh, never from the client's cache), up to 20 pages, so a server that never stops paging can't hang us.
+- **Gives back:** all tools in one list.
+
+#### `_leaf()` · `backend/app/mcp/manager.py`
+
+- **Takes in:** an exception. **What it does:** anyio task groups wrap errors in (nested) exception groups; this digs out the first real error. **Gives back:** that error.
+
+#### `_is_lost()` · `backend/app/mcp/manager.py`
+
+- **Takes in:** an exception. **What it does:** decides "the connection is gone" (MCP `CONNECTION_CLOSED`, closed/broken streams, HTTP transport errors, OS errors) versus "something else failed". **Gives back:** `True` / `False`.
+- **Debug tips:** only "lost" errors trigger a reconnect (and, for safe tools, one retry).
+
+#### `_describe()` · `backend/app/mcp/manager.py`
+
+- **Takes in:** an exception. **What it does:** a short readable reason: `ConnectError: All connection attempts failed`. **Gives back:** the text used in error messages and `last_error`.
+
+### 15.3 Secrets — `backend/app/mcp/secrets.py`
+
+#### `_fernet()` · `backend/app/mcp/secrets.py`
+
+- **Called by:** `encrypt_secrets`, `decrypt_secrets`. **Takes in:** `secret_key` (the `SECRET_KEY` setting, or `None`).
+- **What it does:** turns the key into a Fernet key (SHA-256 of it, base64). Fernet = AES encryption plus a tamper check.
+- **Gives back:** a `Fernet` object.
+- **Can fail with:** `SecretKeyMissingError` → **400** `secret_key_missing` when `SECRET_KEY` isn't set.
+
+#### `encrypt_secrets()` · `backend/app/mcp/secrets.py`
+
+- **Called by:** `MCPService.create_server`. **Takes in:** `values` (e.g. `{"API_TOKEN": "abc"}`) and `secret_key`.
+- **What it does:** nothing to store → `None` (so servers without secrets work without `SECRET_KEY`); otherwise JSON-encodes the values and encrypts them.
+- **Gives back:** an encrypted string like `gAAAAAB...`, or `None`.
+- **Can fail with:** `SecretKeyMissingError` (400) when there are values but no `SECRET_KEY`.
+
+#### `decrypt_secrets()` · `backend/app/mcp/secrets.py`
+
+- **Called by:** `MCPService._target`. **Takes in:** the stored `token` (or `None`) and `secret_key`.
+- **What it does:** the reverse of `encrypt_secrets`. Nothing stored → `{}`.
+- **Gives back:** e.g. `{"API_TOKEN": "abc"}`.
+- **Can fail with:** `MCPConnectionError` (502) "SECRET_KEY changed" when the key is different from the one used to encrypt.
+- **Debug tips:** changing `SECRET_KEY` makes every stored secret unreadable. Delete and re-add the affected servers with their secrets.
+
+### 15.4 Registry service — `backend/app/mcp/service.py`
+
+One `MCPService` per request, on that request's database session. It holds the rules; the
+`MCPManager` does the talking.
+
+#### `MCPService.__init__()` · `backend/app/mcp/service.py`
+
+- **Called by:** `get_mcp_service`; tests. **Takes in:** `session` (database), `manager` (`MCPManager`), `settings`.
+- **What it does:** keeps them.
+
+#### `MCPService._secret_key()` · `backend/app/mcp/service.py`
+
+- **Where:** a read-only property. **Gives back:** the `SECRET_KEY` text, or `None`.
+
+#### `MCPService.list_servers()` · `backend/app/mcp/service.py`
+
+- **Called by:** `list_servers` (route). **Calls:** `MCPService._tools_by_server`, `_server_out`.
+- **What it does:** every server by name, each with all its tools (on or off), in two queries.
+- **Gives back:** `ServerList` `{"data": [ServerOut, ...]}`.
+
+#### `MCPService.get_server()` · `backend/app/mcp/service.py`
+
+- **Called by:** `get_server` (route). **Calls:** `MCPService._require_server`, `MCPService._out`.
+- **Gives back:** one `ServerOut`. **Can fail with:** 404 `mcp_server_not_found`.
+
+#### `MCPService.create_server()` · `backend/app/mcp/service.py`
+
+- **Called by:** `create_server` (route). **Calls:** `MCPService._find_server`, `encrypt_secrets`, `MCPService._commit`, `MCPService._refresh`, `MCPService._out`.
+- **Takes in:** `body` (`ServerCreate`, already checked by `ServerCreate._check_transport`) and `created_by` (filled from Layer 5 on).
+- **What it does:**
+  1. stdio while `MCP_ALLOW_STDIO=false` → refuses.
+  2. Name taken → refuses.
+  3. Saves the row: stdio fields **or** http fields (never both), names of env/headers in clear, their values encrypted. Enabled, no role limits.
+  4. Tries to connect and list tools (`_refresh` without raising): success → tools stored (all **off**), `last_connected_at` set; failure → the reason goes to `last_error`, and the server is still saved.
+- **Gives back:** the new `ServerOut` (with `tools` and possibly `last_error`). The route replies **201** either way.
+- **Can fail with:** 403 `mcp_stdio_disabled`, 409 `mcp_server_conflict`, 400 `secret_key_missing`, 422 (validation).
+- **Debug tips:** a 201 with `last_error` set means "saved, but couldn't connect". Fix the command/URL (delete and re-add) or the server, then **Refresh tools**.
+
+#### `MCPService.update_server()` · `backend/app/mcp/service.py`
+
+- **Called by:** `update_server` (route). **Takes in:** `name`, `body` (`ServerUpdate`).
+- **What it does:** changes `description` and/or `enabled`. Disabling also closes the connection (`MCPManager.disconnect`). A disabled server's tools are never offered to a model, and chats naming it get 404.
+- **Gives back:** the updated `ServerOut`. **Can fail with:** 404.
+
+#### `MCPService.delete_server()` · `backend/app/mcp/service.py`
+
+- **Called by:** `delete_server` (route). **What it does:** deletes the row (its tools go with it) and closes the connection. **Gives back:** nothing (route replies 204). **Can fail with:** 404.
+
+#### `MCPService.refresh_server()` · `backend/app/mcp/service.py`
+
+- **Called by:** `refresh_server` (route). **Calls:** `MCPService._require_server`, `MCPService._refresh` (raising), `MCPService._out`.
+- **What it does:** reconnects and re-reads the tool list. New tools start off; tools that disappeared are removed; your on/off choices for the others are kept.
+- **Gives back:** the updated `ServerOut`. **Can fail with:** 404; 502 `mcp_connection_failed` (the reason is also saved to `last_error`).
+
+#### `MCPService.set_tool_enabled()` · `backend/app/mcp/service.py`
+
+- **Called by:** `update_tool` (route). **Calls:** `MCPService._require_server`, `MCPService._require_tool`, `_tool_out`.
+- **Takes in:** `server_name`, `tool_name`, `enabled`.
+- **What it does:** switches one tool on or off and logs `mcp tool enabled` / `disabled`.
+- **Gives back:** the `ToolOut`. **Can fail with:** 404 `mcp_server_not_found` / `mcp_tool_not_found`.
+- **Debug tips:** the UI asks for confirmation before switching on a destructive tool; the API doesn't.
+
+#### `MCPService.call_tool()` · `backend/app/mcp/service.py`
+
+- **Called by:** `call_tool` (route). **Calls:** `MCPService._target`, `MCPService._end_read`, `MCPManager.call_tool`, `format_result`.
+- **Takes in:** `server_name`, `tool_name`, `arguments`.
+- **What it does:** runs the tool directly, **even if it's switched off** (so an admin can check it before enabling), and times it.
+- **Gives back:** `ToolCallOutcome`, e.g. `{"content": "2+2 = 4", "is_error": false, "duration_ms": 3}`.
+- **Can fail with:** 404; 502 when the server can't be reached; a tool error comes back as `is_error: true`, not as an HTTP error.
+- **Debug tips:** a destructive tool really runs here. The demo's `cancel_order` really cancels the (in-memory) order.
+
+#### `MCPService.available_tools()` · `backend/app/mcp/service.py`
+
+- **Called by:** `list_available_tools` (route). **Calls:** `MCPService._tools_by_server` (enabled only).
+- **What it does:** enabled servers that have at least one enabled tool, with those tools.
+- **Gives back:** `AvailableTools`. Servers with nothing switched on are left out.
+
+#### `MCPService.toolbox_for_chat()` · `backend/app/mcp/service.py`
+
+- **Called by:** `ChatService._toolbox`. **Calls:** `MCPService._tools_by_server`, `MCPService._target`, `model_tool_name`, `tool_schema`, `Toolbox.__init__`.
+- **Takes in:** `ref`, the request's `ToolsRef` (`{"servers": ["demo"]}`).
+- **What it does:**
+  1. Loads the named servers (duplicates ignored). Any that doesn't exist or is disabled → 404.
+  2. For each server, its **enabled** tools only, each as a `ToolEntry`: a `ToolSpec` with the namespaced name (`demo__get_time`), the description (or the name if empty) and an object schema; plus where to run it (decrypted target) and whether it's destructive.
+- **Gives back:** a `Toolbox` (plain data, no database session).
+- **Can fail with:** 404 `mcp_server_not_found`; 403 when the server is stdio and stdio is off; 502 when secrets can't be decrypted.
+
+#### `MCPService._refresh()` · `backend/app/mcp/service.py`
+
+- **Called by:** `MCPService.create_server` (doesn't raise), `MCPService.refresh_server` (raises). **Calls:** `MCPService._target`, `MCPService._end_read`, `MCPManager.list_tools`, `MCPService._upsert_tools`, `MCPService._commit`.
+- **What it does:** ends the read transaction (no database connection waits during the network call), lists tools, then saves them with `last_error = None` and `last_connected_at = now`. On failure saves `last_error` and logs `mcp refresh failed`.
+
+#### `MCPService._upsert_tools()` · `backend/app/mcp/service.py`
+
+- **Called by:** `MCPService._refresh`. **Calls:** `_hints`.
+- **Takes in:** the server row and the tools the server listed.
+- **What it does:**
+  1. New tool → a new row, **switched off**.
+  2. Known tool → description, schema and hints updated; its on/off choice kept, **except** a tool that was on and now says it's destructive is switched off (logged as a warning).
+  3. Stored tool the server no longer lists → deleted.
+
+#### `MCPService._target()` · `backend/app/mcp/service.py`
+
+- **Called by:** `MCPService.call_tool`, `MCPService.toolbox_for_chat`, `MCPService._refresh`. **Calls:** `decrypt_secrets`.
+- **What it does:** builds the `ServerTarget` from the row, with secrets decrypted. Refuses stdio servers when stdio is off.
+
+#### `MCPService._end_read()` · `backend/app/mcp/service.py`
+
+- **What it does:** commits the session's read transaction before a slow network call, so the pooled database connection is returned instead of sitting idle.
+
+#### `MCPService._find_server()` · `backend/app/mcp/service.py`
+
+- **Takes in:** a name. **Gives back:** the server row, or `None`.
+
+#### `MCPService._require_server()` · `backend/app/mcp/service.py`
+
+- **Gives back:** the server row. **Can fail with:** 404 `mcp_server_not_found`.
+
+#### `MCPService._require_tool()` · `backend/app/mcp/service.py`
+
+- **Gives back:** that server's tool row. **Can fail with:** 404 `mcp_tool_not_found` ("Try a refresh").
+
+#### `MCPService._tools_by_server()` · `backend/app/mcp/service.py`
+
+- **Takes in:** server ids and `enabled_only`. **What it does:** one query for all their tools, sorted by name. **Gives back:** `{server_id: [tool rows]}`.
+
+#### `MCPService._out()` · `backend/app/mcp/service.py`
+
+- **What it does:** loads one server's tools and builds its `ServerOut` with `_server_out`.
+
+#### `MCPService._commit()` · `backend/app/mcp/service.py`
+
+- **What it does:** commits; a uniqueness clash (two servers created with the same name at once) → rolls back and raises 409 `mcp_server_conflict`.
+
+#### `presets()` · `backend/app/mcp/service.py`
+
+- **Called by:** `list_presets` (route).
+- **What it does:** returns ready-made server definitions that work on this backend as they are. Today: the demo server, started with the backend's own Python (`sys.executable -m app.mcp.demo_server`), so it works in local dev and in Docker.
+- **Gives back:** `PresetList`.
+
+#### `_hints()` · `backend/app/mcp/service.py`
+
+- **Takes in:** an MCP `Tool`. **What it does:** reads its annotations into `(read_only, destructive)`, using the MCP spec's defaults: read-only → not destructive; otherwise `destructiveHint`, which **defaults to true**. So a tool without annotations counts as destructive.
+- **Gives back:** e.g. `(True, False)` for `get_time`, `(False, True)` for `cancel_order` or any unannotated tool.
+- **Debug tips:** "changes data" on a harmless tool usually means its server doesn't send annotations. It only affects the label and retries; every tool starts off anyway.
+
+#### `_tool_out()` · `backend/app/mcp/service.py`
+
+- **What it does:** tool row → `ToolOut`.
+
+#### `_server_out()` · `backend/app/mcp/service.py`
+
+- **What it does:** server row + its tools → `ServerOut`. Only env/header **names** are copied; encrypted values never leave the service.
+
+#### `ServerCreate._check_transport()` · `backend/app/mcp/schemas.py`
+
+- **Where:** a validator on `ServerCreate`. **Called by:** pydantic, while reading the request body.
+- **What it does:** stdio needs a `command`; http needs a `url` starting with `http://` or `https://`.
+- **Can fail with:** **422** with the reason.
+
+### 15.5 Toolbox — `backend/app/mcp/toolbox.py`
+
+#### `Toolbox.__init__()` · `backend/app/mcp/toolbox.py`
+
+- **Called by:** `MCPService.toolbox_for_chat`; tests. **Takes in:** `manager`, a list of `ToolEntry` (spec + server + tool name + destructive + target), `max_result_chars`.
+- **What it does:** indexes the entries by the name the model sees.
+
+#### `Toolbox.specs()` · `backend/app/mcp/toolbox.py`
+
+- **Where:** a read-only property. **Gives back:** the `ToolSpec` list offered to the model (`LLMRequest.tools`).
+
+#### `Toolbox.servers()` · `backend/app/mcp/toolbox.py`
+
+- **Where:** a read-only property. **Gives back:** the server names in this toolbox, sorted.
+
+#### `Toolbox.__len__()` · `backend/app/mcp/toolbox.py`
+
+- **Gives back:** how many tools are offered (`len(toolbox)`).
+
+#### `Toolbox.trace_for()` · `backend/app/mcp/toolbox.py`
+
+- **Called by:** `ChatService.stream` (the `tool_call` event), `Toolbox._run_one`.
+- **Takes in:** a `ToolCall`. **Gives back:** a `ToolCallTrace` with server, tool name on the server and arguments, but no result yet.
+
+#### `Toolbox.run()` · `backend/app/mcp/toolbox.py`
+
+- **Called by:** `ChatService.complete`, `ChatService.stream`. **Calls:** `Toolbox._run_one` for every call, **at the same time**.
+- **Takes in:** the model's `ToolCall`s for one round.
+- **Gives back:** `(ToolResult, ToolCallTrace)` pairs, in the same order as the calls.
+- **Can fail with:** nothing: every problem becomes an error result for the model.
+
+#### `Toolbox._run_one()` · `backend/app/mcp/toolbox.py`
+
+- **Calls:** `Toolbox.trace_for`, `MCPManager.call_tool`, `format_result`.
+- **What it does:**
+  1. Unknown name (the model invented a tool) → error result "Unknown tool 'x'. Use only the tools you were given."
+  2. Otherwise runs it on its server (`retry_safe` = not destructive) and formats the result.
+  3. Connection errors and timeouts (`AppError`) → the error message becomes the tool result, with `is_error`.
+  4. Logs `tool call` with `server`, `tool`, `is_error`, `latency_ms`, `result_chars` (not the arguments or result, which may hold personal data).
+- **Gives back:** the `ToolResult` (full text, for the model) and the trace (first 500 characters, for the caller).
+
+#### `model_tool_name()` · `backend/app/mcp/toolbox.py`
+
+- **Called by:** `MCPService.toolbox_for_chat`. **Takes in:** `server`, `tool`, and the names already `taken`.
+- **What it does:** `server__tool`, with any character other than letters, digits, `_` and `-` replaced by `_`; prefixed with `t_` if it doesn't start with a letter. Too long (over 64) or already taken → shortened and given an 8-character hash suffix.
+- **Gives back:** e.g. `demo__get_time`, `files__read_file` (from `read.file`).
+- **Debug tips:** 64 characters and this alphabet are the strictest rules among the four providers, so one name works everywhere.
+
+#### `tool_schema()` · `backend/app/mcp/toolbox.py`
+
+- **Takes in:** the tool's stored input schema. **What it does:** providers require an object schema; anything else (missing, `{"type": "string"}`) becomes `{"type": "object", "properties": {}}`. **Gives back:** the schema to send.
+
+#### `format_result()` · `backend/app/mcp/toolbox.py`
+
+- **Called by:** `Toolbox._run_one`, `MCPService.call_tool`. **Takes in:** an MCP `CallToolResult` and `max_chars`.
+- **What it does:**
+  1. Text blocks → their text. Images/audio → `[image: image/png]`. Embedded text resources → their text; binary ones → `[binary resource: uri]`. Resource links → `[resource: uri]`.
+  2. No text at all but structured content → that content as JSON.
+  3. Nothing → `(the tool returned no output)`.
+  4. Longer than `max_chars` (`MCP_MAX_RESULT_CHARS`) → cut, with `[... N more characters cut]`.
+- **Gives back:** the text the model reads.
+
+### 15.6 The chat tool loop — `backend/app/services/chat_service.py`
+
+#### `ChatService._prepare()` · `backend/app/services/chat_service.py`
+
+- **Called by:** `ChatService.complete`, `ChatService.stream`. **Calls:** `ProviderRegistry.resolve`, `ChatService._build_system`, `ChatService._retrieve`, `ChatService._toolbox`, the `release_db` callback, `_to_llm_request`.
+- **Takes in:** the `ChatRequest`.
+- **What it does:** everything before the first model call, in order: pick the provider, build the system prompt, add knowledge-base sources, load the tools. Then **closes the request's database session** (`release_db`), because the model and tool calls that follow can take a long time and don't need it.
+- **Gives back:** a `_Prepared` bundle: provider, model, the `LLMRequest` (with `tools`), prompt used, citations, toolbox.
+- **Can fail with:** every error those steps raise (404 model/prompt/collection/server, 503...). They happen before anything is sent, so they become normal HTTP errors.
+
+#### `ChatService._toolbox()` · `backend/app/services/chat_service.py`
+
+- **Called by:** `ChatService._prepare`. **Calls:** `MCPService.toolbox_for_chat`.
+- **What it does:** no `tools` in the request → `None` (no tools offered). `tools` but no database → 503 `tools_unavailable`.
+- **Gives back:** a `Toolbox` or `None`.
+
+#### `ChatService._wants_tools()` · `backend/app/services/chat_service.py`
+
+- **Called by:** `ChatService.complete`, `ChatService.stream`.
+- **Takes in:** the model's `calls`, the toolbox, and how many rounds ran so far.
+- **What it does:** another round only if the model asked for tools, tools were offered, and fewer than `MCP_MAX_TOOL_ROUNDS` rounds have run. At the limit it logs `tool round limit reached`.
+- **Gives back:** `True` / `False`.
+- **Debug tips:** a reply with `finish_reason: "tool_calls"` means the model still wanted tools at the limit. Raise `MCP_MAX_TOOL_ROUNDS`, or make the tools return more useful results.
+
+#### `ChatService._log()` · `backend/app/services/chat_service.py`
+
+- **Called by:** `ChatService.complete`, `ChatService.stream`.
+- **What it does:** writes the `chat completed` / `chat stream completed` line: request id, provider, model, prompt, sources, `tool_calls` and `tool_rounds` (when tools were offered), latency, **summed** tokens, finish reason.
+
+#### `_turn()` · `backend/app/services/chat_service.py`
+
+- **Takes in:** the text the model wrote this round, its result (`LLMResult` or final `StreamChunk`) and the tool results.
+- **Gives back:** a `ToolTurn` to append to the request (`LLMRequest.with_turn`).
+
+#### `_add_usage()` · `backend/app/services/chat_service.py`
+
+- **Takes in:** two `Usage`. **Gives back:** their sum. A reply with tools makes several model calls; the response shows the total.
+
+#### `LLMRequest.with_turn()` · `backend/app/llm/base.py`
+
+- **Called by:** `ChatService.complete`, `ChatService.stream`; tests.
+- **Takes in:** a `ToolTurn`.
+- **What it does:** makes a **copy** of the request with the turn added to `turns` (the original isn't changed).
+- **Gives back:** the new `LLMRequest`, sent to the same adapter for the next round.
+
+### 15.7 Tools in the provider adapters
+
+Each adapter offers `request.tools` in the vendor's format, reads the model's tool calls (also when
+streamed in pieces), and replays earlier rounds from `request.turns`. The model's own turn is kept in
+`provider_state` exactly as the vendor sent it and sent back unchanged.
+
+| Vendor | Offers tools as | Model's calls arrive as | Results go back as |
+|---|---|---|---|
+| Anthropic | `tools: [{name, description, input_schema}]` (+ `eager_input_streaming` when streaming) | `tool_use` blocks, `stop_reason: "tool_use"` | the assistant content unchanged, then one user message with `tool_result` blocks (`is_error` set) |
+| OpenAI | `tools: [{type: "function", function: {name, description, parameters}}]` | `message.tool_calls` (streamed in pieces by `index`) | the assistant message with `tool_calls`, then one `{"role": "tool", "tool_call_id"}` per result |
+| Gemini | `FunctionDeclaration(parameters_json_schema=...)`, automatic calling **off** | `function_call` parts | the model's `Content` unchanged (keeps thought signatures), then a user `Content` of `function_response` parts |
+| Ollama | same shape as OpenAI | `message.tool_calls` (no ids) | the assistant message, then `{"role": "tool", "tool_name"}` per result |
+
+#### `_tool_calls()` · `backend/app/llm/providers/anthropic_provider.py`
+
+- **Called by:** `AnthropicProvider.complete`, `AnthropicProvider.stream`. **Takes in:** Claude's final message.
+- **What it does:** only when `stop_reason` is `tool_use`, turns each `tool_use` block into a `ToolCall(id, name, input)`. A reply cut off at `max_tokens` gives **no** calls, since a half-written input isn't safe to run.
+- **Gives back:** a list of `ToolCall` (often empty).
+
+#### `_replayable()` · `backend/app/llm/providers/anthropic_provider.py`
+
+- **Called by:** `AnthropicProvider._params`. **Takes in:** the stored assistant content.
+- **What it does:** normally returns it unchanged (thinking blocks with their signatures must go back as they came). If a server-side refusal fallback happened inside that turn (a `fallback` block), keeps only the text written before the last fallback marker plus everything after it, because the declined model's thinking and tool blocks must not be sent back.
+- **Gives back:** the content blocks to send.
+
+#### `_tool_calls()` · `backend/app/llm/providers/openai_provider.py`
+
+- **Called by:** `OpenAIProvider.complete`, `OpenAIProvider.stream`. **Takes in:** `(id, name, JSON arguments)` triples.
+- **What it does:** parses each argument string. Unreadable JSON → `{}` (the tool will reject it with a clear error). Missing id → a made-up `call_...` id.
+- **Gives back:** a list of `ToolCall`.
+
+#### `_assistant_message()` · `backend/app/llm/providers/openai_provider.py`
+
+- **Takes in:** the model's text (or `None`) and its calls. **Gives back:** the assistant message to send back: `{"role": "assistant", "content": ..., "tool_calls": [{"id", "type": "function", "function": {"name", "arguments": "<json>"}}]}`.
+
+#### `_tool_calls()` · `backend/app/llm/providers/gemini_provider.py`
+
+- **Called by:** `GeminiProvider.complete`, `GeminiProvider.stream`. **Takes in:** the parts of the model's turn.
+- **What it does:** each `function_call` part → `ToolCall`. Gemini often gives no id; then one is made up with the `gemini_` prefix, and it's **not** sent back (the function response is matched by name instead).
+- **Gives back:** a list of `ToolCall`.
+
+#### `_tool_calls()` · `backend/app/llm/providers/ollama_provider.py`
+
+- **Called by:** `OllamaProvider.complete`, `OllamaProvider.stream`. **Takes in:** Ollama's `tool_calls` items.
+- **What it does:** reads `function.name` and `function.arguments`; some models send the arguments as JSON text, which is parsed (unreadable → `{}`). Ollama has no ids, so `ollama_...` ids are made up.
+- **Gives back:** a list of `ToolCall`.
+
+#### `_assistant_message()` · `backend/app/llm/providers/ollama_provider.py`
+
+- **Gives back:** `{"role": "assistant", "content": ..., "tool_calls": [{"function": {"name", "arguments": {...}}}]}` (arguments as an object, as Ollama expects).
+
+#### `MockProvider._tool_call()` · `backend/app/llm/providers/mock_provider.py`
+
+- **Called by:** `MockProvider.complete`, `MockProvider.stream`.
+- **What it does:** if tools are offered, no tool has run yet, and the last user message looks like `/tool get_time {"timezone": "UTC"}`, returns a call to the offered tool with that name (the short name matches `server__tool`). Unreadable JSON → no arguments.
+- **Gives back:** a `ToolCall` with id `mock_call_1`, or `None`.
+- **Debug tips:** with `mock/echo`, `/tool <name> {json}` lets you test the whole tool path without an API key. A tool that's switched off isn't offered, so the mock just echoes the message.
+
+### 15.8 Routes, dependencies and migration
+
+Every `/v1/tools` route first runs `get_db_session` → `get_mcp_service` → `require_mcp_service`. Routes
+under `/servers` and `/presets` also run `require_admin` (they show how servers are started).
+
+#### `get_mcp_service()` · `backend/app/api/deps.py`
+
+- **Called by:** FastAPI, for the tools routes and `get_chat_service`. **Gives back:** an `MCPService` on this request's session and the app's `MCPManager`, or `None` without a database.
+
+#### `require_mcp_service()` · `backend/app/api/deps.py`
+
+- **Gives back:** the `MCPService`. **Can fail with:** **503** `tools_unavailable` ("Set DATABASE_URL").
+
+#### `list_available_tools()` · `backend/app/api/v1/tools.py`
+
+- **Route:** `GET /v1/tools` (open). **Calls:** `MCPService.available_tools`. Used by the chat's **Tools** picker.
+
+#### `list_presets()` · `backend/app/api/v1/tools.py`
+
+- **Route:** `GET /v1/tools/presets` (admin). **Calls:** `presets`. Used by **Use demo server**.
+
+#### `list_servers()` · `backend/app/api/v1/tools.py`
+
+- **Route:** `GET /v1/tools/servers` (admin). **Calls:** `MCPService.list_servers`.
+
+#### `create_server()` · `backend/app/api/v1/tools.py`
+
+- **Route:** `POST /v1/tools/servers` (admin) → **201**. **Calls:** `MCPService.create_server`.
+- **Example:** `curl -X POST localhost:8000/v1/tools/servers -H 'content-type: application/json' -d '{"name":"time","transport":"stdio","command":"uvx","args":["mcp-server-time"]}'`
+
+#### `get_server()` · `backend/app/api/v1/tools.py`
+
+- **Route:** `GET /v1/tools/servers/{name}` (admin). **Calls:** `MCPService.get_server`.
+
+#### `update_server()` · `backend/app/api/v1/tools.py`
+
+- **Route:** `PATCH /v1/tools/servers/{name}` (admin), body `{"enabled": false}` or `{"description": "..."}`. **Calls:** `MCPService.update_server`.
+
+#### `delete_server()` · `backend/app/api/v1/tools.py`
+
+- **Route:** `DELETE /v1/tools/servers/{name}` (admin) → **204**. **Calls:** `MCPService.delete_server`.
+
+#### `refresh_server()` · `backend/app/api/v1/tools.py`
+
+- **Route:** `POST /v1/tools/servers/{name}/refresh` (admin). **Calls:** `MCPService.refresh_server`. 502 if the server can't be reached.
+
+#### `update_tool()` · `backend/app/api/v1/tools.py`
+
+- **Route:** `PATCH /v1/tools/servers/{name}/tools/{tool}` (admin), body `{"enabled": true}`. **Calls:** `MCPService.set_tool_enabled`.
+
+#### `call_tool()` · `backend/app/api/v1/tools.py`
+
+- **Route:** `POST /v1/tools/servers/{name}/tools/{tool}/call` (admin), body `{"arguments": {...}}`. **Calls:** `MCPService.call_tool`.
+- **Example:** `curl -X POST localhost:8000/v1/tools/servers/demo/tools/calculate/call -H 'content-type: application/json' -d '{"arguments":{"expression":"2+2"}}'`
+
+#### `upgrade()` · `backend/migrations/versions/0003_create_mcp.py`
+
+- **Run by:** `uv run alembic upgrade head`. **What it does:** creates `mcp_servers` (unique name index) and `mcp_tools` (unique per server + name; deleting a server deletes its tools).
+
+#### `downgrade()` · `backend/migrations/versions/0003_create_mcp.py`
+
+- **Run by:** `uv run alembic downgrade 0002`. **What it does:** drops both tables (registered servers and tool choices are lost).
+
+### 15.9 Demo MCP server — `backend/app/mcp/demo_server.py`
+
+A small, real MCP server used by the demo and the tests. Run it alone with
+`uv run python -m app.mcp.demo_server` (stdio) or `--http 8765` (HTTP at `http://127.0.0.1:8765/mcp`).
+Tools raise `ToolError` for expected failures, so the message reaches the model.
+
+#### `get_time()` · `backend/app/mcp/demo_server.py`
+
+- **Takes in:** `timezone` (IANA name, default `UTC`). **Gives back:** e.g. `2026-11-03 14:05:09 JST (UTC+0900)`. Unknown zone → tool error. Read-only.
+
+#### `calculate()` · `backend/app/mcp/demo_server.py`
+
+- **Takes in:** `expression` (max 200 characters). **What it does:** parses it with Python's `ast` and evaluates it with `_evaluate`: numbers and `+ - * / // % **` only, never `eval`. **Gives back:** `(17.5 * 4) / 3 = 23.3333333333`. Read-only.
+
+#### `_evaluate()` · `backend/app/mcp/demo_server.py`
+
+- **Takes in:** one node of the parsed expression. **What it does:** walks it: numbers, unary +/−, and the allowed binary operators; exponents above 100 and division by zero are refused; anything else (names, calls) → "Only numbers and + - * / // % ** ( ) are allowed." **Gives back:** the number.
+
+#### `lookup_order()` · `backend/app/mcp/demo_server.py`
+
+- **Takes in:** `order_id` (case-insensitive, e.g. `a-1001`). **Gives back:** `{"order_id", "customer", "status", "total"}`. Unknown id → tool error listing the known ones. Read-only.
+
+#### `cancel_order()` · `backend/app/mcp/demo_server.py`
+
+- **Takes in:** `order_id`, optional `reason`. **What it does:** sets the order's status to `cancelled` (in memory; resets when the server restarts). Delivered or already-cancelled orders → tool error. Marked **destructive**, so it starts switched off and the UI warns before enabling it.
+
+#### `main()` · `backend/app/mcp/demo_server.py`
+
+- **Takes in:** command-line arguments. **What it does:** `--http PORT` (and `--host`) → serves over streamable HTTP; otherwise over stdio.
+
+### 15.10 Frontend: the Tools page and tools in Chat
+
+#### `Tools()` · `frontend/app/tools/page.tsx`
+
+- **Route:** `/tools`. Sets the page title and renders `ToolsPage`.
+
+#### `ToolsPage()` · `frontend/components/tools/tools-page.tsx`
+
+- **Calls:** `listMcpServers`, `useAdminKey`, `AdminKeyInput`, `ServerForm`, `ServerPanel`, `toolsError`.
+- **What it does:** loads the server list (needs the admin key when `ADMIN_API_KEY` is set; it reloads when you type the key). Left: one button per server with "local command"/"remote URL" and "N/M tools on", "error" or "disabled". Right: the **Add server** form or the selected server's panel.
+- **Debug tips:** "Managing tools needs the admin key" → enter it at the top. "MCP tools need a database" → set `DATABASE_URL`.
+
+#### `reload()` · `frontend/components/tools/tools-page.tsx`
+
+- **What it does:** bumps a counter so the list loads again (after any change in the form or panel).
+
+#### `ServerForm()` · `frontend/components/tools/server-form.tsx`
+
+- **Calls:** `fillDemo`, `submit`.
+- **What it does:** the **Add MCP server** form: name, description, and either *Local command (stdio)* (command, arguments one per line, `KEY=value` env lines) or *Remote URL (HTTP)* (URL, `Name: value` header lines). Secret fields say "stored encrypted, never shown again".
+
+#### `fillDemo()` · `frontend/components/tools/server-form.tsx`
+
+- **Calls:** `listMcpPresets`. **What it does:** fills the form with the demo server exactly as this backend says to run it (its own Python path).
+
+#### `submit()` · `frontend/components/tools/server-form.tsx`
+
+- **Calls:** `parsePairs`, `createMcpServer`. **What it does:** sends only the fields of the chosen transport. The button shows "Connecting…" because the backend connects and lists tools before answering. On success the new server is selected.
+
+#### `ServerPanel()` · `frontend/components/tools/server-panel.tsx`
+
+- **Calls:** `run`, `toggleTool`, `remove`, `refreshMcpServer`, `updateMcpServer`, `TryTool`.
+- **What it does:** shows the server (transport, command or URL, secret names), its connection state ("Last connection failed: ..." or "Tools last read ... · N of M switched on"), buttons **Refresh tools**, **Disable/Enable server**, **Delete**, and the tool list: an **Allow** checkbox per tool, badges *read-only* / *changes data*, and **Try**.
+- **Debug tips:** switches show your click at once and roll back if the save fails (with the error shown).
+
+#### `run()` · `frontend/components/tools/server-panel.tsx`
+
+- **Takes in:** a label and an action. **What it does:** marks the panel busy, runs the action, shows its error if any, and reloads the list.
+
+#### `toggleTool()` · `frontend/components/tools/server-panel.tsx`
+
+- **Calls:** `setMcpToolEnabled`. **What it does:** switching **on** a destructive tool first asks "can change or delete data, and models run tools without asking first. Switch it on?". Shows the new state at once; if saving fails, shows the stored state again.
+
+#### `remove()` · `frontend/components/tools/server-panel.tsx`
+
+- **Calls:** `deleteMcpServer`. **What it does:** asks for confirmation, deletes the server, clears the selection.
+
+#### `TryTool()` · `frontend/components/tools/server-panel.tsx`
+
+- **Calls:** `exampleArguments`, `runTool`. **What it does:** a JSON box pre-filled from the tool's schema, a **Run** button, and the result (or "The tool reported an error") with its duration. Notes that a destructive tool really changes data, even in a test.
+
+#### `runTool()` · `frontend/components/tools/server-panel.tsx`
+
+- **Calls:** `callMcpTool`. **What it does:** checks the box holds a JSON object (else a clear message), then runs the tool.
+
+#### `exampleArguments()` · `frontend/components/tools/server-panel.tsx`
+
+- **Takes in:** a tool. **Gives back:** starting JSON from its schema's properties: `""` for text, `0` for numbers, `false` for booleans, e.g. `{"timezone": ""}`.
+
+#### `toolsError()` · `frontend/components/tools/messages.ts`
+
+- **What it does:** a short, actionable message for tools API errors (admin key, no database), otherwise the shared `errorMessage`.
+
+#### `parsePairs()` · `frontend/components/tools/messages.ts`
+
+- **Takes in:** text and a separator (`=` for env, `:` for headers). **Gives back:** `{"KEY": "value"}`; blank and malformed lines are skipped, and the value may contain the separator (`Authorization: Bearer a:b`).
+
+#### `ToolTrace()` · `frontend/components/chat.tsx`
+
+- **Takes in:** a reply's tool calls. **What it does:** one line per call above the reply: a dot (pulsing = running, accent = done, red = failed), `server · tool`, and "running…" / "done · 4 ms" / "failed · 4 ms". Click a line to see the arguments and the result (first 500 characters).
+
+#### `serverPath()` · `frontend/lib/api.ts`
+
+- **Gives back:** `/v1/tools/servers/<name>` with the name URL-encoded. Used by the server functions below.
+
+#### `listAvailableTools()` · `frontend/lib/api.ts`
+
+- `GET /v1/tools` → servers and tools a chat may use. Called by `Chat` (fills the **Tools** picker).
+
+#### `listMcpPresets()` · `frontend/lib/api.ts`
+
+- `GET /v1/tools/presets` (admin key). Called by `fillDemo`.
+
+#### `listMcpServers()` · `frontend/lib/api.ts`
+
+- `GET /v1/tools/servers` (admin key). Called by `ToolsPage`.
+
+#### `getMcpServer()` · `frontend/lib/api.ts`
+
+- `GET /v1/tools/servers/{name}` (admin key). Available for callers that need one server.
+
+#### `createMcpServer()` · `frontend/lib/api.ts`
+
+- `POST /v1/tools/servers` (admin key). Called by `submit` in the server form.
+
+#### `updateMcpServer()` · `frontend/lib/api.ts`
+
+- `PATCH /v1/tools/servers/{name}` with `{enabled}` or `{description}`. Called by `ServerPanel`.
+
+#### `deleteMcpServer()` · `frontend/lib/api.ts`
+
+- `DELETE /v1/tools/servers/{name}`. Called by `remove`.
+
+#### `refreshMcpServer()` · `frontend/lib/api.ts`
+
+- `POST /v1/tools/servers/{name}/refresh`. Called by `ServerPanel`.
+
+#### `setMcpToolEnabled()` · `frontend/lib/api.ts`
+
+- `PATCH /v1/tools/servers/{name}/tools/{tool}` with `{enabled}`. Called by `toggleTool`.
+
+#### `callMcpTool()` · `frontend/lib/api.ts`
+
+- `POST /v1/tools/servers/{name}/tools/{tool}/call` with `{arguments}`. Called by `runTool`.
+
+### 15.11 Tool tests
+
+`backend/tests/test_mcp.py` and `backend/tests/test_tools_api.py` start **real** MCP servers over
+stdio (the demo server and `backend/tests/mcp_test_server.py`), and one over HTTP.
+
+#### `echo()` · `backend/tests/mcp_test_server.py`
+
+- Test server tool: returns its `text` unchanged.
+
+#### `pid()` · `backend/tests/mcp_test_server.py`
+
+- Test server tool: the server's process id. A different id = a new process = a reconnect.
+
+#### `env()` · `backend/tests/mcp_test_server.py`
+
+- Test server tool: the value of one environment variable in the server process (`(unset)` if missing). Proves secrets arrive.
+
+#### `slow()` · `backend/tests/mcp_test_server.py`
+
+- Test server tool: waits `seconds`, then answers (for timeouts).
+
+#### `crash()` · `backend/tests/mcp_test_server.py`
+
+- Test server tool: kills the server process mid-call. Has no annotations, so it counts as destructive.
+
+#### `manager()` · `backend/tests/test_mcp.py`
+
+- Fixture: an `MCPManager` with short timeouts, closed after the test.
+
+#### `text()` · `backend/tests/test_mcp.py`
+
+- Helper: a `CallToolResult` as text (`format_result`).
+
+#### `test_lists_tools_with_annotations()` · `backend/tests/test_mcp.py`
+
+- **Proves:** the demo server's four tools are listed with their read-only/destructive hints and schemas, and the connection stays open.
+
+#### `test_calls_tools_and_reports_tool_errors()` · `backend/tests/test_mcp.py`
+
+- **Proves:** a call returns the result; a tool's own failure and an unknown tool come back as error results, not exceptions.
+
+#### `test_parallel_calls_share_one_connection()` · `backend/tests/test_mcp.py`
+
+- **Proves:** five calls at once all reach the same server process.
+
+#### `test_reconnects_after_the_server_dies()` · `backend/tests/test_mcp.py`
+
+- **Proves:** a destructive call that kills the server fails with "may or may not have run" (no automatic retry), and the next call starts a fresh server process.
+
+#### `test_call_timeout()` · `backend/tests/test_mcp.py`
+
+- **Proves:** a slow tool fails with "didn't finish within 0.5s" in well under the tool's 5 seconds.
+
+#### `test_changed_settings_open_a_new_connection()` · `backend/tests/test_mcp.py`
+
+- **Proves:** the same server name with different env gets a new process that sees the new value.
+
+#### `test_connection_failures_are_clear()` · `backend/tests/test_mcp.py`
+
+- **Proves:** a missing command, a process that exits at once, and a refused HTTP connection each give a readable `MCPConnectionError`.
+
+#### `test_stdio_can_be_switched_off()` · `backend/tests/test_mcp.py`
+
+- **Proves:** with `MCP_ALLOW_STDIO=false` the manager refuses stdio servers.
+
+#### `test_close_stops_the_server_process()` · `backend/tests/test_mcp.py`
+
+- **Proves:** `MCPManager.aclose` ends the stdio process.
+
+#### `_process_exists()` · `backend/tests/test_mcp.py`
+
+- Helper: `True` if a process id is running and not a zombie (reads `/proc`).
+
+#### `http_demo_url()` · `backend/tests/test_mcp.py`
+
+- Fixture (once per file): starts the demo server with `--http` on a free port in a subprocess, waits for the port, gives back its URL, and stops it afterwards.
+
+#### `test_http_server()` · `backend/tests/test_mcp.py`
+
+- **Proves:** listing and calling tools work over streamable HTTP (with custom headers).
+
+#### `FakeManager.__init__()` · `backend/tests/test_mcp.py`
+
+- Stand-in manager: keeps a fixed result (or an error to raise) and records every call.
+
+#### `FakeManager.call_tool()` · `backend/tests/test_mcp.py`
+
+- Records `(tool, arguments, retry_safe)` and returns the fixed result or raises the error.
+
+#### `entry()` · `backend/tests/test_mcp.py`
+
+- Helper: a `ToolEntry` for a demo tool.
+
+#### `test_toolbox_runs_calls_and_traces_them()` · `backend/tests/test_mcp.py`
+
+- **Proves:** results and traces come back in call order, unknown tools become error results, and destructive tools are called with `retry_safe=False`.
+
+#### `test_toolbox_turns_connection_errors_into_tool_errors()` · `backend/tests/test_mcp.py`
+
+- **Proves:** a connection error becomes the tool's error result instead of failing the chat.
+
+#### `test_format_result_handles_every_content_type()` · `backend/tests/test_mcp.py`
+
+- **Proves:** text, images, embedded text, structured content, empty results and truncation are all formatted as documented.
+
+#### `test_model_tool_names_are_safe_and_unique()` · `backend/tests/test_mcp.py`
+
+- **Proves:** names are namespaced, unsafe characters replaced, a leading digit prefixed, long names cut to 64, clashes made unique.
+
+#### `test_tool_schema_defaults_to_an_object()` · `backend/tests/test_mcp.py`
+
+- **Proves:** missing or non-object schemas become an empty object schema; valid ones pass through unchanged.
+
+#### `test_secrets_round_trip_and_need_a_key()` · `backend/tests/test_mcp.py`
+
+- **Proves:** secrets decrypt to the original, nothing-to-store needs no key, a missing key is refused, and a changed key gives a clear error.
+
+#### `request()` · `backend/tests/test_tool_calling.py`
+
+- Helper: an `LLMRequest` for a model with one tool (`demo__get_time`).
+
+#### `follow_up()` · `backend/tests/test_tool_calling.py`
+
+- Helper: the next request after "running" the model's calls (each answers `12:00 JST`).
+
+#### `claude()` · `backend/tests/test_tool_calling.py`
+
+- Helper: an `AnthropicProvider` on a fake transport.
+
+#### `test_anthropic_tool_round_trip()` · `backend/tests/test_tool_calling.py`
+
+- **Proves:** tools are sent without forcing a choice; `tool_use` becomes a call; the next request replays thinking (with its signature), text and `tool_use` unchanged, then a `tool_result`.
+
+#### `test_anthropic_no_tool_calls_when_cut_off()` · `backend/tests/test_tool_calling.py`
+
+- **Proves:** a reply cut off at `max_tokens` gives no tool calls.
+
+#### `test_anthropic_stream_collects_tool_call()` · `backend/tests/test_tool_calling.py`
+
+- **Proves:** a streamed tool input arriving in pieces becomes one call with the full arguments; streaming sends `eager_input_streaming`.
+
+#### `openai()` · `backend/tests/test_tool_calling.py`
+
+- Helper: an `OpenAIProvider` on a fake transport.
+
+#### `completion()` · `backend/tests/test_tool_calling.py`
+
+- Helper: a fake Chat Completions reply with a given message and finish reason.
+
+#### `test_openai_tool_round_trip()` · `backend/tests/test_tool_calling.py`
+
+- **Proves:** tools are sent as functions; `tool_calls` become calls; the follow-up has the assistant message with `tool_calls` and a `tool` message.
+
+#### `test_openai_stream_assembles_tool_call_pieces()` · `backend/tests/test_tool_calling.py`
+
+- **Proves:** a tool call streamed in pieces is put together, and calls are trusted even when the server says `stop`.
+
+#### `chunk()` · `backend/tests/test_tool_calling.py`
+
+- Helper inside the OpenAI stream test: one fake stream chunk.
+
+#### `gemini()` · `backend/tests/test_tool_calling.py`
+
+- Helper: a `GeminiProvider` on a fake transport.
+
+#### `gemini_call()` · `backend/tests/test_tool_calling.py`
+
+- Helper: a fake Gemini reply with one `functionCall` and a thought signature.
+
+#### `test_gemini_tool_round_trip()` · `backend/tests/test_tool_calling.py`
+
+- **Proves:** function declarations carry the JSON schema; the model's turn is replayed with its thought signature; the result goes back as a `functionResponse` without a made-up id.
+
+#### `test_gemini_stream_returns_tool_call_with_id()` · `backend/tests/test_tool_calling.py`
+
+- **Proves:** a streamed function call keeps Gemini's own id and the model's turn for replay.
+
+#### `ollama()` · `backend/tests/test_tool_calling.py`
+
+- Helper: an `OllamaProvider` on a fake transport that records requests.
+
+#### `record()` · `backend/tests/test_tool_calling.py`
+
+- Helper inside `ollama()`: saves each request, then answers with the handler.
+
+#### `test_ollama_tool_round_trip()` · `backend/tests/test_tool_calling.py`
+
+- **Proves:** JSON-text arguments are parsed; the follow-up has the assistant message and a `tool` message with `tool_name`.
+
+#### `test_ollama_stream_collects_tool_calls()` · `backend/tests/test_tool_calling.py`
+
+- **Proves:** tool calls in stream lines are collected and given `ollama_` ids.
+
+#### `test_mock_tool_command_matches_short_name_and_reports_results()` · `backend/tests/test_tool_calling.py`
+
+- **Proves:** `/tool get_time {...}` calls `demo__get_time`, and the follow-up reply lists the results.
+
+#### `test_mock_ignores_tool_command_without_tools()` · `backend/tests/test_tool_calling.py`
+
+- **Proves:** with no tools offered, `/tool ...` is just echoed.
+
+#### `chat_body()` · `backend/tests/test_tools_api.py`
+
+- Helper: a chat request body for `mock/echo`, optionally with `tools.servers`.
+
+#### `enable()` · `backend/tests/test_tools_api.py`
+
+- Helper: switches one tool on (or off) through the API.
+
+#### `test_register_server_lists_tools_switched_off()` · `backend/tests/test_tools_api.py`
+
+- **Proves:** registering the demo server connects and lists four tools, all off, with the right hints; nothing is available to chats yet; a duplicate name → 409.
+
+#### `test_chat_runs_an_enabled_tool()` · `backend/tests/test_tools_api.py`
+
+- **Proves:** after enabling `calculate`, a chat calls it, the reply contains the result, the trace names server, tool, arguments and result, and usage is summed.
+
+#### `test_disabled_and_destructive_tools_are_not_offered()` · `backend/tests/test_tools_api.py`
+
+- **Proves:** a switched-off destructive tool is never offered (no calls, plain echo).
+
+#### `test_tool_errors_are_returned_to_the_model()` · `backend/tests/test_tools_api.py`
+
+- **Proves:** a tool's failure is in the trace (`is_error`) and reaches the model.
+
+#### `test_stream_reports_tool_calls_and_results()` · `backend/tests/test_tools_api.py`
+
+- **Proves:** the stream sends `start`, `tool_call` (no result), `tool_result`, deltas, `done`.
+
+#### `test_chat_names_unknown_or_disabled_server()` · `backend/tests/test_tools_api.py`
+
+- **Proves:** an unknown or disabled server in `tools.servers` → 404.
+
+#### `test_tools_need_a_database()` · `backend/tests/test_tools_api.py`
+
+- **Proves:** without a database, chat with `tools` and `GET /v1/tools` → 503 `tools_unavailable`.
+
+#### `test_secrets_are_encrypted_hidden_and_reach_the_server()` · `backend/tests/test_tools_api.py`
+
+- **Proves:** env values never appear in responses or in the database row, but the stdio process receives them.
+
+#### `test_secret_needs_secret_key()` · `backend/tests/test_tools_api.py`
+
+- **Proves:** a secret without `SECRET_KEY` → 400 `secret_key_missing`.
+
+#### `test_stdio_servers_can_be_switched_off()` · `backend/tests/test_tools_api.py`
+
+- **Proves:** with `MCP_ALLOW_STDIO=false`, registering a stdio server → 403.
+
+#### `test_unreachable_server_is_saved_with_its_error()` · `backend/tests/test_tools_api.py`
+
+- **Proves:** an unreachable server is saved with `last_error`; refresh → 502.
+
+#### `test_invalid_server_definitions_are_rejected()` · `backend/tests/test_tools_api.py`
+
+- **Proves:** stdio without a command, a non-HTTP URL and a bad name → 422.
+
+#### `test_admin_key_protects_server_management()` · `backend/tests/test_tools_api.py`
+
+- **Proves:** with `ADMIN_API_KEY`, server routes need `X-Admin-Key`; `GET /v1/tools` stays open.
+
+#### `test_demo_preset_can_be_registered_as_is()` · `backend/tests/test_tools_api.py`
+
+- **Proves:** the demo preset uses the backend's Python and registers with four tools.
+
+#### `test_try_a_tool_and_delete_a_server()` · `backend/tests/test_tools_api.py`
+
+- **Proves:** "try it" runs a switched-off tool; an unknown tool → 404; delete → 204, then 404.
+
+#### `ListingManager.__init__()` · `backend/tests/test_tools_api.py`
+
+- Fake manager whose tool list the test sets.
+
+#### `ListingManager.list_tools()` · `backend/tests/test_tools_api.py`
+
+- Returns the tool list the test set.
+
+#### `ListingManager.disconnect()` · `backend/tests/test_tools_api.py`
+
+- Does nothing (no real connection).
+
+#### `tool()` · `backend/tests/test_tools_api.py`
+
+- Helper: an MCP `Tool` with optional annotation hints.
+
+#### `test_refresh_keeps_choices_and_rechecks_tools()` · `backend/tests/test_tools_api.py`
+
+- **Proves:** a tool without hints counts as destructive; on refresh, choices are kept, a tool that became destructive is switched off, vanished tools are removed and new ones start off.
+
+#### `AlwaysCallsTools.__init__()` · `backend/tests/test_tools_api.py`
+
+- A fake model provider (`loop/loop`) that counts its calls.
+
+#### `AlwaysCallsTools.complete()` · `backend/tests/test_tools_api.py`
+
+- Always asks for the first offered tool.
+
+#### `AlwaysCallsTools.stream()` · `backend/tests/test_tools_api.py`
+
+- The same, as a stream's final chunk.
+
+#### `test_tool_rounds_are_limited()` · `backend/tests/test_tools_api.py`
+
+- **Proves:** blocking and streaming stop after `MCP_MAX_TOOL_ROUNDS` (2) with `finish_reason: "tool_calls"`, usage summed over the 3 model calls.
+
+#### `test_manager_is_created_and_closed_with_the_app()` · `backend/tests/test_tools_api.py`
+
+- **Proves:** the app creates one `MCPManager` at startup.
+
+---
+
+## 16. Debugging cheat sheet
 
 | Symptom | Most likely cause | Where to look |
 |---|---|---|
@@ -3683,3 +4793,13 @@ Database tests are marked `requires_pgvector` (`backend/tests/conftest.py`): the
 | 415 / 422 on upload | Unsupported type / no readable text (e.g. scanned PDF) | `detect_type` / `extract_text` |
 | Answer ignores the documents | Wrong passages retrieved | Try the question in the Knowledge page's **Test search**; check `vector_similarity` / `keyword_score` |
 | Chat shows "No matching sources" | Collection empty or documents not `ready` | Knowledge page → document statuses |
+| 503 `tools_unavailable` | No `DATABASE_URL` (the MCP server registry lives there) | `/health` → `tools` |
+| Server saved but `last_error` set / 502 `mcp_connection_failed` | Wrong command or URL, missing package, server down, bad credentials | The error text; run the command by hand on the backend machine; then **Refresh tools** |
+| "Connection closed" right after adding a stdio server | The process started and exited (wrong arguments, missing dependency) | Its stderr in the backend console |
+| 403 `mcp_stdio_disabled` | `MCP_ALLOW_STDIO=false` | Use an HTTP server, or allow stdio |
+| 400 `secret_key_missing` | Env values or headers given without `SECRET_KEY` | Set `SECRET_KEY` in `backend/.env` |
+| "SECRET_KEY changed" | `SECRET_KEY` differs from when the secrets were saved | Delete and re-add the server with its secrets |
+| Chat never uses a tool | Tool switched off, server disabled, or not ticked in **Tools** | `GET /v1/tools`; the Tools page |
+| Tool marked "changes data" but it's harmless | Its server sends no annotations (the MCP default is destructive) | Label only; switch it on if you trust it |
+| `finish_reason: "tool_calls"` | Round limit hit while the model still wanted tools | Raise `MCP_MAX_TOOL_ROUNDS`; check the trace for repeated failing calls |
+| Tool call "failed" in the trace | The tool's own error, a timeout, or a dropped connection | The trace's result text; the `tool call` log line |

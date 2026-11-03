@@ -12,11 +12,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.v1.collections import router as collections_router
 from app.api.v1.prompts import router as prompts_router
 from app.api.v1.routes import health_router, router
+from app.api.v1.tools import router as tools_router
 from app.core.config import Settings, get_settings
 from app.core.errors import register_error_handlers
 from app.core.logging import configure_logging
 from app.db.session import Database
 from app.llm.registry import ProviderRegistry
+from app.mcp.manager import MCPManager
 from app.rag.embeddings import build_embedder
 from app.rag.runtime import RagRuntime
 
@@ -39,7 +41,9 @@ def create_app(
         embedder = build_embedder(settings) if app.state.database is not None else None
         app.state.rag = RagRuntime(app.state.database, embedder, settings)
         await app.state.rag.start()
+        app.state.mcp = MCPManager(settings)  # connects to MCP servers on first use
         yield
+        await app.state.mcp.aclose()  # also stops stdio server processes
         await app.state.rag.stop()
         await app.state.registry.aclose()
         if app.state.database is not None and database is None:  # close only what we opened
@@ -79,6 +83,7 @@ def create_app(
     app.include_router(router)
     app.include_router(prompts_router)
     app.include_router(collections_router)
+    app.include_router(tools_router)
     return app
 
 

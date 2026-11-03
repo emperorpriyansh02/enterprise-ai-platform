@@ -1,6 +1,6 @@
 # Architecture
 
-## Request flow (Layers 1–3, today)
+## Request flow (Layers 1–4, today)
 
 ```
 Browser (Next.js chat UI)
@@ -15,6 +15,11 @@ ChatService  app/services/chat_service.py      ◄── every later layer plugs
    │                        render {{ variables }}, record {name, version}
    │  _retrieve()      ──►  RagService  ──►  embed question ──► pgvector + full-text ──► RRF
    │                        append numbered Sources, return citations
+   │  _toolbox()       ──►  MCPService  ──►  enabled tools of the named MCP servers
+   │  release the database connection
+   │  model ↔ tool loop (≤ MCP_MAX_TOOL_ROUNDS):
+   │     LLM asks for tools ──► Toolbox ──► MCPManager ──► MCP servers (stdio process / streamable HTTP)
+   │                       ◄── results (cut to MCP_MAX_RESULT_CHARS) back to the LLM
    ▼
 LLMProvider adapters  app/llm/providers/
    ├─ anthropic_provider.py   official anthropic SDK
@@ -83,5 +88,25 @@ response
   409 until it's re-indexed, instead of silently returning nonsense.
 - **Sources are data, not instructions.** Retrieved passages go into a clearly marked "Sources" block
   that tells the model not to follow directions inside them (stronger guardrails in Layer 6).
+- **MCP tools are an admin allowlist (Layer 4).** Registering a server lists its tools, all switched
+  off. An admin switches on the ones models may use; destructive tools (by the server's own
+  annotations, or no annotations at all) are flagged and need a confirmation in the UI. A tool that
+  starts calling itself destructive on a refresh is switched off again. Once on, tools run without
+  asking (auto-run), so the allowlist is the control point.
+- **One long-lived connection per MCP server.** `MCPManager` keeps each client open in its own
+  background task (the MCP client must be opened and closed by the same task), connects lazily,
+  reconnects after a crash, and limits each call (`MCP_CALL_TIMEOUT_S`). A non-destructive call that
+  hit a dropped connection is retried once; a destructive one never is.
+- **Local and remote servers.** stdio servers are processes the backend starts (minimal environment
+  plus their own env values, never the backend's secrets); HTTP servers are reached over streamable
+  HTTP with stored headers. `MCP_ALLOW_STDIO=false` turns local servers off for the whole platform.
+  Env values and headers are encrypted at rest with a key derived from `SECRET_KEY`.
+- **One tool contract for four vendors.** The adapters translate tools, tool calls and results for
+  Claude, OpenAI, Gemini and Ollama. The model's own turn is kept as an opaque `provider_state` and
+  replayed unchanged, so Claude's thinking blocks and Gemini's thought signatures survive the loop.
+  Tool names are `server__tool` (letters, digits, `_`, `-`, ≤ 64 chars), valid for every vendor.
+- **Tool failures don't fail the chat.** A tool error, timeout or unreachable server becomes an error
+  result for the model to handle; the reply's `tool_calls` trace shows what ran, with what arguments,
+  and how long it took.
 - **Testability.** Every adapter accepts an injected HTTP client; tests replay realistic provider
   responses through a mock transport, so the suite needs no keys and no network.

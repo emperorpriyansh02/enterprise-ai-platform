@@ -69,10 +69,14 @@ export default function KnowledgePage() {
         </div>
       )}
 
-      <div className="grid flex-1 gap-6 overflow-y-auto py-4 md:grid-cols-[17rem_1fr]">
+      <div className="grid flex-1 grid-cols-[minmax(0,1fr)] gap-6 overflow-y-auto py-4 md:grid-cols-[17rem_minmax(0,1fr)]">
         <aside aria-label="Collection list">
           <label className="mb-2 flex items-center gap-2 text-xs text-muted">
-            <input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} />
+            <input
+              type="checkbox"
+              checked={showArchived}
+              onChange={(e) => setShowArchived(e.target.checked)}
+            />
             Show archived
           </label>
           {loading ? (
@@ -82,7 +86,8 @@ export default function KnowledgePage() {
           ) : (
             <ul className="flex flex-col gap-1">
               {collections.map((c) => {
-                const total = c.documents.pending + c.documents.processing + c.documents.ready + c.documents.failed;
+                const total =
+                  c.documents.pending + c.documents.processing + c.documents.ready + c.documents.failed;
                 return (
                   <li key={c.name}>
                     <button
@@ -102,7 +107,9 @@ export default function KnowledgePage() {
                           {c.archived ? "archived" : `${c.documents.ready}/${total} ready`}
                         </span>
                       </span>
-                      {c.description && <span className="block truncate text-xs text-muted">{c.description}</span>}
+                      {c.description && (
+                        <span className="block truncate text-xs text-muted">{c.description}</span>
+                      )}
                     </button>
                   </li>
                 );

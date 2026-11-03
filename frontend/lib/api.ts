@@ -1,10 +1,10 @@
 // Typed client for the backend API: models + chat streaming (Layer 1), prompts (Layer 2),
-// knowledge bases (Layer 3).
+// knowledge bases (Layer 3), MCP tools (Layer 4).
 
 export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
 export type Role = "user" | "assistant";
-export type FinishReason = "stop" | "length" | "refusal" | "content_filter" | "other";
+export type FinishReason = "stop" | "length" | "refusal" | "content_filter" | "tool_calls" | "other";
 
 export interface Message {
   role: Role;
@@ -16,6 +16,7 @@ export interface ChatRequest {
   messages: Message[];
   prompt?: PromptRef;
   rag?: RagRef;
+  tools?: ToolsRef;
   system?: string;
   temperature?: number;
   max_tokens?: number;
@@ -42,6 +43,8 @@ export type StreamEvent =
       citations?: Citation[];
     }
   | { type: "delta"; id: string; delta: string }
+  | { type: "tool_call"; id: string; tool: ToolCallTrace } // about to run (no result yet)
+  | { type: "tool_result"; id: string; tool: ToolCallTrace }
   | {
       type: "done";
       id: string;
@@ -184,6 +187,77 @@ export interface SearchHit {
   keyword_score: number | null;
 }
 
+// --- MCP tools (Layer 4) ---
+
+export type Transport = "stdio" | "http";
+
+export interface ToolsRef {
+  servers: string[];
+}
+
+export interface ToolCallTrace {
+  id: string;
+  server: string;
+  tool: string;
+  arguments: Record<string, unknown>;
+  result?: string; // first 500 characters
+  is_error?: boolean;
+  duration_ms?: number;
+}
+
+export interface McpTool {
+  name: string;
+  description: string;
+  input_schema: {
+    properties?: Record<string, { type?: string; description?: string }>;
+    required?: string[];
+  };
+  read_only: boolean;
+  destructive: boolean;
+  enabled: boolean;
+}
+
+export interface McpServer {
+  name: string;
+  description: string;
+  transport: Transport;
+  command: string | null;
+  args: string[];
+  env_names: string[];
+  url: string | null;
+  header_names: string[];
+  enabled: boolean;
+  allowed_roles: string[];
+  last_error: string | null;
+  last_connected_at: string | null;
+  tools: McpTool[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface McpServerCreate {
+  name: string;
+  description: string;
+  transport: Transport;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+}
+
+export interface AvailableServer {
+  name: string;
+  description: string;
+  tools: { name: string; description: string; destructive: boolean }[];
+}
+
+export interface ToolCallOutcome {
+  content: string;
+  is_error: boolean;
+  duration_ms: number;
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -211,7 +285,6 @@ async function toApiError(response: Response): Promise<ApiError> {
   return new ApiError(`Request failed with status ${response.status}`, response.status);
 }
 
-/** Send a JSON request and parse the JSON reply. Throws ApiError on HTTP errors. */
 /**
  * Send a request and parse the JSON reply. `body` is sent as JSON; `form` as multipart (file uploads,
  * where the browser sets the content type). Throws ApiError on HTTP errors. 204 replies give undefined.
@@ -299,14 +372,20 @@ export function activatePromptVersion(
 }
 
 export function archivePrompt(name: string, adminKey?: string): Promise<PromptDetail> {
-  return apiRequest(`/v1/prompts/${encodeURIComponent(name)}`, { method: "DELETE", adminKey });
+  return apiRequest(`/v1/prompts/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+    adminKey,
+  });
 }
 
 export function renderPrompt(
   name: string,
   body: { version?: number; variables: VariableValues },
 ): Promise<RenderResult> {
-  return apiRequest(`/v1/prompts/${encodeURIComponent(name)}/render`, { method: "POST", body });
+  return apiRequest(`/v1/prompts/${encodeURIComponent(name)}/render`, {
+    method: "POST",
+    body,
+  });
 }
 
 /**
@@ -320,7 +399,10 @@ export async function streamChat(
 ): Promise<void> {
   const response = await fetch(`${API_URL}/v1/chat/stream`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "text/event-stream",
+    },
     body: JSON.stringify(request),
     signal,
   });
@@ -380,7 +462,10 @@ export function archiveCollection(name: string, adminKey?: string): Promise<Coll
 }
 
 export function reindexCollection(name: string, adminKey?: string): Promise<CollectionDetail> {
-  return apiRequest(`${collectionPath(name)}/reindex`, { method: "POST", adminKey });
+  return apiRequest(`${collectionPath(name)}/reindex`, {
+    method: "POST",
+    adminKey,
+  });
 }
 
 export function listDocuments(name: string): Promise<{ data: KnowledgeDocument[] }> {
@@ -390,7 +475,11 @@ export function listDocuments(name: string): Promise<{ data: KnowledgeDocument[]
 export function uploadDocuments(name: string, files: File[], adminKey?: string): Promise<UploadResult> {
   const form = new FormData();
   for (const file of files) form.append("files", file);
-  return apiRequest(`${collectionPath(name)}/documents`, { method: "POST", form, adminKey });
+  return apiRequest(`${collectionPath(name)}/documents`, {
+    method: "POST",
+    form,
+    adminKey,
+  });
 }
 
 export function addTextDocument(
@@ -398,11 +487,18 @@ export function addTextDocument(
   body: { title: string; text: string },
   adminKey?: string,
 ): Promise<KnowledgeDocument> {
-  return apiRequest(`${collectionPath(name)}/documents/text`, { method: "POST", body, adminKey });
+  return apiRequest(`${collectionPath(name)}/documents/text`, {
+    method: "POST",
+    body,
+    adminKey,
+  });
 }
 
 export function deleteDocument(name: string, documentId: string, adminKey?: string): Promise<void> {
-  return apiRequest(`${collectionPath(name)}/documents/${documentId}`, { method: "DELETE", adminKey });
+  return apiRequest(`${collectionPath(name)}/documents/${documentId}`, {
+    method: "DELETE",
+    adminKey,
+  });
 }
 
 export function reindexDocument(
@@ -410,12 +506,88 @@ export function reindexDocument(
   documentId: string,
   adminKey?: string,
 ): Promise<KnowledgeDocument> {
-  return apiRequest(`${collectionPath(name)}/documents/${documentId}/reindex`, { method: "POST", adminKey });
+  return apiRequest(`${collectionPath(name)}/documents/${documentId}/reindex`, {
+    method: "POST",
+    adminKey,
+  });
 }
 
 export function searchCollection(
   name: string,
   body: { query: string; top_k?: number },
-): Promise<{ query: string; collections: string[]; embedding_model: string; hits: SearchHit[] }> {
+): Promise<{
+  query: string;
+  collections: string[];
+  embedding_model: string;
+  hits: SearchHit[];
+}> {
   return apiRequest(`${collectionPath(name)}/search`, { method: "POST", body });
+}
+
+const serverPath = (name: string) => `/v1/tools/servers/${encodeURIComponent(name)}`;
+
+export function listAvailableTools(signal?: AbortSignal): Promise<{ data: AvailableServer[] }> {
+  return apiRequest("/v1/tools", { signal });
+}
+
+/** Ready-made server definitions (the built-in demo server, with the backend's own Python). */
+export function listMcpPresets(adminKey?: string): Promise<{ data: McpServerCreate[] }> {
+  return apiRequest("/v1/tools/presets", { adminKey });
+}
+
+export function listMcpServers(adminKey?: string): Promise<{ data: McpServer[] }> {
+  return apiRequest("/v1/tools/servers", { adminKey });
+}
+
+export function getMcpServer(name: string, adminKey?: string): Promise<McpServer> {
+  return apiRequest(serverPath(name), { adminKey });
+}
+
+export function createMcpServer(body: McpServerCreate, adminKey?: string): Promise<McpServer> {
+  return apiRequest("/v1/tools/servers", { method: "POST", body, adminKey });
+}
+
+export function updateMcpServer(
+  name: string,
+  body: { description?: string; enabled?: boolean },
+  adminKey?: string,
+): Promise<McpServer> {
+  return apiRequest(serverPath(name), { method: "PATCH", body, adminKey });
+}
+
+export function deleteMcpServer(name: string, adminKey?: string): Promise<void> {
+  return apiRequest(serverPath(name), { method: "DELETE", adminKey });
+}
+
+export function refreshMcpServer(name: string, adminKey?: string): Promise<McpServer> {
+  return apiRequest(`${serverPath(name)}/refresh`, {
+    method: "POST",
+    adminKey,
+  });
+}
+
+export function setMcpToolEnabled(
+  server: string,
+  tool: string,
+  enabled: boolean,
+  adminKey?: string,
+): Promise<McpTool> {
+  return apiRequest(`${serverPath(server)}/tools/${encodeURIComponent(tool)}`, {
+    method: "PATCH",
+    body: { enabled },
+    adminKey,
+  });
+}
+
+export function callMcpTool(
+  server: string,
+  tool: string,
+  args: Record<string, unknown>,
+  adminKey?: string,
+): Promise<ToolCallOutcome> {
+  return apiRequest(`${serverPath(server)}/tools/${encodeURIComponent(tool)}/call`, {
+    method: "POST",
+    body: { arguments: args },
+    adminKey,
+  });
 }

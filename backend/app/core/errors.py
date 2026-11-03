@@ -173,6 +173,52 @@ class RagUnavailableError(AppError):
     code = "rag_unavailable"
 
 
+# --- MCP tools (Layer 4) ---
+
+
+class ToolsUnavailableError(AppError):
+    """No database is configured, so there's no MCP server registry."""
+
+    status_code = 503
+    code = "tools_unavailable"
+
+
+class MCPServerNotFoundError(AppError):
+    status_code = 404
+    code = "mcp_server_not_found"
+
+
+class MCPServerConflictError(AppError):
+    status_code = 409
+    code = "mcp_server_conflict"
+
+
+class MCPToolNotFoundError(AppError):
+    status_code = 404
+    code = "mcp_tool_not_found"
+
+
+class MCPConnectionError(AppError):
+    """The MCP server couldn't be started, reached, or didn't answer in time."""
+
+    status_code = 502
+    code = "mcp_connection_failed"
+
+
+class MCPStdioDisabledError(AppError):
+    """Local (stdio) MCP servers are switched off (MCP_ALLOW_STDIO=false)."""
+
+    status_code = 403
+    code = "mcp_stdio_disabled"
+
+
+class SecretKeyMissingError(AppError):
+    """A secret (env value or header) was given, but SECRET_KEY isn't set, so it can't be encrypted."""
+
+    status_code = 400
+    code = "secret_key_missing"
+
+
 def register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def _handle_app_error(_: Request, exc: AppError) -> JSONResponse:

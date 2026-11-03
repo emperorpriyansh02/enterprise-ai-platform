@@ -18,6 +18,7 @@ def test_health(client: TestClient):
         "providers": ["mock"],
         "database": "disabled",
         "rag": "disabled",
+        "tools": "disabled",
     }
     assert response.headers["X-Request-ID"]
 

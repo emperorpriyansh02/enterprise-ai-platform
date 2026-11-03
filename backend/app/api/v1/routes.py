@@ -1,4 +1,4 @@
-"""HTTP routes for Layer 1: health, model catalog, chat (blocking and streaming)."""
+"""HTTP routes for Layer 1: health, model catalog, chat (blocking and streaming, with tools from Layer 4)."""
 
 from collections.abc import AsyncIterator
 from typing import Annotated
@@ -26,7 +26,13 @@ async def health(request: Request, registry: Registry) -> dict:
     else:
         db_status = "ok" if await database.ping() else "unavailable"
     rag_status = await request.app.state.rag.status() if db_status == "ok" else "disabled"
-    return {"status": "ok", "providers": registry.provider_names, "database": db_status, "rag": rag_status}
+    return {
+        "status": "ok",
+        "providers": registry.provider_names,
+        "database": db_status,
+        "rag": rag_status,
+        "tools": db_status,  # the MCP server registry lives in the database
+    }
 
 
 @router.get("/models", response_model=ModelList)

@@ -14,7 +14,7 @@ observability and evals added one layer at a time.
 | 1 | API calls: unified multi-provider LLM API (Claude, OpenAI, Gemini, Ollama), streaming | ✅ Built | `backend/app/llm`, `backend/app/api` |
 | 2 | System prompts: versioned templates in Postgres, admin API, Prompts page | ✅ Built | `backend/app/prompts`, `frontend/components/prompts` |
 | 3 | RAG: knowledge bases (txt/md/pdf/docx/html), hybrid search on pgvector, cited answers | ✅ Built | `backend/app/rag`, `frontend/components/knowledge` |
-| 4 | MCP tools | Planned | `backend/app/mcp` |
+| 4 | MCP tools: stdio + HTTP MCP servers, admin tool allowlist, model ↔ tool loop for all providers, Tools page | ✅ Built | `backend/app/mcp`, `frontend/components/tools` |
 | 5 | RBAC + OAuth (Keycloak / OIDC) | Planned | `backend/app/auth` |
 | 6 | Guardrails | Planned | `backend/app/guardrails` |
 | 7 | Cache + router | Planned | `backend/app/cache`, `backend/app/routing` |
@@ -100,6 +100,9 @@ Only models listed in config can be called. See [`backend/.env.example`](backend
 | `ADMIN_API_KEY` | If set, prompt and knowledge-base changes need the `X-Admin-Key` header (stand-in until RBAC in Layer 5). |
 | `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` | Embeddings for knowledge bases: `openai`, `gemini`, `ollama` or `mock` (blank = first configured). Vectors are 768 numbers. See [backend/app/rag/README.md](backend/app/rag/README.md). |
 | `RAG_*` | Chunk size and overlap, passages per answer, upload limit, indexing concurrency. |
+| `SECRET_KEY` | Encrypts MCP server secrets (env values, headers) in the database. Needed only to save secrets. |
+| `MCP_ALLOW_STDIO` | Allow MCP servers the backend starts as local commands (default `true`). `false` = HTTP servers only. |
+| `MCP_*` | Tool rounds per message (5), call and connect timeouts, max tool result length. See [backend/app/mcp/README.md](backend/app/mcp/README.md). |
 
 OpenAI and Gemini model names change often. Check the provider's current model list and set
 `OPENAI_MODELS` / `GEMINI_MODELS` to match.
@@ -108,7 +111,7 @@ OpenAI and Gemini model names change often. Check the provider's current model l
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/health` | Liveness, enabled providers, database status |
+| GET | `/health` | Liveness, enabled providers, database / RAG / tools status |
 | GET | `/v1/models` | Models you can call, and the default |
 | POST | `/v1/chat` | Chat completion (JSON) |
 | POST | `/v1/chat/stream` | Chat completion as server-sent events |
@@ -124,6 +127,13 @@ OpenAI and Gemini model names change often. Check the provider's current model l
 | GET/DELETE | `/v1/collections/{name}/documents/{id}` | Document status / delete |
 | POST | `/v1/collections/{name}/search` | Test search (no LLM) |
 | POST | `/v1/collections/{name}/reindex` | Re-embed everything (after changing the embedding model) |
+| GET | `/v1/tools` | MCP servers and tools a chat may use |
+| GET/POST | `/v1/tools/servers` | List / register MCP servers (stdio command or HTTP URL) |
+| GET/PATCH/DELETE | `/v1/tools/servers/{name}` | Details / enable-disable / delete |
+| POST | `/v1/tools/servers/{name}/refresh` | Reconnect and re-read the tool list |
+| PATCH | `/v1/tools/servers/{name}/tools/{tool}` | Switch a tool on or off (`{"enabled": true}`) |
+| POST | `/v1/tools/servers/{name}/tools/{tool}/call` | Run a tool directly, to test it |
+| GET | `/v1/tools/presets` | Ready-made servers (the built-in demo server) |
 
 ```bash
 curl -s localhost:8000/v1/chat -H 'content-type: application/json' -d '{
@@ -155,8 +165,13 @@ With knowledge bases (Layer 3): add `"rag": {"collections": ["hr-policies"]}`. T
 sources, the model cites them as [1], [2], and the reply includes `"citations"`.
 See [backend/app/rag/README.md](backend/app/rag/README.md).
 
+With MCP tools (Layer 4): add `"tools": {"servers": ["demo"]}`. The model may call that server's switched-on tools
+(up to `MCP_MAX_TOOL_ROUNDS` rounds), and the reply includes `"tool_calls"`: each call's server, tool, arguments,
+result and duration. Register servers and switch tools on in the **Tools** page (try **Use demo server**).
+See [backend/app/mcp/README.md](backend/app/mcp/README.md).
+
 Streaming events (`/v1/chat/stream`), one JSON object per SSE `data:` line:
-`start` → `delta` (text chunks) → `done` (finish reason, usage, latency), or `error`.
+`start` → `delta` (text chunks), with `tool_call` / `tool_result` pairs when tools run → `done` (finish reason, usage, latency), or `error`.
 
 Errors always look like `{"error": {"code": "...", "message": "...", "provider": "..."}}`.
 
@@ -186,7 +201,8 @@ backend/
       providers/            anthropic, openai, gemini, ollama, mock
     prompts/                Layer 2: models, repository (SQL), service (rules), templates, seed
     rag/                    Layer 3: parsers, chunking, embedders, hybrid search, background indexing
-    mcp/ auth/ guardrails/ cache/ routing/ observability/   (layers 4–8)
+    mcp/                    Layer 4: MCP connections, server registry + tool allowlist, toolbox, demo server
+    auth/ guardrails/ cache/ routing/ observability/   (layers 5–8)
   migrations/               Alembic database migrations
   evals/                    (layer 9)
   tests/
@@ -194,9 +210,11 @@ frontend/
   app/page.tsx              chat page
   app/prompts/page.tsx      prompts page
   app/knowledge/page.tsx    knowledge page
+  app/tools/page.tsx        tools page
   components/chat.tsx       chat UI (prompt + model pickers, variables, streaming)
   components/prompts/       prompts UI (list, versions, rollback, preview, editor)
   components/knowledge/     knowledge UI (collections, uploads, indexing status, test search)
+  components/tools/         tools UI (MCP servers, tool allowlist, try a tool)
   lib/api.ts                typed API client + SSE parser
 docs/
   WORKFLOW_CODE_MAP.md      which functions run, in order, per workflow

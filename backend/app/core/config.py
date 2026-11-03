@@ -84,6 +84,16 @@ class Settings(BaseSettings):
     rag_max_upload_mb: float = Field(default=20, gt=0)
     rag_ingest_concurrency: int = Field(default=2, ge=1, le=16)
 
+    # --- MCP tools (Layer 4). Needs DATABASE_URL (the server registry is stored there). ---
+    # Encrypts MCP secrets (env values, HTTP headers) at rest. Required to save any secret.
+    secret_key: SecretStr | None = None
+    # Allow MCP servers that the backend starts as a local command. Turn off where that's not acceptable.
+    mcp_allow_stdio: bool = True
+    mcp_max_tool_rounds: int = Field(default=5, ge=1, le=20, description="Model ↔ tool rounds per message.")
+    mcp_call_timeout_s: float = Field(default=30, gt=0)
+    mcp_connect_timeout_s: float = Field(default=20, gt=0)
+    mcp_max_result_chars: int = Field(default=20_000, ge=500, description="Longer tool results are cut.")
+
     @field_validator(
         "cors_origins",
         "anthropic_models",
@@ -108,6 +118,7 @@ class Settings(BaseSettings):
         "admin_api_key",
         "embedding_provider",
         "embedding_model",
+        "secret_key",
         mode="before",
     )
     @classmethod

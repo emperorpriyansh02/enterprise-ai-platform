@@ -30,6 +30,7 @@ files use the same section numbers.
 12. [Tests](#12-tests)
 13. [Prompts (Layer 2)](#13-prompts-layer-2)
 14. [Knowledge bases / RAG (Layer 3)](#14-knowledge-bases--rag-layer-3)
+15. [MCP tools (Layer 4)](#15-mcp-tools-layer-4)
 
 ---
 
@@ -40,11 +41,15 @@ Browser ──► Next.js chat UI ──► FastAPI route ──► ChatService 
                                                        │
                                                        ├──► PromptService (managed prompt from Postgres, Layer 2)
                                                        ├──► RagService (cited passages from pgvector, Layer 3)
+                                                       ├──► MCPService → Toolbox (allowed MCP tools, Layer 4)
                                                        ▼
                                           provider adapter (Anthropic / OpenAI / Gemini / Ollama / Mock)
                                                        │
                                                        ▼
                                           vendor SDK or HTTP call ──► the LLM
+                                                       │  (asks for tools?)
+                                                       ▼
+                                   Toolbox ──► MCPManager ──► MCP servers ──► results back to the LLM
 ```
 
 The reply travels back the same way: the adapter turns the vendor's answer into our own shape,
@@ -80,6 +85,7 @@ which builds the app. When the server starts, it creates one client per enabled 
    6. Logs `prompt store: enabled` or `prompt store: disabled (no DATABASE_URL)`.
    7. With a database: `build_embedder()` · `backend/app/rag/embeddings.py` picks the embedding provider (section 14.1) and logs `embedding model: ...`.
    8. `RagRuntime.__init__()` · `backend/app/rag/runtime.py` → saved on `app.state.rag`; then `RagRuntime.start()` · `backend/app/rag/runtime.py` starts the background indexing worker (section 14.2).
+   9. `MCPManager.__init__()` · `backend/app/mcp/manager.py` → saved on `app.state.mcp`. MCP servers are connected on first use (section 15.1).
 3. The app now waits for requests.
 
 ---
@@ -109,7 +115,7 @@ which builds the app. When the server starts, it creates one client per enabled 
    1. `ProviderRegistry.provider_names()` · `backend/app/llm/registry.py` — the list of enabled provider names.
    2. `Database.ping()` · `backend/app/db/session.py` — runs `SELECT 1` if a database is configured.
    3. `RagRuntime.status()` · `backend/app/rag/runtime.py` — knowledge bases `ok`, `unavailable` or `disabled`.
-4. Returns `{"status": "ok", "providers": [...], "database": "ok" | "unavailable" | "disabled", "rag": "ok" | "unavailable" | "disabled"}`.
+4. Returns `{"status": "ok", "providers": [...], "database": "ok" | "unavailable" | "disabled", "rag": "ok" | "unavailable" | "disabled", "tools": <same as database>}`.
 
 ---
 
@@ -138,21 +144,25 @@ which builds the app. When the server starts, it creates one client per enabled 
    1. `get_db_session()` · `backend/app/api/deps.py` — opens one database session for this request (or gives `None` without a database).
    2. `get_prompt_service()` · `backend/app/api/deps.py` — wraps that session in a `PromptService` (or `None`), using `get_settings_from_app()` · `backend/app/api/deps.py` for `DEFAULT_PROMPT_NAME`.
    3. `get_rag_service()` · `backend/app/api/deps.py` — a `RagService` on the same session (or `None` without a database or embedder).
-   4. `get_registry()` · `backend/app/api/deps.py`
-   5. `ChatService.__init__()` · `backend/app/services/chat_service.py` — keeps the registry, the prompt service, the RAG service and the RAG runtime.
+   4. `get_mcp_service()` · `backend/app/api/deps.py` — an `MCPService` on the same session (or `None` without a database).
+   5. `get_registry()` · `backend/app/api/deps.py`
+   6. `ChatService.__init__()` · `backend/app/services/chat_service.py` — keeps the registry, the prompt, RAG and MCP services, the RAG runtime, `MCP_MAX_TOOL_ROUNDS`, and `release_db` (closes the session).
 4. `chat()` · `backend/app/api/v1/routes.py` — the route; hands off to the service.
 5. `ChatService.complete()` · `backend/app/services/chat_service.py` — the main work:
-   1. `ProviderRegistry.resolve()` · `backend/app/llm/registry.py` — `"anthropic/claude-opus-5-5"` → (Anthropic adapter, `"claude-opus-5-5"`). Unknown or not-allowed model → 404.
-      - No model in the request → uses `ProviderRegistry.default_model()` · `backend/app/llm/registry.py`.
-   2. `ChatService._build_system()` · `backend/app/services/chat_service.py` — works out the final system prompt: the managed prompt (if the request names one, or a default applies), then the request's own `system` text. Details in section 13.3.
-      - Then `ChatService._retrieve()` · `backend/app/services/chat_service.py` — if the request has `rag`, searches those collections and adds a numbered "Sources" block to the system prompt. Details in section 14.4.
-   3. `_new_id()` · `backend/app/services/chat_service.py` — makes the reply id `chat_<random>`.
-   4. Starts a timer.
-   5. `_to_llm_request()` · `backend/app/services/chat_service.py` — converts the public `ChatRequest` into the internal `LLMRequest` (model name without the `provider/` prefix, final system prompt).
-   6. `provider.complete(...)` — the chosen adapter's `complete` (section 7), e.g. `AnthropicProvider.complete()` · `backend/app/llm/providers/anthropic_provider.py`. It calls the vendor and returns an `LLMResult`.
-   7. `_ms_since()` · `backend/app/services/chat_service.py` — how long the call took.
-   8. Logs `chat completed` with provider, model, prompt (`_prompt_label()` · `backend/app/services/chat_service.py` → `support-agent@v3`), tokens, latency, finish reason.
-   9. Builds the `ChatResponse`, including `prompt: {name, version}` when a managed prompt was used and `citations` when `rag` was used.
+   1. `ChatService._prepare()` · `backend/app/services/chat_service.py` — everything before the first model call:
+      1. `ProviderRegistry.resolve()` · `backend/app/llm/registry.py` — `"anthropic/claude-opus-5-5"` → (Anthropic adapter, `"claude-opus-5-5"`). Unknown or not-allowed model → 404.
+         - No model in the request → uses `ProviderRegistry.default_model()` · `backend/app/llm/registry.py`.
+      2. `ChatService._build_system()` · `backend/app/services/chat_service.py` — works out the final system prompt: the managed prompt (if the request names one, or a default applies), then the request's own `system` text. Details in section 13.3.
+      3. `ChatService._retrieve()` · `backend/app/services/chat_service.py` — if the request has `rag`, searches those collections and adds a numbered "Sources" block to the system prompt. Details in section 14.4.
+      4. `ChatService._toolbox()` · `backend/app/services/chat_service.py` — if the request has `tools`, loads the enabled tools of those MCP servers. Details in section 15.5.
+      5. `release_db` closes the request's database session (nothing below needs it).
+      6. `_to_llm_request()` · `backend/app/services/chat_service.py` — converts the public `ChatRequest` into the internal `LLMRequest` (model name without the `provider/` prefix, final system prompt, tools).
+   2. `_new_id()` · `backend/app/services/chat_service.py` — makes the reply id `chat_<random>`. Starts a timer.
+   3. `provider.complete(...)` — the chosen adapter's `complete` (section 7), e.g. `AnthropicProvider.complete()` · `backend/app/llm/providers/anthropic_provider.py`. It calls the vendor and returns an `LLMResult`.
+   4. If the model asked for tools: run them and call the model again, up to `MCP_MAX_TOOL_ROUNDS` times (section 15.5). Tokens are summed with `_add_usage()` · `backend/app/services/chat_service.py`.
+   5. `_ms_since()` · `backend/app/services/chat_service.py` — how long it all took.
+   6. `ChatService._log()` · `backend/app/services/chat_service.py` — logs `chat completed` with provider, model, prompt (`_prompt_label()` · `backend/app/services/chat_service.py` → `support-agent@v3`), sources, tool calls, tokens, latency, finish reason.
+   7. Builds the `ChatResponse`, including `prompt: {name, version}` when a managed prompt was used, `citations` when `rag` was used, and `tool_calls` when `tools` was used.
 6. FastAPI turns the `ChatResponse` into JSON and sends it.
 
 If anything in step 5 raises an error, go to section 8.
@@ -162,25 +172,23 @@ If anything in step 5 raises an error, go to section 8.
 ## 6. Chat, streaming — `POST /v1/chat/stream`
 
 **What happens:** same as section 5, but the answer arrives piece by piece as server-sent events
-(`start` → many `delta` → `done`, or `error`).
+(`start` → many `delta`, with `tool_call`/`tool_result` pairs when tools run → `done`, or `error`).
 
 1. `request_context()` · `backend/app/main.py`, body validation with `ChatRequest._first_message_from_user()` · `backend/app/schemas/chat.py`, and `get_chat_service()` · `backend/app/api/deps.py` — same as section 5, steps 1–3.
 2. `chat_stream()` · `backend/app/api/v1/routes.py` — the route.
    1. Calls `ChatService.stream()` · `backend/app/services/chat_service.py`, which gives back an event generator (nothing runs yet).
    2. **Pulls the first event right away.** That makes the generator run until its first `yield`:
-      1. `ProviderRegistry.resolve()` · `backend/app/llm/registry.py` — pick the adapter (404 if unknown).
-      2. `ChatService._build_system()` · `backend/app/services/chat_service.py` — final system prompt (section 13.3). An unknown prompt or missing variable fails *here*, as a normal HTTP error.
-         - Then `ChatService._retrieve()` · `backend/app/services/chat_service.py` — adds knowledge-base sources (section 14.4). An unknown collection fails here too.
-      3. `_new_id()` · `backend/app/services/chat_service.py` and start a timer.
-      4. `_to_llm_request()` · `backend/app/services/chat_service.py` — convert the request.
-      5. `provider.stream(...)` — the adapter's `stream` (section 7), e.g. `OpenAIProvider.stream()` · `backend/app/llm/providers/openai_provider.py`.
-      6. Waits for the adapter's **first chunk**. This is when the vendor is actually contacted, so a bad key or rate limit fails *here* and becomes a normal HTTP error (section 8).
-      7. Yields the `start` event (with `prompt` if a managed prompt was used, and `citations` if `rag` was used).
+      1. `ChatService._prepare()` · `backend/app/services/chat_service.py` — the same preparation as section 5: `ProviderRegistry.resolve()` · `backend/app/llm/registry.py` (404 if unknown), `ChatService._build_system()` · `backend/app/services/chat_service.py` (an unknown prompt or missing variable fails *here*, as a normal HTTP error), `ChatService._retrieve()` · `backend/app/services/chat_service.py` (an unknown collection fails here too), `ChatService._toolbox()` · `backend/app/services/chat_service.py` (an unknown MCP server too), then `_to_llm_request()` · `backend/app/services/chat_service.py`.
+      2. `_new_id()` · `backend/app/services/chat_service.py` and start a timer.
+      3. `provider.stream(...)` — the adapter's `stream` (section 7), e.g. `OpenAIProvider.stream()` · `backend/app/llm/providers/openai_provider.py`.
+      4. Waits for the adapter's **first chunk**. This is when the vendor is actually contacted, so a bad key or rate limit fails *here* and becomes a normal HTTP error (section 8).
+      5. Yields the `start` event (with `prompt` if a managed prompt was used, and `citations` if `rag` was used).
    3. Wraps the rest in an `EventSourceResponse` (server-sent events, with a keep-alive ping every 15 s).
 3. `_sse()` · `backend/app/api/v1/routes.py` — turns each event into an SSE `data:` line, while `ChatService.stream()` · `backend/app/services/chat_service.py` keeps running:
    1. For every text chunk → yields a `delta` event.
-   2. When the adapter's final chunk arrives (`done=True`) → `_ms_since()` · `backend/app/services/chat_service.py`, logs `chat stream completed`, yields the `done` event, stops.
-   3. If the adapter fails mid-stream → logs `chat stream failed`, yields an `error` event, stops. (The HTTP status is already 200 at this point, so the error travels inside the stream.)
+   2. A final chunk with tool calls (and `ChatService._wants_tools()` · `backend/app/services/chat_service.py` says yes) → `tool_call` events, run the tools, `tool_result` events, then the adapter's stream starts again (section 15.5).
+   3. When the adapter's final chunk arrives (`done=True`) → `_ms_since()` · `backend/app/services/chat_service.py`, logs `chat stream completed` (`ChatService._log()` · `backend/app/services/chat_service.py`), yields the `done` event, stops.
+   4. If the adapter fails mid-stream → logs `chat stream failed`, yields an `error` event, stops. (The HTTP status is already 200 at this point, so the error travels inside the stream.)
 
 ---
 
@@ -192,6 +200,10 @@ Every adapter follows the same contract, defined in `backend/app/llm/base.py`:
 - `LLMProvider.complete()` · `backend/app/llm/base.py` — one full reply.
 - `LLMProvider.stream()` · `backend/app/llm/base.py` — text pieces, then one final chunk.
 - `LLMProvider.aclose()` · `backend/app/llm/base.py` — close network clients at shutdown.
+
+Tools (Layer 4): when `LLMRequest.tools` is set, `_params`/`_payload` also send the tools and replay
+earlier tool rounds from `LLMRequest.turns`, and `complete`/`stream` return the model's `tool_calls`
+(details per vendor in section 15.6).
 
 ### 7.1 Anthropic Claude — `complete` and `stream`
 
@@ -323,14 +335,15 @@ and `ChatService.stream()` · `backend/app/services/chat_service.py`).
 ## 10. Shutdown
 
 1. The server stops (Ctrl+C or container stop) → `lifespan()` · `backend/app/main.py` continues after its `yield`.
-2. `ProviderRegistry.aclose()` · `backend/app/llm/registry.py` — closes each adapter, one by one; a failure in one is logged and doesn't stop the others:
+2. `MCPManager.aclose()` · `backend/app/mcp/manager.py` — closes every MCP connection and stops stdio server processes (section 15.1).
+3. `ProviderRegistry.aclose()` · `backend/app/llm/registry.py` — closes each adapter, one by one; a failure in one is logged and doesn't stop the others:
    - `AnthropicProvider.aclose()` · `backend/app/llm/providers/anthropic_provider.py`
    - `OpenAIProvider.aclose()` · `backend/app/llm/providers/openai_provider.py`
    - `GeminiProvider.aclose()` · `backend/app/llm/providers/gemini_provider.py`
    - `OllamaProvider.aclose()` · `backend/app/llm/providers/ollama_provider.py`
    - Mock uses `LLMProvider.aclose()` · `backend/app/llm/base.py` (does nothing).
-3. `RagRuntime.stop()` · `backend/app/rag/runtime.py` — stops the indexing worker (`IngestionWorker.stop()` · `backend/app/rag/runtime.py`) and closes the embedder's client (e.g. `OpenAIEmbedder.aclose()` · `backend/app/rag/embeddings.py`).
-4. `Database.aclose()` · `backend/app/db/session.py` — closes the database connection pool (only if the app opened it).
+4. `RagRuntime.stop()` · `backend/app/rag/runtime.py` — stops the indexing worker (`IngestionWorker.stop()` · `backend/app/rag/runtime.py`) and closes the embedder's client (e.g. `OpenAIEmbedder.aclose()` · `backend/app/rag/embeddings.py`).
+5. `Database.aclose()` · `backend/app/db/session.py` — closes the database connection pool (only if the app opened it).
 
 ---
 
@@ -338,7 +351,7 @@ and `ChatService.stream()` · `backend/app/services/chat_service.py`).
 
 ### 11.1 Page load
 
-1. Next.js renders `RootLayout()` · `frontend/app/layout.tsx` — the `<html>`/`<body>` shell, fonts, and the top bar `NavBar()` · `frontend/components/nav.tsx` (Chat | Prompts links).
+1. Next.js renders `RootLayout()` · `frontend/app/layout.tsx` — the `<html>`/`<body>` shell, fonts, and the top bar `NavBar()` · `frontend/components/nav.tsx` (Chat | Prompts | Knowledge | Tools links).
 2. Inside it, `Home()` · `frontend/app/page.tsx` — the `/` page, which renders the chat.
 3. `Chat()` · `frontend/components/chat.tsx` — the chat component; sets up its state (models, turns, input...).
 4. Right after the first render, the **load-models effect** inside `Chat()` · `frontend/components/chat.tsx` runs:
@@ -351,6 +364,7 @@ and `ChatService.stream()` · `backend/app/services/chat_service.py`).
    1. `listPrompts()` · `frontend/lib/api.ts` → `apiRequest()` · `frontend/lib/api.ts` — `GET /v1/prompts`.
    2. Success → fills the Prompt dropdown. Failure (no database) → the dropdown shows "Unavailable"; chat still works.
 6. The **load-collections effect** inside `Chat()` · `frontend/components/chat.tsx`: `listCollections()` · `frontend/lib/api.ts` → if there are any, a **Knowledge** button appears (section 14.6).
+7. The **load-tools effect** inside `Chat()` · `frontend/components/chat.tsx`: `listAvailableTools()` · `frontend/lib/api.ts` → if any server has enabled tools, a **Tools** button appears (section 15.8).
 
 ### 11.2 Sending a message
 
@@ -358,13 +372,14 @@ and `ChatService.stream()` · `backend/app/services/chat_service.py`).
    1. Stops early if a prompt is selected and any of its variables is empty (the hint under the box names them). Otherwise builds the history from earlier turns (skipping failed ones) and adds the new user message.
    2. `nextKey()` · `frontend/components/chat.tsx` (twice) — unique keys for the new user turn and the empty assistant turn.
    3. Adds both turns to the screen; clears the input; marks the chat busy.
-   4. `streamChat()` · `frontend/lib/api.ts` — `POST /v1/chat/stream`, with `prompt: {name, variables}` when a prompt is selected and `rag: {collections}` when knowledge bases are ticked.
+   4. `streamChat()` · `frontend/lib/api.ts` — `POST /v1/chat/stream`, with `prompt: {name, variables}` when a prompt is selected `rag: {collections}` when knowledge bases are ticked, and `tools: {servers}` when Tools servers are ticked.
       1. Not OK → `toApiError()` · `frontend/lib/api.ts` → throws `ApiError` · `frontend/lib/api.ts`.
       2. Reads the response body piece by piece; splits it at blank lines.
       3. `parseEvent()` · `frontend/lib/api.ts` — one SSE block → one event object.
       4. Calls the event handler inside `send()` · `frontend/components/chat.tsx` for each event:
          - `start` → `updateTurn()` · `frontend/components/chat.tsx` saves provider/model/prompt and the citations (shown as "Sources").
          - `delta` → `updateTurn()` · `frontend/components/chat.tsx` appends the text.
+         - `tool_call` / `tool_result` → `updateTurn()` · `frontend/components/chat.tsx` adds / completes a line in the reply's tool list (`ToolTrace()` · `frontend/components/chat.tsx`).
          - `done` → `updateTurn()` · `frontend/components/chat.tsx` saves usage, latency, finish reason.
          - `error` → `updateTurn()` · `frontend/components/chat.tsx` shows the error under the reply.
    5. When the stream ends (or fails) → `updateTurn()` · `frontend/components/chat.tsx` marks the turn finished; busy is cleared.
@@ -758,3 +773,180 @@ Run the database ones with `TEST_DATABASE_URL=postgresql+asyncpg://...`; on SQLi
   `test_unfinished_documents_are_requeued_on_start()` · `backend/tests/test_rag_api.py`,
   `test_without_postgres_rag_is_unavailable_but_chat_works()` · `backend/tests/test_rag_api.py`,
   `test_without_database_rag_is_unavailable()` · `backend/tests/test_rag_api.py`
+
+---
+
+## 15. MCP tools (Layer 4)
+
+Connect MCP servers, let an admin choose which tools models may use, and run the model ↔ tool loop.
+Code lives in `backend/app/mcp/`, routes in `backend/app/api/v1/tools.py`, the loop in
+`backend/app/services/chat_service.py`, UI in `frontend/components/tools/`.
+
+```
+register ──► connect (stdio process or HTTP) ──► list tools ──► mcp_tools rows, all OFF
+admin switches tools ON ──► chat with tools: {servers}
+chat ──► model ──► tool calls? ──► Toolbox ──► MCPManager ──► MCP server ──► results ──► model ──► ... ──► answer
+```
+
+### 15.1 Startup, connections and shutdown
+
+1. In `lifespan()` · `backend/app/main.py`: `MCPManager.__init__()` · `backend/app/mcp/manager.py` → saved on `app.state.mcp`. Nothing connects yet.
+2. The first time a request needs a server, `MCPManager._client()` · `backend/app/mcp/manager.py` (called by `MCPManager.list_tools()` · `backend/app/mcp/manager.py` or `MCPManager.call_tool()` · `backend/app/mcp/manager.py`):
+   1. stdio while `MCP_ALLOW_STDIO=false` → 403.
+   2. Takes the server's lock; reuses a live connection whose `ServerTarget.fingerprint()` · `backend/app/mcp/manager.py` still matches (`_Connection.alive()` · `backend/app/mcp/manager.py`); otherwise `MCPManager.disconnect()` · `backend/app/mcp/manager.py` and a new one:
+   3. `_Connection.__init__()` · `backend/app/mcp/manager.py` → `_Connection.open()` · `backend/app/mcp/manager.py` starts a background task running `_Connection._run()` · `backend/app/mcp/manager.py`:
+      1. `_Connection._transport()` · `backend/app/mcp/manager.py` — stdio parameters (command, args, env) or a streamable-HTTP transport with the headers.
+      2. Opens the MCP `Client` (handshake), signals "ready", then waits until asked to stop.
+      3. A startup failure is unwrapped by `_leaf()` · `backend/app/mcp/manager.py` and described by `_describe()` · `backend/app/mcp/manager.py`.
+   4. `_Connection.open()` · `backend/app/mcp/manager.py` waits for "ready" (at most `MCP_CONNECT_TIMEOUT_S`), then `_Connection.client()` · `backend/app/mcp/manager.py` hands out the client.
+3. Listing: `MCPManager.list_tools()` · `backend/app/mcp/manager.py` → `_all_tools()` · `backend/app/mcp/manager.py` (every page). A dropped connection (`_is_lost()` · `backend/app/mcp/manager.py`) → reconnect and list once more.
+4. Calling: `MCPManager.call_tool()` · `backend/app/mcp/manager.py` — time limit `MCP_CALL_TIMEOUT_S`; dropped connection → reconnect, and retry once only if the tool isn't destructive.
+5. `MCPManager.is_connected()` · `backend/app/mcp/manager.py` tells whether a server has a live connection (tests).
+6. Shutdown, in `lifespan()` · `backend/app/main.py`: `MCPManager.aclose()` · `backend/app/mcp/manager.py` → `MCPManager.disconnect()` · `backend/app/mcp/manager.py` for each → `_Connection.close()` · `backend/app/mcp/manager.py` (stops stdio processes).
+
+### 15.2 Registering a server — `POST /v1/tools/servers`
+
+Every `/v1/tools` route first runs `get_db_session()` · `backend/app/api/deps.py` → `get_mcp_service()` · `backend/app/api/deps.py` (`MCPService.__init__()` · `backend/app/mcp/service.py`) → `require_mcp_service()` · `backend/app/api/deps.py` (503 `tools_unavailable` without a database). Routes under `/servers` and `/presets` also run `require_admin()` · `backend/app/api/deps.py`.
+
+1. FastAPI checks the body with `ServerCreate._check_transport()` · `backend/app/mcp/schemas.py` (stdio needs `command`, http needs an `http(s)://` URL).
+2. `create_server()` · `backend/app/api/v1/tools.py` → `MCPService.create_server()` · `backend/app/mcp/service.py`
+   1. stdio switched off → 403; `MCPService._find_server()` · `backend/app/mcp/service.py` finds the name taken → 409.
+   2. `encrypt_secrets()` · `backend/app/mcp/secrets.py` (→ `_fernet()` · `backend/app/mcp/secrets.py`, using `MCPService._secret_key()` · `backend/app/mcp/service.py`) for env values or headers; no `SECRET_KEY` with secrets → 400.
+   3. Saves the row → `MCPService._commit()` · `backend/app/mcp/service.py`.
+   4. `MCPService._refresh()` · `backend/app/mcp/service.py` (doesn't raise) — see 15.3. A failure is kept in `last_error`.
+   5. `MCPService._out()` · `backend/app/mcp/service.py` → `_server_out()` · `backend/app/mcp/service.py` (names of secrets only) → **201**.
+3. The **Use demo server** button first calls `list_presets()` · `backend/app/api/v1/tools.py` → `presets()` · `backend/app/mcp/service.py` (the demo server with this backend's Python).
+
+### 15.3 Refreshing tools — `POST /v1/tools/servers/{name}/refresh`
+
+1. `refresh_server()` · `backend/app/api/v1/tools.py` → `MCPService.refresh_server()` · `backend/app/mcp/service.py` → `MCPService._require_server()` · `backend/app/mcp/service.py` (404).
+2. `MCPService._refresh()` · `backend/app/mcp/service.py`
+   1. `MCPService._target()` · `backend/app/mcp/service.py` — row → `ServerTarget`, secrets via `decrypt_secrets()` · `backend/app/mcp/secrets.py`.
+   2. `MCPService._end_read()` · `backend/app/mcp/service.py` — frees the database connection during the network call.
+   3. `MCPManager.list_tools()` · `backend/app/mcp/manager.py` (15.1).
+   4. `MCPService._upsert_tools()` · `backend/app/mcp/service.py` — existing rows via `MCPService._tools_by_server()` · `backend/app/mcp/service.py`; hints via `_hints()` · `backend/app/mcp/service.py`; new tools **off**; a tool that became destructive → off; vanished tools deleted.
+   5. Saves `last_error = None`, `last_connected_at = now` → `MCPService._commit()` · `backend/app/mcp/service.py`. On failure: saves `last_error`, then 502.
+3. Reply: `MCPService._out()` · `backend/app/mcp/service.py`.
+
+### 15.4 Managing servers and the allowlist
+
+- List `GET /v1/tools/servers` → `list_servers()` · `backend/app/api/v1/tools.py` → `MCPService.list_servers()` · `backend/app/mcp/service.py` → `MCPService._tools_by_server()` · `backend/app/mcp/service.py` → `_server_out()` · `backend/app/mcp/service.py` (each tool via `_tool_out()` · `backend/app/mcp/service.py`).
+- One server `GET /v1/tools/servers/{name}` → `get_server()` · `backend/app/api/v1/tools.py` → `MCPService.get_server()` · `backend/app/mcp/service.py`.
+- Enable/disable or describe `PATCH /v1/tools/servers/{name}` → `update_server()` · `backend/app/api/v1/tools.py` → `MCPService.update_server()` · `backend/app/mcp/service.py` (disabling → `MCPManager.disconnect()` · `backend/app/mcp/manager.py`).
+- Delete `DELETE /v1/tools/servers/{name}` → `delete_server()` · `backend/app/api/v1/tools.py` → `MCPService.delete_server()` · `backend/app/mcp/service.py` → **204**.
+- Switch a tool on/off `PATCH /v1/tools/servers/{name}/tools/{tool}` → `update_tool()` · `backend/app/api/v1/tools.py` → `MCPService.set_tool_enabled()` · `backend/app/mcp/service.py` → `MCPService._require_tool()` · `backend/app/mcp/service.py` → `_tool_out()` · `backend/app/mcp/service.py`.
+- Try a tool `POST /v1/tools/servers/{name}/tools/{tool}/call` → `call_tool()` · `backend/app/api/v1/tools.py` → `MCPService.call_tool()` · `backend/app/mcp/service.py` → `MCPService._target()` · `backend/app/mcp/service.py` → `MCPManager.call_tool()` · `backend/app/mcp/manager.py` → `format_result()` · `backend/app/mcp/toolbox.py`. Works on switched-off tools.
+- What chats may use `GET /v1/tools` → `list_available_tools()` · `backend/app/api/v1/tools.py` → `MCPService.available_tools()` · `backend/app/mcp/service.py`.
+- Tables: `uv run alembic upgrade head` runs `upgrade()` · `backend/migrations/versions/0003_create_mcp.py`; `downgrade()` · `backend/migrations/versions/0003_create_mcp.py` drops them. `Database._tables()` · `backend/app/db/session.py` loads `app.mcp.models` so tests create them too.
+
+### 15.5 Chat with tools — `POST /v1/chat` and `/v1/chat/stream` with `tools`
+
+1. `get_chat_service()` · `backend/app/api/deps.py` also gets `get_mcp_service()` · `backend/app/api/deps.py`, and passes `MCP_MAX_TOOL_ROUNDS` and the session's `close` as `release_db`.
+2. `ChatService._prepare()` · `backend/app/services/chat_service.py`
+   1. Provider, system prompt, sources (sections 5, 13.3, 14.4).
+   2. `ChatService._toolbox()` · `backend/app/services/chat_service.py` — no `tools` → no tools; no database → 503.
+      1. `MCPService.toolbox_for_chat()` · `backend/app/mcp/service.py` — named servers (unknown/disabled → 404), their **enabled** tools only (`MCPService._tools_by_server()` · `backend/app/mcp/service.py`), each named by `model_tool_name()` · `backend/app/mcp/toolbox.py` with a schema from `tool_schema()` · `backend/app/mcp/toolbox.py`, targets from `MCPService._target()` · `backend/app/mcp/service.py`.
+      2. → `Toolbox.__init__()` · `backend/app/mcp/toolbox.py`.
+   3. `release_db` closes the database session.
+   4. `_to_llm_request()` · `backend/app/services/chat_service.py` sets `tools` from `Toolbox.specs()` · `backend/app/mcp/toolbox.py`.
+3. The loop, in `ChatService.complete()` · `backend/app/services/chat_service.py` (and the same in `ChatService.stream()` · `backend/app/services/chat_service.py`):
+   1. The adapter's `complete`/`stream` (15.6) → maybe `tool_calls`.
+   2. `_add_usage()` · `backend/app/services/chat_service.py` adds the tokens.
+   3. `ChatService._wants_tools()` · `backend/app/services/chat_service.py` — calls asked for, tools offered, under the round limit?
+   4. Stream only: one `tool_call` event per call, built by `Toolbox.trace_for()` · `backend/app/mcp/toolbox.py`.
+   5. `Toolbox.run()` · `backend/app/mcp/toolbox.py` — all calls at once, each through `Toolbox._run_one()` · `backend/app/mcp/toolbox.py`:
+      1. Unknown name → error result.
+      2. `MCPManager.call_tool()` · `backend/app/mcp/manager.py` (`retry_safe` = not destructive).
+      3. `format_result()` · `backend/app/mcp/toolbox.py` — text for the model, cut to `MCP_MAX_RESULT_CHARS`.
+      4. Connection errors → error result. Logs `tool call`.
+   6. Stream only: one `tool_result` event per call.
+   7. `_turn()` · `backend/app/services/chat_service.py` → `LLMRequest.with_turn()` · `backend/app/llm/base.py` → back to step 1.
+4. Done: `ChatService._log()` · `backend/app/services/chat_service.py` logs the totals; the response carries `tool_calls` (the trace).
+5. `Toolbox.servers()` · `backend/app/mcp/toolbox.py` and `Toolbox.__len__()` · `backend/app/mcp/toolbox.py` describe a toolbox (servers, count).
+
+### 15.6 Tools inside the provider adapters
+
+Each adapter's `_params`/`_payload` adds `tools` and replays `turns`; `complete`/`stream` read calls back (section 7):
+
+1. Anthropic: `_tool_calls()` · `backend/app/llm/providers/anthropic_provider.py` (only on `stop_reason: "tool_use"`); replayed content goes through `_replayable()` · `backend/app/llm/providers/anthropic_provider.py`.
+2. OpenAI: `_tool_calls()` · `backend/app/llm/providers/openai_provider.py` (streamed pieces joined by index); the turn to replay from `_assistant_message()` · `backend/app/llm/providers/openai_provider.py`.
+3. Gemini: `_tool_calls()` · `backend/app/llm/providers/gemini_provider.py`; the model's `Content` is replayed as is.
+4. Ollama: `_tool_calls()` · `backend/app/llm/providers/ollama_provider.py`; the turn from `_assistant_message()` · `backend/app/llm/providers/ollama_provider.py`.
+5. Mock: `MockProvider._tool_call()` · `backend/app/llm/providers/mock_provider.py` turns `/tool name {json}` into a call; after the round, `MockProvider._reply()` · `backend/app/llm/providers/mock_provider.py` lists the results.
+
+### 15.7 The demo MCP server (`uv run python -m app.mcp.demo_server [--http PORT]`)
+
+`main()` · `backend/app/mcp/demo_server.py` picks stdio or HTTP. Tools:
+`get_time()` · `backend/app/mcp/demo_server.py`,
+`calculate()` · `backend/app/mcp/demo_server.py` (→ `_evaluate()` · `backend/app/mcp/demo_server.py`, safe arithmetic only),
+`lookup_order()` · `backend/app/mcp/demo_server.py`,
+`cancel_order()` · `backend/app/mcp/demo_server.py` (destructive).
+
+### 15.8 Frontend: the Tools page (`/tools`) and tools in Chat
+
+1. `Tools()` · `frontend/app/tools/page.tsx` → `ToolsPage()` · `frontend/components/tools/tools-page.tsx`
+   1. Load effect → `listMcpServers()` · `frontend/lib/api.ts` (with the admin key); errors through `toolsError()` · `frontend/components/tools/messages.ts`; `reload()` · `frontend/components/tools/tools-page.tsx` after changes.
+   2. **Add server** → `ServerForm()` · `frontend/components/tools/server-form.tsx`
+      1. **Use demo server** → `fillDemo()` · `frontend/components/tools/server-form.tsx` → `listMcpPresets()` · `frontend/lib/api.ts`.
+      2. **Add and connect** → `submit()` · `frontend/components/tools/server-form.tsx` → `parsePairs()` · `frontend/components/tools/messages.ts` (env/header lines) → `createMcpServer()` · `frontend/lib/api.ts`.
+   3. Selecting a server → `ServerPanel()` · `frontend/components/tools/server-panel.tsx`
+      1. Every change goes through `run()` · `frontend/components/tools/server-panel.tsx`.
+      2. Refresh → `refreshMcpServer()` · `frontend/lib/api.ts`; Disable/Enable → `updateMcpServer()` · `frontend/lib/api.ts`; Delete → `remove()` · `frontend/components/tools/server-panel.tsx` → `deleteMcpServer()` · `frontend/lib/api.ts`.
+      3. **Allow** checkbox → `toggleTool()` · `frontend/components/tools/server-panel.tsx` (asks first for destructive tools) → `setMcpToolEnabled()` · `frontend/lib/api.ts`.
+      4. **Try** → `TryTool()` · `frontend/components/tools/server-panel.tsx` (arguments from `exampleArguments()` · `frontend/components/tools/server-panel.tsx`) → `runTool()` · `frontend/components/tools/server-panel.tsx` → `callMcpTool()` · `frontend/lib/api.ts`.
+   4. Server URLs are built by `serverPath()` · `frontend/lib/api.ts`; one server can be fetched with `getMcpServer()` · `frontend/lib/api.ts`.
+2. Chat: the load-tools effect in `Chat()` · `frontend/components/chat.tsx` calls `listAvailableTools()` · `frontend/lib/api.ts` and shows the **Tools** picker; `send()` · `frontend/components/chat.tsx` adds `tools: {servers}`; `tool_call` / `tool_result` events fill the list drawn by `ToolTrace()` · `frontend/components/chat.tsx` above the reply.
+
+### 15.9 Tool tests
+
+Real MCP servers over stdio (the demo server and `backend/tests/mcp_test_server.py`) and over HTTP.
+
+- Test server tools (`backend/tests/mcp_test_server.py`): `echo()` · `backend/tests/mcp_test_server.py`, `pid()` · `backend/tests/mcp_test_server.py`, `env()` · `backend/tests/mcp_test_server.py`, `slow()` · `backend/tests/mcp_test_server.py`, `crash()` · `backend/tests/mcp_test_server.py`.
+- Connections, toolbox, secrets (`backend/tests/test_mcp.py`): fixtures `manager()` · `backend/tests/test_mcp.py` and `http_demo_url()` · `backend/tests/test_mcp.py`; helpers `text()` · `backend/tests/test_mcp.py`, `_process_exists()` · `backend/tests/test_mcp.py`, `entry()` · `backend/tests/test_mcp.py`, and a fake manager `FakeManager.__init__()` · `backend/tests/test_mcp.py` / `FakeManager.call_tool()` · `backend/tests/test_mcp.py`;
+  `test_lists_tools_with_annotations()` · `backend/tests/test_mcp.py`,
+  `test_calls_tools_and_reports_tool_errors()` · `backend/tests/test_mcp.py`,
+  `test_parallel_calls_share_one_connection()` · `backend/tests/test_mcp.py`,
+  `test_reconnects_after_the_server_dies()` · `backend/tests/test_mcp.py`,
+  `test_call_timeout()` · `backend/tests/test_mcp.py`,
+  `test_changed_settings_open_a_new_connection()` · `backend/tests/test_mcp.py`,
+  `test_connection_failures_are_clear()` · `backend/tests/test_mcp.py`,
+  `test_stdio_can_be_switched_off()` · `backend/tests/test_mcp.py`,
+  `test_close_stops_the_server_process()` · `backend/tests/test_mcp.py`,
+  `test_http_server()` · `backend/tests/test_mcp.py`,
+  `test_toolbox_runs_calls_and_traces_them()` · `backend/tests/test_mcp.py`,
+  `test_toolbox_turns_connection_errors_into_tool_errors()` · `backend/tests/test_mcp.py`,
+  `test_format_result_handles_every_content_type()` · `backend/tests/test_mcp.py`,
+  `test_model_tool_names_are_safe_and_unique()` · `backend/tests/test_mcp.py`,
+  `test_tool_schema_defaults_to_an_object()` · `backend/tests/test_mcp.py`,
+  `test_secrets_round_trip_and_need_a_key()` · `backend/tests/test_mcp.py`
+- Adapters (`backend/tests/test_tool_calling.py`): helpers `request()` · `backend/tests/test_tool_calling.py`, `follow_up()` · `backend/tests/test_tool_calling.py`, `claude()` · `backend/tests/test_tool_calling.py`, `openai()` · `backend/tests/test_tool_calling.py`, `completion()` · `backend/tests/test_tool_calling.py`, `chunk()` · `backend/tests/test_tool_calling.py`, `gemini()` · `backend/tests/test_tool_calling.py`, `gemini_call()` · `backend/tests/test_tool_calling.py`, `ollama()` · `backend/tests/test_tool_calling.py` (with its inner `record()` · `backend/tests/test_tool_calling.py`);
+  `test_anthropic_tool_round_trip()` · `backend/tests/test_tool_calling.py`,
+  `test_anthropic_no_tool_calls_when_cut_off()` · `backend/tests/test_tool_calling.py`,
+  `test_anthropic_stream_collects_tool_call()` · `backend/tests/test_tool_calling.py`,
+  `test_openai_tool_round_trip()` · `backend/tests/test_tool_calling.py`,
+  `test_openai_stream_assembles_tool_call_pieces()` · `backend/tests/test_tool_calling.py`,
+  `test_gemini_tool_round_trip()` · `backend/tests/test_tool_calling.py`,
+  `test_gemini_stream_returns_tool_call_with_id()` · `backend/tests/test_tool_calling.py`,
+  `test_ollama_tool_round_trip()` · `backend/tests/test_tool_calling.py`,
+  `test_ollama_stream_collects_tool_calls()` · `backend/tests/test_tool_calling.py`,
+  `test_mock_tool_command_matches_short_name_and_reports_results()` · `backend/tests/test_tool_calling.py`,
+  `test_mock_ignores_tool_command_without_tools()` · `backend/tests/test_tool_calling.py`
+- End to end (`backend/tests/test_tools_api.py`): helpers `chat_body()` · `backend/tests/test_tools_api.py`, `enable()` · `backend/tests/test_tools_api.py`, `tool()` · `backend/tests/test_tools_api.py`; a fake manager `ListingManager.__init__()` · `backend/tests/test_tools_api.py`, `ListingManager.list_tools()` · `backend/tests/test_tools_api.py`, `ListingManager.disconnect()` · `backend/tests/test_tools_api.py`; a fake model that always calls tools `AlwaysCallsTools.__init__()` · `backend/tests/test_tools_api.py`, `AlwaysCallsTools.complete()` · `backend/tests/test_tools_api.py`, `AlwaysCallsTools.stream()` · `backend/tests/test_tools_api.py`;
+  `test_register_server_lists_tools_switched_off()` · `backend/tests/test_tools_api.py`,
+  `test_chat_runs_an_enabled_tool()` · `backend/tests/test_tools_api.py`,
+  `test_disabled_and_destructive_tools_are_not_offered()` · `backend/tests/test_tools_api.py`,
+  `test_tool_errors_are_returned_to_the_model()` · `backend/tests/test_tools_api.py`,
+  `test_stream_reports_tool_calls_and_results()` · `backend/tests/test_tools_api.py`,
+  `test_chat_names_unknown_or_disabled_server()` · `backend/tests/test_tools_api.py`,
+  `test_tools_need_a_database()` · `backend/tests/test_tools_api.py`,
+  `test_secrets_are_encrypted_hidden_and_reach_the_server()` · `backend/tests/test_tools_api.py`,
+  `test_secret_needs_secret_key()` · `backend/tests/test_tools_api.py`,
+  `test_stdio_servers_can_be_switched_off()` · `backend/tests/test_tools_api.py`,
+  `test_unreachable_server_is_saved_with_its_error()` · `backend/tests/test_tools_api.py`,
+  `test_invalid_server_definitions_are_rejected()` · `backend/tests/test_tools_api.py`,
+  `test_admin_key_protects_server_management()` · `backend/tests/test_tools_api.py`,
+  `test_demo_preset_can_be_registered_as_is()` · `backend/tests/test_tools_api.py`,
+  `test_try_a_tool_and_delete_a_server()` · `backend/tests/test_tools_api.py`,
+  `test_refresh_keeps_choices_and_rechecks_tools()` · `backend/tests/test_tools_api.py`,
+  `test_tool_rounds_are_limited()` · `backend/tests/test_tools_api.py`,
+  `test_manager_is_created_and_closed_with_the_app()` · `backend/tests/test_tools_api.py`

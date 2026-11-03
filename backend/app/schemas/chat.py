@@ -4,11 +4,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from app.mcp.schemas import ToolCallTrace, ToolsRef
 from app.prompts.schemas import PromptRef, PromptUsed
 from app.rag.schemas import Citation, RagRef
 
 Role = Literal["user", "assistant"]
-FinishReason = Literal["stop", "length", "refusal", "content_filter", "other"]
+FinishReason = Literal["stop", "length", "refusal", "content_filter", "tool_calls", "other"]
 
 
 class Message(BaseModel):
@@ -32,6 +33,10 @@ class ChatRequest(BaseModel):
     )
     rag: RagRef | None = Field(
         default=None, description="Knowledge bases to search for this message (Layer 3). Adds cited sources."
+    )
+    tools: ToolsRef | None = Field(
+        default=None,
+        description="MCP servers whose enabled tools the model may call while answering (Layer 4).",
     )
     temperature: float | None = Field(
         default=None,
@@ -70,15 +75,23 @@ class ChatResponse(BaseModel):
     citations: list[Citation] | None = Field(
         default=None, description="Sources given to the model when `rag` was used ([] = none found)."
     )
+    tool_calls: list[ToolCallTrace] | None = Field(
+        default=None,
+        description=(
+            "Tools the model called, in order, when `tools` was used ([] = none). If finish_reason is "
+            "`tool_calls`, the model still wanted tools when the round limit (MCP_MAX_TOOL_ROUNDS) was hit."
+        ),
+    )
 
 
 class StreamEvent(BaseModel):
     """One server-sent event on /v1/chat/stream.
 
-    Order: one `start`, any number of `delta`, then exactly one `done` or `error`.
+    Order: one `start`, then `delta` text and (when tools are used) `tool_call` / `tool_result` pairs,
+    then exactly one `done` or `error`.
     """
 
-    type: Literal["start", "delta", "done", "error"]
+    type: Literal["start", "delta", "tool_call", "tool_result", "done", "error"]
     id: str
     provider: str | None = None
     model: str | None = None
@@ -88,6 +101,7 @@ class StreamEvent(BaseModel):
     latency_ms: int | None = None
     prompt: PromptUsed | None = None
     citations: list[Citation] | None = None  # on `start`, when `rag` was used
+    tool: ToolCallTrace | None = None  # on `tool_call` (no result yet) and `tool_result`
     error: dict | None = None
 
 

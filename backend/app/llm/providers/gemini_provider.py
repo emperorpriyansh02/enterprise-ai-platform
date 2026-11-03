@@ -1,5 +1,11 @@
-"""Google Gemini adapter (official `google-genai` SDK)."""
+"""Google Gemini adapter (official `google-genai` SDK).
 
+Tools (Layer 4): offered as function declarations (JSON schema), with the SDK's automatic calling off.
+The model's turn is replayed as Gemini sent it, so `thought_signature`s survive, followed by one user
+turn with a `function_response` per call.
+"""
+
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -17,7 +23,7 @@ from app.core.errors import (
     ProviderTimeoutError,
     ProviderUnavailableError,
 )
-from app.llm.base import LLMProvider, LLMRequest, LLMResult, StreamChunk
+from app.llm.base import LLMProvider, LLMRequest, LLMResult, StreamChunk, ToolCall
 from app.schemas.chat import FinishReason, Usage
 
 NAME = "gemini"
@@ -64,7 +70,36 @@ class GeminiProvider(LLMProvider):
             )
             for m in request.messages
         ]
+        for turn in request.turns:
+            contents.append(turn.provider_state)
+            contents.append(
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(
+                            function_response=types.FunctionResponse(
+                                id=None if r.call_id.startswith(_MADE_UP_ID) else r.call_id,
+                                name=r.name,
+                                response={"error": r.content} if r.is_error else {"result": r.content},
+                            )
+                        )
+                        for r in turn.results
+                    ],
+                )
+            )
         config: dict[str, Any] = {}
+        if request.tools:
+            config["tools"] = [
+                types.Tool(
+                    function_declarations=[
+                        types.FunctionDeclaration(
+                            name=t.name, description=t.description, parameters_json_schema=t.input_schema
+                        )
+                        for t in request.tools
+                    ]
+                )
+            ]
+            config["automatic_function_calling"] = types.AutomaticFunctionCallingConfig(disable=True)
         if request.system:
             config["system_instruction"] = request.system
         if request.temperature is not None:
@@ -83,20 +118,27 @@ class GeminiProvider(LLMProvider):
             response = await self._client.aio.models.generate_content(**self._params(request))
         except Exception as exc:
             raise _map_error(exc) from exc
+        content = response.candidates[0].content if response.candidates else None
+        calls = _tool_calls(content.parts if content else [])
         return LLMResult(
             content=_text(response),
-            finish_reason=_finish_reason(response) or "other",
+            finish_reason="tool_calls" if calls else (_finish_reason(response) or "other"),
             usage=_usage(response),
             model=response.model_version or request.model,
+            tool_calls=calls,
+            provider_state=content if calls else None,
         )
 
     async def stream(self, request: LLMRequest) -> AsyncIterator[StreamChunk]:
         finish_reason: FinishReason = "other"
         usage = Usage()
         model = request.model
+        parts: list[types.Part] = []  # every part of the model's turn, to replay it if it calls tools
         try:
             stream = await self._client.aio.models.generate_content_stream(**self._params(request))
             async for chunk in stream:
+                if chunk.candidates and chunk.candidates[0].content:
+                    parts.extend(chunk.candidates[0].content.parts or [])
                 text = _text(chunk)
                 if text:
                     yield StreamChunk(delta=text)
@@ -106,10 +148,34 @@ class GeminiProvider(LLMProvider):
                 model = chunk.model_version or model
         except Exception as exc:
             raise _map_error(exc) from exc
-        yield StreamChunk(done=True, finish_reason=finish_reason, usage=usage, model=model)
+        calls = _tool_calls(parts)
+        yield StreamChunk(
+            done=True,
+            finish_reason="tool_calls" if calls else finish_reason,
+            usage=usage,
+            model=model,
+            tool_calls=calls,
+            provider_state=types.Content(role="model", parts=parts) if calls else None,
+        )
 
     async def aclose(self) -> None:
         await self._client.aio.aclose()
+
+
+_MADE_UP_ID = "gemini_"  # prefix for ids we invent when Gemini gives none (not sent back to Gemini)
+
+
+def _tool_calls(parts: list[types.Part]) -> list[ToolCall]:
+    """The function calls in a model turn."""
+    return [
+        ToolCall(
+            id=p.function_call.id or f"{_MADE_UP_ID}{uuid.uuid4().hex[:12]}",
+            name=p.function_call.name or "",
+            arguments=dict(p.function_call.args or {}),
+        )
+        for p in parts
+        if p.function_call
+    ]
 
 
 def _text(response: types.GenerateContentResponse) -> str:

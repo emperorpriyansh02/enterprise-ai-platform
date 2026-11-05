@@ -16,7 +16,7 @@ observability and evals added one layer at a time.
 | 3 | RAG: knowledge bases (txt/md/pdf/docx/html), hybrid search on pgvector, cited answers | ✅ Built | `backend/app/rag`, `frontend/components/knowledge` |
 | 4 | MCP tools: stdio + HTTP MCP servers, admin tool allowlist, model ↔ tool loop for all providers, Tools page | ✅ Built | `backend/app/mcp`, `frontend/components/tools` |
 | 5 | RBAC + OAuth: Keycloak sign-in (PKCE), roles admin / editor / user, per-collection, per-tool-server and per-model access | ✅ Built | `backend/app/auth`, `frontend/lib/auth.ts`, `infra/keycloak` |
-| 6 | Guardrails | Planned | `backend/app/guardrails` |
+| 6 | Guardrails: PII/secret masking, prompt-injection (direct + indirect), harmful content, topic policies; block / redact / log at input, context and output; optional LLM judge | 🚧 Backend built (UI next) | `backend/app/guardrails` |
 | 7 | Cache + router | Planned | `backend/app/cache`, `backend/app/routing` |
 | 8 | Observability (OpenTelemetry) | Planned (JSON logs today) | `backend/app/observability` |
 | 9 | Evals | Planned | `backend/evals` |
